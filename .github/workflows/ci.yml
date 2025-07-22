@@ -29,14 +29,11 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        go-version: ['1.23', '1.24']
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: ${{ env.GO_VERSION }}
       - uses: actions/cache@v3
         with:
           path: ~/go/pkg/mod
@@ -44,7 +41,6 @@ jobs:
           restore-keys: ${{ runner.os }}-go-
       - run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
       - uses: codecov/codecov-action@v3
-        if: matrix.go-version == env.GO_VERSION
         with:
           file: ./coverage.txt
 
