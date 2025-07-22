@@ -70,7 +70,7 @@ jobs:
         run: tar czf tsdnsproxy-${{ matrix.os }}-${{ matrix.arch }}.tar.gz tsdnsproxy-${{ matrix.os }}-${{ matrix.arch }}
       
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: tsdnsproxy-${{ matrix.os }}-${{ matrix.arch }}
           path: tsdnsproxy-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
