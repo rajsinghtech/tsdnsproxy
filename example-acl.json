@@ -1,0 +1,96 @@
+{
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["*"],
+      "dst": ["tag:tsdnsproxy:53"]
+    }
+  ],
+  "tagOwners": {
+    "tag:tsdnsproxy": ["autogroup:admin"],
+    "tag:k8s-operator": ["autogroup:admin"],
+    "tag:prod-cluster": ["autogroup:admin"],
+    "tag:dev-cluster": ["autogroup:admin"]
+  },
+  "grants": [
+    {
+      "comment": "Production cluster DNS configuration",
+      "src": ["tag:prod-cluster", "group:sre"],
+      "dst": ["tag:tsdnsproxy"],
+    },
+    {
+      "comment": "Development cluster with domain rewriting",
+      "src": ["tag:dev-cluster", "group:developers"],
+      "dst": ["tag:tsdnsproxy"],
+      "app": {
+        "rajsingh.info/cap/tsdnsproxy": [
+          {
+            "dev.k8s.local": {
+              "dns": ["10.200.0.10:53"],
+              "rewrite": "k8s.local",
+              "comment": "Dev cluster - rewrite to remove 'dev' prefix"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "comment": "4via6 translation for legacy services",
+      "src": ["group:engineering"],
+      "dst": ["tag:tsdnsproxy"],
+      "app": {
+        "rajsingh.info/cap/tsdnsproxy": [
+          {
+            "legacy.corp": {
+              "dns": ["192.168.1.53:53"],
+              "translateid": 1,
+              "comment": "Legacy services - translate to 4via6 with site ID 1"
+            },
+            "oldapp.internal": {
+              "dns": ["192.168.2.53:53"],
+              "translateid": 2,
+              "comment": "Old application - translate to 4via6 with site ID 2"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "comment": "Multi-environment configuration with rewriting and translation",
+      "src": ["tag:k8s-operator"],
+      "dst": ["tag:tsdnsproxy"],
+      "app": {
+        "rajsingh.info/cap/tsdnsproxy": [
+          {
+            "staging.k8s.local": {
+              "dns": ["10.150.0.10:53", "10.150.0.11:53"],
+              "rewrite": "k8s.local",
+              "comment": "Staging - rewrite to prod domain format"
+            },
+            "test.k8s.local": {
+              "dns": ["10.250.0.10:53"],
+              "rewrite": "k8s.local",
+              "translateid": 10,
+              "comment": "Test env - rewrite AND translate for compatibility"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "comment": "Default internal DNS for all authenticated users",
+      "src": ["autogroup:members"],
+      "dst": ["tag:tsdnsproxy"],
+      "app": {
+        "rajsingh.info/cap/tsdnsproxy": [
+          {
+            "internal.company.com": {
+              "dns": ["10.0.1.53:53", "10.0.2.53:53"],
+              "comment": "Internal company DNS servers with failover"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

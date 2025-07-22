@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tsdnsproxy
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tsdnsproxy
+  namespace: tsdnsproxy
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tsdnsproxy
+  namespace: tsdnsproxy
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "update", "patch", "create"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tsdnsproxy
+  namespace: tsdnsproxy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tsdnsproxy
+subjects:
+- kind: ServiceAccount
+  name: tsdnsproxy
+  namespace: tsdnsproxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tsdnsproxy
+  namespace: tsdnsproxy
+  labels:
+    app: tsdnsproxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tsdnsproxy
+  template:
+    metadata:
+      labels:
+        app: tsdnsproxy
+    spec:
+      serviceAccountName: tsdnsproxy
+      containers:
+      - name: tsdnsproxy
+        image: ghcr.io/rajsinghtech/tsdnsproxy:latest  # Update with your registry/image
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 53
+          protocol: UDP
+          name: dns-udp
+        - containerPort: 53
+          protocol: TCP
+          name: dns-tcp
+        - containerPort: 8080
+          protocol: TCP
+          name: health
+        env:
+        - name: TSDNSPROXY_STATE
+          value: "kube:tsdnsproxy-state"
+        - name: TSDNSPROXY_HOSTNAME
+          value: "tsdnsproxy"
+        - name: TSDNSPROXY_VERBOSE
+          value: "true"
+        - name: TSDNSPROXY_DEFAULT_DNS
+          value: "8.8.8.8:53,8.8.4.4:53"  # Configure your default DNS
+        - name: TS_AUTHKEY
+          valueFrom:
+            secretKeyRef:
+              name: tsdnsproxy-auth
+              key: TS_AUTHKEY
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: health
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: health
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE  # Required for binding to port 53
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tsdnsproxy
+  namespace: tsdnsproxy
+  labels:
+    app: tsdnsproxy
+spec:
+  type: ClusterIP
+  selector:
+    app: tsdnsproxy
+  ports:
+  - name: dns-udp
+    port: 53
+    targetPort: dns-udp
+    protocol: UDP
+  - name: dns-tcp
+    port: 53
+    targetPort: dns-tcp
+    protocol: TCP
+  - name: health
+    port: 8080
+    targetPort: health
+    protocol: TCP
