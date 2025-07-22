@@ -217,6 +217,10 @@ go test ./...
 docker build -t tsdnsproxy:latest .
 ```
 
+## Community
+
+This project is built by the Tailscale community. It is not an official Tailscale product.
+
 ## License
 
 [MIT License](LICENSE)
