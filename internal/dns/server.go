@@ -394,9 +394,9 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 	}
 
 	// Handle 4via6 domains authoritatively (don't forward to backends)
-	// Only handle authoritatively if this is a 4via6 domain (has translateid > 0)
-	// Note: translateid 0 might be valid too, but we need to distinguish from non-4via6 grants
-	if grant.TranslateID > 0 && len(grant.DNS) > 0 {
+	// 4via6 domains are identified by having both translateid (0-65535) and DNS servers
+	// translateid 0 is valid and results in empty translator identifier
+	if grant.TranslateID >= 0 && len(grant.DNS) > 0 {
 		s.Logf("[v] 4via6 domain detected: %s (translateID=%d)", domain, grant.TranslateID)
 		return s.handleAuthoritative4via6(query, &grant, domain)
 	}
@@ -476,33 +476,42 @@ func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, gr
 	var targetDomain string
 	if grant.Rewrite != "" {
 		targetDomain = s.GrantParser.RewriteDomain(queryDomain, grantDomain, grant.Rewrite)
+		s.Logf("[v] domain rewrite: %s -> %s", queryDomain, targetDomain)
 	} else {
 		targetDomain = queryDomain
+		s.Logf("[v] no rewrite, using original domain: %s", targetDomain)
 	}
 
 	// Ensure target domain has trailing dot for DNS resolution
 	if !strings.HasSuffix(targetDomain, ".") {
 		targetDomain += "."
 	}
+	s.Logf("[v] resolving backend domain: %s via DNS servers: %v", targetDomain, grant.DNS)
 
 	// Resolve the target domain to get IPv4 address
 	ipv4, err := s.resolveToIPv4(targetDomain, grant.DNS)
 	if err != nil {
+		s.Logf("failed to resolve %s via %v: %v", targetDomain, grant.DNS, err)
 		return netip.Addr{}, fmt.Errorf("failed to resolve %s: %w", targetDomain, err)
 	}
+	s.Logf("[v] resolved %s to IPv4: %s", targetDomain, ipv4)
 
 	// Create 4via6 address using tsaddr.MapVia
 	prefix := netip.PrefixFrom(ipv4, 32)
 	via6Prefix, err := tsaddr.MapVia(uint32(grant.TranslateID), prefix)
 	if err != nil {
+		s.Logf("failed to map 4via6 for %s (site %d): %v", ipv4, grant.TranslateID, err)
 		return netip.Addr{}, fmt.Errorf("failed to map 4via6 for %s (site %d): %w", ipv4, grant.TranslateID, err)
 	}
+	s.Logf("[v] created 4via6 address: %s -> %s", ipv4, via6Prefix.Addr())
 
 	return via6Prefix.Addr(), nil
 }
 
 // resolveToIPv4 resolves a domain to an IPv4 address using the specified DNS servers
 func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, error) {
+	s.Logf("[v] resolveToIPv4: creating A query for %s", domain)
+	
 	// Create a basic A query
 	query := dnsmessage.Message{
 		Header: dnsmessage.Header{
@@ -520,8 +529,10 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 
 	queryBytes, err := query.Pack()
 	if err != nil {
+		s.Logf("failed to pack A query for %s: %v", domain, err)
 		return netip.Addr{}, fmt.Errorf("failed to pack query: %w", err)
 	}
+	s.Logf("[v] packed A query for %s, querying backends: %v", domain, dnsServers)
 
 	// Try each DNS server until we get a response
 	backends := s.BackendMgr.CreateBackends(dnsServers)
@@ -530,25 +541,32 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 
 	responseBytes, err := s.BackendMgr.Query(ctx, backends, queryBytes)
 	if err != nil {
+		s.Logf("backend query failed for %s via %v: %v", domain, dnsServers, err)
 		return netip.Addr{}, fmt.Errorf("DNS resolution failed: %w", err)
 	}
+	s.Logf("[v] got response for %s (%d bytes)", domain, len(responseBytes))
 
 	// Parse response
 	var response dnsmessage.Message
 	if err := response.Unpack(responseBytes); err != nil {
+		s.Logf("failed to unpack response for %s: %v", domain, err)
 		return netip.Addr{}, fmt.Errorf("failed to unpack response: %w", err)
 	}
+	s.Logf("[v] unpacked response for %s: %d answers, RCode=%v", domain, len(response.Answers), response.RCode)
 
 	// Extract IPv4 address from A records
-	for _, answer := range response.Answers {
+	for i, answer := range response.Answers {
+		s.Logf("[v] answer[%d]: Type=%v", i, answer.Header.Type)
 		if a, ok := answer.Body.(*dnsmessage.AResource); ok {
 			ipv4 := netip.AddrFrom4(a.A)
+			s.Logf("[v] found A record: %s", ipv4)
 			if ipv4.IsValid() {
 				return ipv4, nil
 			}
 		}
 	}
 
+	s.Logf("no valid IPv4 address found in response for %s", domain)
 	return netip.Addr{}, fmt.Errorf("no IPv4 address found in response for %s", domain)
 }
 
