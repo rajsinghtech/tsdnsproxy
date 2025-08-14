@@ -500,10 +500,11 @@ func (s *Server) unrewriteResponse(response *dnsmessage.Message, originalName dn
 		response.Questions[0].Name = originalName
 	}
 
-	// We don't need to unrewrite answer names because they should remain
-	// as returned by the upstream DNS server. The query was rewritten
-	// (cluster1.local -> cluster.local) so the answers are for cluster.local,
-	// which is what we want to return.
+	// Rewrite answer names back to the original query domain
+	// This is required for DNS protocol compliance - answers must match the queried domain
+	for i := range response.Answers {
+		response.Answers[i].Header.Name = originalName
+	}
 }
 
 func (s *Server) sendError(pc net.PacketConn, addr net.Addr, query *dnsmessage.Message, rcode dnsmessage.RCode) {
