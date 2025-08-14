@@ -240,13 +240,14 @@ func TestServer_translate4via6(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string
-		response *dnsmessage.Message
-		siteID   uint32
-		validate func(t *testing.T, response *dnsmessage.Message)
+		name          string
+		response      *dnsmessage.Message
+		originalQuery *dnsmessage.Message
+		siteID        uint32
+		validate      func(t *testing.T, response *dnsmessage.Message)
 	}{
 		{
-			name: "translate_A_to_AAAA",
+			name: "AAAA_query_translates_A_to_AAAA",
 			response: &dnsmessage.Message{
 				Answers: []dnsmessage.Resource{
 					{
@@ -259,6 +260,15 @@ func TestServer_translate4via6(t *testing.T) {
 						Body: &dnsmessage.AResource{
 							A: [4]byte{10, 0, 0, 1}, // 10.0.0.1
 						},
+					},
+				},
+			},
+			originalQuery: &dnsmessage.Message{
+				Questions: []dnsmessage.Question{
+					{
+						Name:  dnsmessage.MustNewName("test.example.com."),
+						Type:  dnsmessage.TypeAAAA,
+						Class: dnsmessage.ClassINET,
 					},
 				},
 			},
@@ -285,6 +295,51 @@ func TestServer_translate4via6(t *testing.T) {
 				addrStr := addr.String()
 				if !strings.HasPrefix(addrStr, "fd7a:115c:a1e0:b1a:0:1:") {
 					t.Errorf("4via6 address = %s, want prefix fd7a:115c:a1e0:b1a:0:1:", addrStr)
+				}
+			},
+		},
+		{
+			name: "A_query_keeps_original_A_record",
+			response: &dnsmessage.Message{
+				Answers: []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{
+							Name:  dnsmessage.MustNewName("test.example.com."),
+							Type:  dnsmessage.TypeA,
+							Class: dnsmessage.ClassINET,
+							TTL:   300,
+						},
+						Body: &dnsmessage.AResource{
+							A: [4]byte{10, 0, 0, 1}, // 10.0.0.1
+						},
+					},
+				},
+			},
+			originalQuery: &dnsmessage.Message{
+				Questions: []dnsmessage.Question{
+					{
+						Name:  dnsmessage.MustNewName("test.example.com."),
+						Type:  dnsmessage.TypeA,
+						Class: dnsmessage.ClassINET,
+					},
+				},
+			},
+			siteID: 1,
+			validate: func(t *testing.T, response *dnsmessage.Message) {
+				if len(response.Answers) != 1 {
+					t.Fatalf("expected 1 answer, got %d", len(response.Answers))
+				}
+				ans := response.Answers[0]
+				if ans.Header.Type != dnsmessage.TypeA {
+					t.Errorf("answer type = %v, want TypeA", ans.Header.Type)
+				}
+				a, ok := ans.Body.(*dnsmessage.AResource)
+				if !ok {
+					t.Fatalf("answer body is not AResource")
+				}
+				expected := [4]byte{10, 0, 0, 1}
+				if a.A != expected {
+					t.Errorf("A record = %v, want %v", a.A, expected)
 				}
 			},
 		},
@@ -316,6 +371,15 @@ func TestServer_translate4via6(t *testing.T) {
 					},
 				},
 			},
+			originalQuery: &dnsmessage.Message{
+				Questions: []dnsmessage.Question{
+					{
+						Name:  dnsmessage.MustNewName("test.example.com."),
+						Type:  dnsmessage.TypeAAAA,
+						Class: dnsmessage.ClassINET,
+					},
+				},
+			},
 			siteID: 1,
 			validate: func(t *testing.T, response *dnsmessage.Message) {
 				if len(response.Answers) != 2 {
@@ -332,7 +396,7 @@ func TestServer_translate4via6(t *testing.T) {
 			},
 		},
 		{
-			name: "translate_multiple_A_records",
+			name: "translate_multiple_A_records_for_AAAA_query",
 			response: &dnsmessage.Message{
 				Answers: []dnsmessage.Resource{
 					{
@@ -356,6 +420,15 @@ func TestServer_translate4via6(t *testing.T) {
 						Body: &dnsmessage.AResource{
 							A: [4]byte{10, 0, 0, 2},
 						},
+					},
+				},
+			},
+			originalQuery: &dnsmessage.Message{
+				Questions: []dnsmessage.Question{
+					{
+						Name:  dnsmessage.MustNewName("test.example.com."),
+						Type:  dnsmessage.TypeAAAA,
+						Class: dnsmessage.ClassINET,
 					},
 				},
 			},
@@ -385,7 +458,7 @@ func TestServer_translate4via6(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server.translate4via6(tt.response, tt.siteID)
+			server.translate4via6(tt.response, tt.siteID, tt.originalQuery)
 			tt.validate(t, tt.response)
 		})
 	}
@@ -565,6 +638,49 @@ func TestServer_processQuery(t *testing.T) {
 					{
 						Name:  dnsmessage.MustNewName("service.test.local."),
 						Type:  dnsmessage.TypeA,
+						Class: dnsmessage.ClassINET,
+					},
+				},
+			},
+			grants:  mockGrants,
+			backend: &mockBackend{queryFunc: mockBackendFunc},
+			validate: func(t *testing.T, response []byte, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+
+				var resp dnsmessage.Message
+				if err := resp.Unpack(response); err != nil {
+					t.Fatalf("failed to unpack response: %v", err)
+				}
+
+				// Check question was unrewritten back to original
+				if len(resp.Questions) != 1 {
+					t.Fatalf("expected 1 question, got %d", len(resp.Questions))
+				}
+				if resp.Questions[0].Name.String() != "service.test.local." {
+					t.Errorf("question name = %s, want service.test.local.", resp.Questions[0].Name)
+				}
+
+				// Check answer remains as A record (RFC compliant behavior)
+				if len(resp.Answers) != 1 {
+					t.Fatalf("expected 1 answer, got %d", len(resp.Answers))
+				}
+				if resp.Answers[0].Header.Type != dnsmessage.TypeA {
+					t.Errorf("answer type = %v, want TypeA", resp.Answers[0].Header.Type)
+				}
+			},
+		},
+		{
+			name: "AAAA_query_with_rewriting_and_4via6",
+			query: &dnsmessage.Message{
+				Header: dnsmessage.Header{
+					ID: 1235,
+				},
+				Questions: []dnsmessage.Question{
+					{
+						Name:  dnsmessage.MustNewName("service.test.local."),
+						Type:  dnsmessage.TypeAAAA,
 						Class: dnsmessage.ClassINET,
 					},
 				},
