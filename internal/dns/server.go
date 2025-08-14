@@ -309,9 +309,12 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 	}
 
 	identity := s.getIdentity(whois)
+	s.Logf("[v] client whois for %s: identity=%s", host, identity)
+	s.Logf("[v] client capabilities: %+v", whois.CapMap)
 
 	cachedGrants, cached := s.GrantCache.Get(identity)
 	if cached {
+		s.Logf("[v] using cached grants for %s: %d configs", identity, len(cachedGrants))
 		return cachedGrants, nil
 	}
 
@@ -320,6 +323,7 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 	if err != nil {
 		return nil, fmt.Errorf("parse grants: %w", err)
 	}
+	s.Logf("[v] parsed %d grant configs for client %s", len(parsedGrants), identity)
 
 	// Cache grants
 	s.GrantCache.Set(identity, parsedGrants)
@@ -352,6 +356,9 @@ func (s *Server) loadServerGrants(ctx context.Context, status *ipnstate.Status) 
 	if err != nil {
 		return fmt.Errorf("whois self: %w", err)
 	}
+
+	s.Logf("[v] server self-whois for IP %s", selfIP)
+	s.Logf("[v] server capabilities: %+v", whois.CapMap)
 
 	// Parse grants from our own capabilities
 	grants, err := s.GrantParser.ParseGrants(whois.CapMap)
@@ -387,10 +394,10 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 	}
 
 	// Handle 4via6 domains authoritatively (don't forward to backends)
-	// Only handle authoritatively if both TranslateID and DNS servers are configured
-	if grant.TranslateID >= 0 && len(grant.DNS) > 0 {
-		// Check if this is actually a 4via6 configuration (has translateid set)
-		// In the configuration, 4via6 domains have both dns servers and translateid
+	// Only handle authoritatively if this is a 4via6 domain (has translateid > 0)
+	// Note: translateid 0 might be valid too, but we need to distinguish from non-4via6 grants
+	if grant.TranslateID > 0 && len(grant.DNS) > 0 {
+		s.Logf("[v] 4via6 domain detected: %s (translateID=%d)", domain, grant.TranslateID)
 		return s.handleAuthoritative4via6(query, &grant, domain)
 	}
 
