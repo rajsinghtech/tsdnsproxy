@@ -448,7 +448,7 @@ func (s *Server) forwardQuery(ctx context.Context, query *dnsmessage.Message, ba
 	}
 
 	if grant != nil && grant.TranslateID > 0 {
-		s.translate4via6(&response, uint32(grant.TranslateID))
+		s.translate4via6(&response, uint32(grant.TranslateID), query)
 	}
 
 	if grant != nil && grant.Rewrite != "" && originalName.String() != "" {
@@ -459,12 +459,17 @@ func (s *Server) forwardQuery(ctx context.Context, query *dnsmessage.Message, ba
 	return response.Pack()
 }
 
-func (s *Server) translate4via6(response *dnsmessage.Message, siteID uint32) {
+func (s *Server) translate4via6(response *dnsmessage.Message, siteID uint32, originalQuery *dnsmessage.Message) {
+	// Determine what the client originally requested
+	var queryTypes = make(map[dnsmessage.Type]bool)
+	for _, q := range originalQuery.Questions {
+		queryTypes[q.Type] = true
+	}
+
 	var translatedAnswers []dnsmessage.Resource
 
 	for _, ans := range response.Answers {
 		if a, ok := ans.Body.(*dnsmessage.AResource); ok && ans.Header.Type == dnsmessage.TypeA {
-			// Convert A record to AAAA with 4via6
 			ip4 := netip.AddrFrom4(a.A)
 			via, err := tsaddr.MapVia(siteID, netip.PrefixFrom(ip4, 32))
 			if err != nil {
@@ -473,21 +478,35 @@ func (s *Server) translate4via6(response *dnsmessage.Message, siteID uint32) {
 				continue
 			}
 
-			// Create AAAA record
-			aaaa := dnsmessage.Resource{
-				Header: dnsmessage.ResourceHeader{
-					Name:  ans.Header.Name,
-					Type:  dnsmessage.TypeAAAA,
-					Class: ans.Header.Class,
-					TTL:   ans.Header.TTL,
-				},
-				Body: &dnsmessage.AAAAResource{
-					AAAA: via.Addr().As16(),
-				},
+			// Handle different query types appropriately
+			if queryTypes[dnsmessage.TypeA] {
+				// Client requested A records, keep original A record
+				translatedAnswers = append(translatedAnswers, ans)
 			}
-			translatedAnswers = append(translatedAnswers, aaaa)
+			
+			if queryTypes[dnsmessage.TypeAAAA] {
+				// Client requested AAAA records, provide 4via6 translation
+				aaaa := dnsmessage.Resource{
+					Header: dnsmessage.ResourceHeader{
+						Name:  ans.Header.Name,
+						Type:  dnsmessage.TypeAAAA,
+						Class: ans.Header.Class,
+						TTL:   ans.Header.TTL,
+					},
+					Body: &dnsmessage.AAAAResource{
+						AAAA: via.Addr().As16(),
+					},
+				}
+				translatedAnswers = append(translatedAnswers, aaaa)
+			}
+
+			// If client requested neither A nor AAAA specifically (shouldn't happen in practice),
+			// default to keeping the original A record for compatibility
+			if !queryTypes[dnsmessage.TypeA] && !queryTypes[dnsmessage.TypeAAAA] {
+				translatedAnswers = append(translatedAnswers, ans)
+			}
 		} else {
-			// Pass through non-A records
+			// Pass through non-A records unchanged
 			translatedAnswers = append(translatedAnswers, ans)
 		}
 	}
