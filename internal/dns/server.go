@@ -267,9 +267,12 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 		s.Logf("[v] %s: %s %s", addr, q.Name, q.Type)
 	}
 
-	s.grantsMu.RLock()
-	grants := s.serverGrants
-	s.grantsMu.RUnlock()
+	grants, err := s.getGrantsForSource(queryCtx, addr.String())
+	if err != nil {
+		s.Logf("failed to get grants for %s: %v", addr, err)
+		s.sendError(pc, addr, &msg, dnsmessage.RCodeServerFailure)
+		return
+	}
 	response, err := s.processQuery(queryCtx, &msg, grants)
 	if err != nil {
 		if queryCtx.Err() != nil {
