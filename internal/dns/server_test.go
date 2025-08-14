@@ -130,12 +130,12 @@ func TestServer_unrewriteResponse(t *testing.T) {
 				if response.Questions[0].Name.String() != "service.cluster1.local." {
 					t.Errorf("question name = %s, want service.cluster1.local.", response.Questions[0].Name)
 				}
-				// Check answer was NOT updated (it should remain as returned by backend)
+				// Check answer was updated to match the original query domain
 				if len(response.Answers) != 1 {
 					t.Fatalf("expected 1 answer, got %d", len(response.Answers))
 				}
-				if response.Answers[0].Header.Name.String() != "service.cluster.local." {
-					t.Errorf("answer name = %s, want service.cluster.local.", response.Answers[0].Header.Name)
+				if response.Answers[0].Header.Name.String() != "service.cluster1.local." {
+					t.Errorf("answer name = %s, want service.cluster1.local.", response.Answers[0].Header.Name)
 				}
 			},
 		},
