@@ -386,6 +386,14 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 		return s.forwardQuery(ctx, query, nil, nil, dnsmessage.Name{})
 	}
 
+	// Handle 4via6 domains authoritatively (don't forward to backends)
+	// Only handle authoritatively if both TranslateID and DNS servers are configured
+	if grant.TranslateID >= 0 && len(grant.DNS) > 0 {
+		// Check if this is actually a 4via6 configuration (has translateid set)
+		// In the configuration, 4via6 domains have both dns servers and translateid
+		return s.handleAuthoritative4via6(query, &grant, domain)
+	}
+
 	var rewrittenQuery *dnsmessage.Message
 	if grant.Rewrite != "" {
 		rewrittenQuery = s.rewriteQuery(query, domain, grant.Rewrite)
@@ -401,6 +409,140 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 	}
 
 	return response, nil
+}
+
+// handleAuthoritative4via6 handles 4via6 domains authoritatively without forwarding to backends
+func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *grants.DNSGrant, domain string) ([]byte, error) {
+	if len(query.Questions) == 0 {
+		return nil, fmt.Errorf("no questions in query")
+	}
+
+	question := query.Questions[0]
+	response := dnsmessage.Message{
+		Header: dnsmessage.Header{
+			ID:                 query.ID,
+			Response:           true,
+			OpCode:             query.OpCode,
+			Authoritative:      true,
+			Truncated:          false,
+			RecursionDesired:   query.RecursionDesired,
+			RecursionAvailable: false,
+			RCode:              dnsmessage.RCodeSuccess,
+		},
+		Questions: query.Questions,
+	}
+
+	// Only respond to AAAA queries with 4via6 addresses
+	if question.Type == dnsmessage.TypeAAAA {
+		// Create synthetic 4via6 address
+		via6Addr, err := s.createSynthetic4via6Address(question.Name.String(), domain, grant)
+		if err != nil {
+			s.Logf("failed to create synthetic 4via6 address for %s: %v", question.Name.String(), err)
+			response.RCode = dnsmessage.RCodeServerFailure
+		} else {
+			// Add AAAA record to response
+			response.Answers = []dnsmessage.Resource{
+				{
+					Header: dnsmessage.ResourceHeader{
+						Name:  question.Name,
+						Type:  dnsmessage.TypeAAAA,
+						Class: question.Class,
+						TTL:   300, // Default TTL
+					},
+					Body: &dnsmessage.AAAAResource{
+						AAAA: via6Addr.As16(),
+					},
+				},
+			}
+			s.Logf("[v] 4via6 authoritative response for %s: %s", question.Name.String(), via6Addr.String())
+		}
+	}
+	// For A queries or other types, return NODATA (empty answer section)
+	// This is RFC compliant - the domain exists but has no records of the requested type
+
+	return response.Pack()
+}
+
+// createSynthetic4via6Address creates a synthetic 4via6 IPv6 address by resolving the backend service
+func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
+	// Determine what to resolve - use rewrite if available, otherwise resolve directly via backends
+	var targetDomain string
+	if grant.Rewrite != "" {
+		targetDomain = s.GrantParser.RewriteDomain(queryDomain, grantDomain, grant.Rewrite)
+	} else {
+		targetDomain = queryDomain
+	}
+
+	// Ensure target domain has trailing dot for DNS resolution
+	if !strings.HasSuffix(targetDomain, ".") {
+		targetDomain += "."
+	}
+
+	// Resolve the target domain to get IPv4 address
+	ipv4, err := s.resolveToIPv4(targetDomain, grant.DNS)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("failed to resolve %s: %w", targetDomain, err)
+	}
+
+	// Create 4via6 address using tsaddr.MapVia
+	prefix := netip.PrefixFrom(ipv4, 32)
+	via6Prefix, err := tsaddr.MapVia(uint32(grant.TranslateID), prefix)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("failed to map 4via6 for %s (site %d): %w", ipv4, grant.TranslateID, err)
+	}
+
+	return via6Prefix.Addr(), nil
+}
+
+// resolveToIPv4 resolves a domain to an IPv4 address using the specified DNS servers
+func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, error) {
+	// Create a basic A query
+	query := dnsmessage.Message{
+		Header: dnsmessage.Header{
+			ID:               1, // Simple ID
+			RecursionDesired: true,
+		},
+		Questions: []dnsmessage.Question{
+			{
+				Name:  dnsmessage.MustNewName(domain),
+				Type:  dnsmessage.TypeA,
+				Class: dnsmessage.ClassINET,
+			},
+		},
+	}
+
+	queryBytes, err := query.Pack()
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("failed to pack query: %w", err)
+	}
+
+	// Try each DNS server until we get a response
+	backends := s.BackendMgr.CreateBackends(dnsServers)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	responseBytes, err := s.BackendMgr.Query(ctx, backends, queryBytes)
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("DNS resolution failed: %w", err)
+	}
+
+	// Parse response
+	var response dnsmessage.Message
+	if err := response.Unpack(responseBytes); err != nil {
+		return netip.Addr{}, fmt.Errorf("failed to unpack response: %w", err)
+	}
+
+	// Extract IPv4 address from A records
+	for _, answer := range response.Answers {
+		if a, ok := answer.Body.(*dnsmessage.AResource); ok {
+			ipv4 := netip.AddrFrom4(a.A)
+			if ipv4.IsValid() {
+				return ipv4, nil
+			}
+		}
+	}
+
+	return netip.Addr{}, fmt.Errorf("no IPv4 address found in response for %s", domain)
 }
 
 func (s *Server) rewriteQuery(query *dnsmessage.Message, targetDomain, rewriteDomain string) *dnsmessage.Message {

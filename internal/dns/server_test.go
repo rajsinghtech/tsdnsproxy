@@ -629,7 +629,7 @@ func TestServer_processQuery(t *testing.T) {
 		validate func(t *testing.T, response []byte, err error)
 	}{
 		{
-			name: "query_with_rewriting_and_4via6",
+			name: "A_query_to_4via6_domain_returns_NODATA",
 			query: &dnsmessage.Message{
 				Header: dnsmessage.Header{
 					ID: 1234,
@@ -662,12 +662,13 @@ func TestServer_processQuery(t *testing.T) {
 					t.Errorf("question name = %s, want service.test.local.", resp.Questions[0].Name)
 				}
 
-				// Check answer remains as A record (RFC compliant behavior)
-				if len(resp.Answers) != 1 {
-					t.Fatalf("expected 1 answer, got %d", len(resp.Answers))
+				// Check A query to 4via6 domain returns NODATA (authoritative behavior)
+				if len(resp.Answers) != 0 {
+					t.Fatalf("expected 0 answers (NODATA), got %d", len(resp.Answers))
 				}
-				if resp.Answers[0].Header.Type != dnsmessage.TypeA {
-					t.Errorf("answer type = %v, want TypeA", resp.Answers[0].Header.Type)
+				// Should still be a successful response (not NXDOMAIN)
+				if resp.RCode != dnsmessage.RCodeSuccess {
+					t.Errorf("RCode = %v, want RCodeSuccess", resp.RCode)
 				}
 			},
 		},
