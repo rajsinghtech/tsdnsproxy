@@ -6,9 +6,15 @@ RUN apk add --no-cache git ca-certificates
 
 WORKDIR /build
 
+# Configure Go module proxy for faster downloads
+ENV GOPROXY=https://proxy.golang.org,direct
+ENV GOSUMDB=sum.golang.org
+
 # Copy go mod files first for better caching
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 
 # Copy source code
 COPY . .
@@ -16,7 +22,9 @@ COPY . .
 # Build with optimizations for target architecture
 ARG TARGETARCH
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags="-w -s -extldflags '-static' -X main.version=${VERSION}" \
     -tags netgo \
     -o tsdnsproxy \

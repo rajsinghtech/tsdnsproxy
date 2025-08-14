@@ -94,21 +94,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      
       - name: Build and push
-        run: |
-          IMAGE=ghcr.io/${{ env.IMAGE_NAME }}
-          
-          TAGS="--tag $IMAGE:latest"
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/}
-            TAGS="$TAGS --tag $IMAGE:$VERSION"
-          fi
-          
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            $TAGS \
-            --push \
-            .
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   release:
     name: Create Release
