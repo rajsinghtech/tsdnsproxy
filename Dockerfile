@@ -1,10 +1,15 @@
-# Build stage
-FROM golang:1.25-alpine AS builder
+# Build stage with cross-compilation optimization
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git ca-certificates
 
 WORKDIR /build
+
+# Configure Go for cross-compilation
+ARG TARGETOS
+ARG TARGETARCH
+ENV GOOS=$TARGETOS GOARCH=$TARGETARCH
 
 # Configure Go module proxy for faster downloads
 ENV GOPROXY=https://proxy.golang.org,direct
@@ -19,12 +24,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Copy source code
 COPY . .
 
-# Build with optimizations for target architecture
-ARG TARGETARCH
+# Build with native Go cross-compilation
 ARG VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+    CGO_ENABLED=0 go build \
     -ldflags="-w -s -extldflags '-static' -X main.version=${VERSION}" \
     -tags netgo \
     -o tsdnsproxy \
