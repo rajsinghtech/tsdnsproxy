@@ -377,7 +377,12 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 		return s.LocalClient.WhoIs(whoisCtx, host)
 	})
 	if err != nil {
-		return nil, fmt.Errorf("whois lookup: %w", err)
+		// For non-Tailscale clients, fall back to server's own grants
+		s.Logf("[v] whois failed for %s (%v), using server grants", host, err)
+		s.grantsMu.RLock()
+		serverGrants := s.serverGrants
+		s.grantsMu.RUnlock()
+		return serverGrants, nil
 	}
 
 	identity := s.getIdentity(whois)
