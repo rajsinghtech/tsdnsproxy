@@ -23,5 +23,5 @@ configMapGenerator:
 - name: tsdnsproxy-config
   namespace: tsdnsproxy
   literals:
-  - TSDNSPROXY_DEFAULT_DNS=8.8.8.8:53,8.8.4.4:53
+  - TSDNSPROXY_OVERRIDE_DNS=8.8.8.8:53,8.8.4.4:53
   - TSDNSPROXY_VERBOSE=true

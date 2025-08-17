@@ -102,7 +102,7 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TSDNSPROXY_HOSTNAME`: Hostname on tailnet (default: `tsdnsproxy`)
 - `TSDNSPROXY_STATE_DIR`: State directory (default: `/var/lib/tsdnsproxy`)
 - `TSDNSPROXY_STATE`: State storage backend (e.g., `kube:secret-name`)
-- `TSDNSPROXY_DEFAULT_DNS`: Default DNS servers (comma-separated)
+- `TSDNSPROXY_OVERRIDE_DNS`: Override host DNS servers (comma-separated, defaults to host's resolvers)
 - `TSDNSPROXY_LISTEN_ADDRS`: Listen addresses (default: `tailscale`) - see Network Configuration
 - `TSDNSPROXY_HEALTH_ADDR`: Health check endpoint address (default: `:8080`)
 - `TSDNSPROXY_VERBOSE`: Enable verbose logging (default: `false`)
@@ -116,7 +116,7 @@ tsdnsproxy \
   -listen-addrs tailscale,0.0.0.0:53 \
   -statedir /var/lib/tsdnsproxy \
   -state kube:tsdnsproxy-state \
-  -default-dns 8.8.8.8:53,8.8.4.4:53 \
+  -override-dns 8.8.8.8:53,8.8.4.4:53 \
   -cache-expiry 5m \
   -health-addr :8080 \
   -verbose
