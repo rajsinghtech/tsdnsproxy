@@ -13,7 +13,7 @@ A DNS proxy server for Tailscale networks that enables per-identity DNS routing,
 
 ## How It Works
 
-tsdnsproxy runs as a tsnet application on your tailnet, listening on UDP port 53. When it receives DNS requests:
+tsdnsproxy runs as a tsnet application on your tailnet, listening on configurable addresses (default: Tailscale IP port 53). When it receives DNS requests:
 
 1. Identifies the requesting node using LocalAPI whois
 2. Retrieves DNS grants from the node's capabilities
@@ -66,6 +66,7 @@ docker run -d \
   --name tsdnsproxy \
   -e TS_AUTHKEY=tskey-auth-YOUR-KEY \
   -e TSDNSPROXY_HOSTNAME=tsdnsproxy \
+  -e TSDNSPROXY_LISTEN_ADDRS=tailscale,0.0.0.0:53 \
   -p 53:53/udp \
   ghcr.io/rajsinghtech/tsdnsproxy:latest
 ```
@@ -102,6 +103,7 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TSDNSPROXY_STATE_DIR`: State directory (default: `/var/lib/tsdnsproxy`)
 - `TSDNSPROXY_STATE`: State storage backend (e.g., `kube:secret-name`)
 - `TSDNSPROXY_DEFAULT_DNS`: Default DNS servers (comma-separated)
+- `TSDNSPROXY_LISTEN_ADDRS`: Listen addresses (default: `tailscale`) - see Network Configuration
 - `TSDNSPROXY_HEALTH_ADDR`: Health check endpoint address (default: `:8080`)
 - `TSDNSPROXY_VERBOSE`: Enable verbose logging (default: `false`)
 
@@ -111,6 +113,7 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 tsdnsproxy \
   -authkey tskey-auth-YOUR-KEY \
   -hostname tsdnsproxy \
+  -listen-addrs tailscale,0.0.0.0:53 \
   -statedir /var/lib/tsdnsproxy \
   -state kube:tsdnsproxy-state \
   -default-dns 8.8.8.8:53,8.8.4.4:53 \
