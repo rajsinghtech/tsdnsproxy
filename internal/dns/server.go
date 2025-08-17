@@ -52,14 +52,18 @@ type Server struct {
 	serverGrants []grants.GrantConfig
 }
 
-// Run starts both UDP and TCP DNS servers
+// Run starts both UDP and TCP DNS servers on the default Tailscale address
 func (s *Server) Run(ctx context.Context) error {
-	s.workerPool = make(chan struct{}, 100)
-
 	status, err := s.LocalClient.Status(ctx)
 	if err != nil {
 		return fmt.Errorf("get status: %w", err)
 	}
+	return s.RunWithAddrs(ctx, "tailscale", status)
+}
+
+// RunWithAddrs starts DNS servers on specified addresses
+func (s *Server) RunWithAddrs(ctx context.Context, listenAddrsStr string, status *ipnstate.Status) error {
+	s.workerPool = make(chan struct{}, 100)
 
 	// Load server's own grants
 	if err := s.loadServerGrants(ctx, status); err != nil {
@@ -69,34 +73,32 @@ func (s *Server) Run(ctx context.Context) error {
 		s.grantsMu.Unlock()
 	}
 
-	var listenAddr string
-	if status.Self != nil && len(status.Self.TailscaleIPs) > 0 {
-		// Use the first tailscale IP
-		listenAddr = fmt.Sprintf("%s:53", status.Self.TailscaleIPs[0])
-	} else {
-		listenAddr = ":53"
-	}
+	// Parse listen addresses
+	listenAddrs := s.parseListenAddresses(listenAddrsStr, status)
 
-	// Create error channel for goroutines
-	errCh := make(chan error, 2)
+	// Create error channel for goroutines (2 per address)
+	errCh := make(chan error, len(listenAddrs)*2)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Start UDP server
-	go func() {
-		if err := s.runUDP(ctx, listenAddr); err != nil {
-			errCh <- fmt.Errorf("UDP server: %w", err)
-		}
-	}()
+	// Start UDP and TCP servers for each listen address
+	for _, addr := range listenAddrs {
+		// Start UDP server
+		go func(listenAddr string) {
+			if err := s.runUDP(ctx, listenAddr); err != nil {
+				errCh <- fmt.Errorf("UDP server on %s: %w", listenAddr, err)
+			}
+		}(addr)
 
-	// Start TCP server
-	go func() {
-		if err := s.runTCP(ctx, listenAddr); err != nil {
-			errCh <- fmt.Errorf("TCP server: %w", err)
-		}
-	}()
+		// Start TCP server
+		go func(listenAddr string) {
+			if err := s.runTCP(ctx, listenAddr); err != nil {
+				errCh <- fmt.Errorf("TCP server on %s: %w", listenAddr, err)
+			}
+		}(addr)
+	}
 
-	// Wait for either server to fail or context to be done
+	// Wait for any server to fail or context to be done
 	select {
 	case err := <-errCh:
 		cancel()
@@ -106,9 +108,52 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
+// parseListenAddresses converts the listen addresses string into concrete addresses
+func (s *Server) parseListenAddresses(listenAddrsStr string, status *ipnstate.Status) []string {
+	addrs := strings.Split(listenAddrsStr, ",")
+	var result []string
+	
+	for _, addr := range addrs {
+		addr = strings.TrimSpace(addr)
+		switch addr {
+		case "tailscale":
+			// Use the first tailscale IP
+			if status.Self != nil && len(status.Self.TailscaleIPs) > 0 {
+				result = append(result, fmt.Sprintf("%s:53", status.Self.TailscaleIPs[0]))
+			} else {
+				s.Logf("warning: tailscale address requested but no Tailscale IPs available, using :53")
+				result = append(result, ":53")
+			}
+		case "0.0.0.0:53", "0.0.0.0", "all":
+			result = append(result, "0.0.0.0:53")
+		case "127.0.0.1:53", "127.0.0.1", "localhost":
+			result = append(result, "127.0.0.1:53")
+		case "[::]:53", "[::]", "ipv6":
+			result = append(result, "[::]:53")
+		default:
+			// Custom address - validate it has a port
+			if !strings.Contains(addr, ":") {
+				addr += ":53"
+			}
+			result = append(result, addr)
+		}
+	}
+	
+	s.Logf("parsed listen addresses: %v", result)
+	return result
+}
+
 // runUDP handles UDP DNS queries
 func (s *Server) runUDP(ctx context.Context, listenAddr string) error {
-	pc, err := s.TSServer.ListenPacket("udp", listenAddr)
+	var pc net.PacketConn
+	var err error
+	
+	// Determine if we should use tsnet or standard networking
+	if s.shouldUseTSNet(listenAddr) {
+		pc, err = s.TSServer.ListenPacket("udp", listenAddr)
+	} else {
+		pc, err = net.ListenPacket("udp", listenAddr)
+	}
 	if err != nil {
 		return fmt.Errorf("listen UDP: %w", err)
 	}
@@ -176,9 +221,36 @@ func (s *Server) runUDP(ctx context.Context, listenAddr string) error {
 	}
 }
 
+// shouldUseTSNet determines if we should use tsnet for the given address
+func (s *Server) shouldUseTSNet(listenAddr string) bool {
+	// Extract host from address
+	host, _, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		// If we can't parse, assume it's a tsnet address
+		return true
+	}
+	
+	// Use standard networking for common non-tailscale addresses
+	switch host {
+	case "0.0.0.0", "127.0.0.1", "localhost", "", "[::]":
+		return false
+	default:
+		// If it looks like a tailscale IP or custom address, use tsnet
+		return true
+	}
+}
+
 // runTCP handles TCP DNS queries
 func (s *Server) runTCP(ctx context.Context, listenAddr string) error {
-	listener, err := s.TSServer.Listen("tcp", listenAddr)
+	var listener net.Listener
+	var err error
+	
+	// Determine if we should use tsnet or standard networking
+	if s.shouldUseTSNet(listenAddr) {
+		listener, err = s.TSServer.Listen("tcp", listenAddr)
+	} else {
+		listener, err = net.Listen("tcp", listenAddr)
+	}
 	if err != nil {
 		return fmt.Errorf("listen TCP: %w", err)
 	}

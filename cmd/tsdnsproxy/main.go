@@ -76,6 +76,7 @@ func main() {
 		defaultDNS  = flag.String("default-dns", envOr("TSDNSPROXY_DEFAULT_DNS", ""), "default DNS servers (comma-separated)")
 		cacheExpiry = flag.Duration("cache-expiry", constants.DefaultCacheExpiry, "whois cache expiry duration")
 		healthAddr  = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
+		listenAddrs = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
 		verbose     = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
 	)
 	flag.Parse()
@@ -193,7 +194,7 @@ func main() {
 
 	// Start DNS server (handles both UDP and TCP)
 	log.Printf("starting DNS server")
-	if err := dnsServer.Run(ctx); err != nil {
+	if err := dnsServer.RunWithAddrs(ctx, *listenAddrs, status); err != nil {
 		log.Printf("DNS server error: %v", err)
 	}
 
