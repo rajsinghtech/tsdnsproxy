@@ -75,8 +75,8 @@ spec:
           value: "tsdnsproxy"
         - name: TSDNSPROXY_VERBOSE
           value: "true"
-        - name: TSDNSPROXY_DEFAULT_DNS
-          value: "8.8.8.8:53,8.8.4.4:53"  # Configure your default DNS
+        - name: TSDNSPROXY_OVERRIDE_DNS
+          value: "8.8.8.8:53,8.8.4.4:53"  # Override host DNS with specific servers
         - name: TSDNSPROXY_LISTEN_ADDRS
           value: "tailscale,0.0.0.0:53"  # Listen on both Tailscale and LAN
         - name: TS_AUTHKEY

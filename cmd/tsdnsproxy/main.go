@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"bufio"
+	"net"
 
 	"github.com/rajsinghtech/tsdnsproxy/internal/backend"
 	"github.com/rajsinghtech/tsdnsproxy/internal/cache"
@@ -29,6 +31,49 @@ func envOr(key, defaultVal string) string {
 		return v
 	}
 	return defaultVal
+}
+
+func getHostDNSServers() []string {
+	var servers []string
+	
+	// Try to read from /etc/resolv.conf (Linux/Unix)
+	if file, err := os.Open("/etc/resolv.conf"); err == nil {
+		defer file.Close()
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if strings.HasPrefix(line, "nameserver ") {
+				server := strings.TrimSpace(strings.TrimPrefix(line, "nameserver"))
+				// Add port if not specified
+				if !strings.Contains(server, ":") {
+					server += ":53"
+				}
+				servers = append(servers, server)
+			}
+		}
+		if len(servers) > 0 {
+			return servers
+		}
+	}
+	
+	// Fallback to system DNS resolution
+	config, err := net.DefaultResolver.LookupNS(context.Background(), ".")
+	if err == nil && len(config) > 0 {
+		for _, ns := range config {
+			if !strings.Contains(ns.Host, ":") {
+				servers = append(servers, ns.Host+":53")
+			} else {
+				servers = append(servers, ns.Host)
+			}
+		}
+		if len(servers) > 0 {
+			return servers
+		}
+	}
+	
+	// Final fallback to common public DNS
+	log.Println("warning: could not determine host DNS servers, falling back to 8.8.8.8:53")
+	return []string{"8.8.8.8:53"}
 }
 
 func retryWithBackoff(ctx context.Context, maxRetries int, fn func() error) error {
@@ -73,7 +118,7 @@ func main() {
 		stateDir    = flag.String("statedir", envOr("TSDNSPROXY_STATE_DIR", "/var/lib/tsdnsproxy"), "state directory")
 		state       = flag.String("state", os.Getenv("TSDNSPROXY_STATE"), "state storage (e.g., kube:<secret-name>)")
 		controlURL  = flag.String("controlurl", os.Getenv("TS_CONTROLURL"), "optional alternate control server URL")
-		defaultDNS  = flag.String("default-dns", envOr("TSDNSPROXY_DEFAULT_DNS", ""), "default DNS servers (comma-separated)")
+		overrideDNS = flag.String("override-dns", envOr("TSDNSPROXY_OVERRIDE_DNS", ""), "override DNS servers (comma-separated, defaults to host resolvers)")
 		cacheExpiry = flag.Duration("cache-expiry", constants.DefaultCacheExpiry, "whois cache expiry duration")
 		healthAddr  = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
 		listenAddrs = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
@@ -141,11 +186,17 @@ func main() {
 	grantCache := cache.NewGrantCache(*cacheExpiry)
 
 	var defaultServers []string
-	if *defaultDNS != "" {
-		defaultServers = strings.Split(*defaultDNS, ",")
+	if *overrideDNS != "" {
+		// Use override DNS servers if specified
+		defaultServers = strings.Split(*overrideDNS, ",")
 		for i := range defaultServers {
 			defaultServers[i] = strings.TrimSpace(defaultServers[i])
 		}
+		log.Printf("using override DNS servers: %v", defaultServers)
+	} else {
+		// Default to host's DNS resolvers
+		defaultServers = getHostDNSServers()
+		log.Printf("using host DNS servers: %v", defaultServers)
 	}
 	backendMgr := backend.NewManager(defaultServers)
 	defer backendMgr.Close()
