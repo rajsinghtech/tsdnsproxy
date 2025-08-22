@@ -6,7 +6,7 @@ toolchain go1.24.5
 
 require (
 	golang.org/x/net v0.42.0
-	tailscale.com v1.86.4
+	tailscale.com v1.86.5
 )
 
 require (
