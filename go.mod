@@ -2,7 +2,7 @@ module github.com/rajsinghtech/tsdnsproxy
 
 go 1.24.4
 
-toolchain go1.24.5
+toolchain go1.25.1
 
 require (
 	golang.org/x/net v0.42.0
