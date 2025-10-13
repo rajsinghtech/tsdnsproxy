@@ -906,3 +906,335 @@ func (m *mockPacketConn) SetReadDeadline(t time.Time) error {
 func (m *mockPacketConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
+
+func TestServer_handleAuthoritative4via6(t *testing.T) {
+	tests := []struct {
+		name     string
+		query    *dnsmessage.Message
+		grant    *grants.DNSGrant
+		domain   string
+		backend  backend.Backend
+		validate func(t *testing.T, response []byte, err error)
+	}{
+		{
+			name: "translateID_0_A_query_returns_IPv4",
+			query: &dnsmessage.Message{
+				Header: dnsmessage.Header{
+					ID: 1,
+				},
+				Questions: []dnsmessage.Question{
+					{
+						Name:  dnsmessage.MustNewName("service.test.local."),
+						Type:  dnsmessage.TypeA,
+						Class: dnsmessage.ClassINET,
+					},
+				},
+			},
+			grant: &grants.DNSGrant{
+				DNS:         []string{"10.0.0.10:53"},
+				Rewrite:     "svc.cluster.local",
+				TranslateID: 0,
+			},
+			domain: "test.local",
+			backend: &mockBackend{
+				queryFunc: func(ctx context.Context, query []byte) ([]byte, error) {
+					var q dnsmessage.Message
+					if err := q.Unpack(query); err != nil {
+						return nil, err
+					}
+					resp := dnsmessage.Message{
+						Header: dnsmessage.Header{
+							ID:       q.ID,
+							Response: true,
+							RCode:    dnsmessage.RCodeSuccess,
+						},
+						Questions: q.Questions,
+						Answers: []dnsmessage.Resource{
+							{
+								Header: dnsmessage.ResourceHeader{
+									Name:  q.Questions[0].Name,
+									Type:  dnsmessage.TypeA,
+									Class: dnsmessage.ClassINET,
+									TTL:   300,
+								},
+								Body: &dnsmessage.AResource{
+									A: [4]byte{10, 2, 26, 202},
+								},
+							},
+						},
+					}
+					return resp.Pack()
+				},
+			},
+			validate: func(t *testing.T, response []byte, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var resp dnsmessage.Message
+				if err := resp.Unpack(response); err != nil {
+					t.Fatalf("failed to unpack response: %v", err)
+				}
+				if !resp.Authoritative {
+					t.Error("response should be authoritative")
+				}
+				if len(resp.Answers) != 1 {
+					t.Fatalf("expected 1 answer, got %d", len(resp.Answers))
+				}
+				if resp.Answers[0].Header.Type != dnsmessage.TypeA {
+					t.Errorf("answer type = %v, want TypeA", resp.Answers[0].Header.Type)
+				}
+				a, ok := resp.Answers[0].Body.(*dnsmessage.AResource)
+				if !ok {
+					t.Fatal("answer body is not AResource")
+				}
+				expected := [4]byte{10, 2, 26, 202}
+				if a.A != expected {
+					t.Errorf("A record = %v, want %v", a.A, expected)
+				}
+			},
+		},
+		{
+			name: "translateID_0_AAAA_query_returns_IPv6",
+			query: &dnsmessage.Message{
+				Header: dnsmessage.Header{
+					ID: 2,
+				},
+				Questions: []dnsmessage.Question{
+					{
+						Name:  dnsmessage.MustNewName("service.test.local."),
+						Type:  dnsmessage.TypeAAAA,
+						Class: dnsmessage.ClassINET,
+					},
+				},
+			},
+			grant: &grants.DNSGrant{
+				DNS:         []string{"10.0.0.10:53"},
+				Rewrite:     "svc.cluster.local",
+				TranslateID: 0,
+			},
+			domain: "test.local",
+			backend: &mockBackend{
+				queryFunc: func(ctx context.Context, query []byte) ([]byte, error) {
+					var q dnsmessage.Message
+					if err := q.Unpack(query); err != nil {
+						return nil, err
+					}
+					resp := dnsmessage.Message{
+						Header: dnsmessage.Header{
+							ID:       q.ID,
+							Response: true,
+							RCode:    dnsmessage.RCodeSuccess,
+						},
+						Questions: q.Questions,
+						Answers: []dnsmessage.Resource{
+							{
+								Header: dnsmessage.ResourceHeader{
+									Name:  q.Questions[0].Name,
+									Type:  dnsmessage.TypeAAAA,
+									Class: dnsmessage.ClassINET,
+									TTL:   300,
+								},
+								Body: &dnsmessage.AAAAResource{
+									AAAA: [16]byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1},
+								},
+							},
+						},
+					}
+					return resp.Pack()
+				},
+			},
+			validate: func(t *testing.T, response []byte, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var resp dnsmessage.Message
+				if err := resp.Unpack(response); err != nil {
+					t.Fatalf("failed to unpack response: %v", err)
+				}
+				if !resp.Authoritative {
+					t.Error("response should be authoritative")
+				}
+				if len(resp.Answers) != 1 {
+					t.Fatalf("expected 1 answer, got %d", len(resp.Answers))
+				}
+				if resp.Answers[0].Header.Type != dnsmessage.TypeAAAA {
+					t.Errorf("answer type = %v, want TypeAAAA", resp.Answers[0].Header.Type)
+				}
+				aaaa, ok := resp.Answers[0].Body.(*dnsmessage.AAAAResource)
+				if !ok {
+					t.Fatal("answer body is not AAAAResource")
+				}
+				addr := netip.AddrFrom16(aaaa.AAAA)
+				if addr.String() != "2001:db8::1" {
+					t.Errorf("AAAA record = %v, want 2001:db8::1", addr)
+				}
+			},
+		},
+		{
+			name: "translateID_1_A_query_returns_NODATA",
+			query: &dnsmessage.Message{
+				Header: dnsmessage.Header{
+					ID: 3,
+				},
+				Questions: []dnsmessage.Question{
+					{
+						Name:  dnsmessage.MustNewName("service.test.local."),
+						Type:  dnsmessage.TypeA,
+						Class: dnsmessage.ClassINET,
+					},
+				},
+			},
+			grant: &grants.DNSGrant{
+				DNS:         []string{"10.0.0.10:53"},
+				Rewrite:     "svc.cluster.local",
+				TranslateID: 1,
+			},
+			domain: "test.local",
+			backend: &mockBackend{
+				queryFunc: func(ctx context.Context, query []byte) ([]byte, error) {
+					var q dnsmessage.Message
+					if err := q.Unpack(query); err != nil {
+						return nil, err
+					}
+					resp := dnsmessage.Message{
+						Header: dnsmessage.Header{
+							ID:       q.ID,
+							Response: true,
+							RCode:    dnsmessage.RCodeSuccess,
+						},
+						Questions: q.Questions,
+						Answers: []dnsmessage.Resource{
+							{
+								Header: dnsmessage.ResourceHeader{
+									Name:  q.Questions[0].Name,
+									Type:  dnsmessage.TypeA,
+									Class: dnsmessage.ClassINET,
+									TTL:   300,
+								},
+								Body: &dnsmessage.AResource{
+									A: [4]byte{10, 2, 26, 202},
+								},
+							},
+						},
+					}
+					return resp.Pack()
+				},
+			},
+			validate: func(t *testing.T, response []byte, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var resp dnsmessage.Message
+				if err := resp.Unpack(response); err != nil {
+					t.Fatalf("failed to unpack response: %v", err)
+				}
+				if !resp.Authoritative {
+					t.Error("response should be authoritative")
+				}
+				// Should return NODATA (empty answers)
+				if len(resp.Answers) != 0 {
+					t.Fatalf("expected 0 answers (NODATA), got %d", len(resp.Answers))
+				}
+				if resp.RCode != dnsmessage.RCodeSuccess {
+					t.Errorf("RCode = %v, want RCodeSuccess", resp.RCode)
+				}
+			},
+		},
+		{
+			name: "translateID_1_AAAA_query_returns_4via6",
+			query: &dnsmessage.Message{
+				Header: dnsmessage.Header{
+					ID: 4,
+				},
+				Questions: []dnsmessage.Question{
+					{
+						Name:  dnsmessage.MustNewName("service.test.local."),
+						Type:  dnsmessage.TypeAAAA,
+						Class: dnsmessage.ClassINET,
+					},
+				},
+			},
+			grant: &grants.DNSGrant{
+				DNS:         []string{"10.0.0.10:53"},
+				Rewrite:     "svc.cluster.local",
+				TranslateID: 1,
+			},
+			domain: "test.local",
+			backend: &mockBackend{
+				queryFunc: func(ctx context.Context, query []byte) ([]byte, error) {
+					var q dnsmessage.Message
+					if err := q.Unpack(query); err != nil {
+						return nil, err
+					}
+					// Backend returns A record
+					resp := dnsmessage.Message{
+						Header: dnsmessage.Header{
+							ID:       q.ID,
+							Response: true,
+							RCode:    dnsmessage.RCodeSuccess,
+						},
+						Questions: q.Questions,
+						Answers: []dnsmessage.Resource{
+							{
+								Header: dnsmessage.ResourceHeader{
+									Name:  q.Questions[0].Name,
+									Type:  dnsmessage.TypeA,
+									Class: dnsmessage.ClassINET,
+									TTL:   300,
+								},
+								Body: &dnsmessage.AResource{
+									A: [4]byte{10, 2, 26, 202},
+								},
+							},
+						},
+					}
+					return resp.Pack()
+				},
+			},
+			validate: func(t *testing.T, response []byte, err error) {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				var resp dnsmessage.Message
+				if err := resp.Unpack(response); err != nil {
+					t.Fatalf("failed to unpack response: %v", err)
+				}
+				if !resp.Authoritative {
+					t.Error("response should be authoritative")
+				}
+				if len(resp.Answers) != 1 {
+					t.Fatalf("expected 1 answer, got %d", len(resp.Answers))
+				}
+				if resp.Answers[0].Header.Type != dnsmessage.TypeAAAA {
+					t.Errorf("answer type = %v, want TypeAAAA", resp.Answers[0].Header.Type)
+				}
+				aaaa, ok := resp.Answers[0].Body.(*dnsmessage.AAAAResource)
+				if !ok {
+					t.Fatal("answer body is not AAAAResource")
+				}
+				addr := netip.AddrFrom16(aaaa.AAAA)
+				// Should have 4via6 prefix for site 1
+				if !strings.HasPrefix(addr.String(), "fd7a:115c:a1e0:b1a:0:1:") {
+					t.Errorf("4via6 address = %v, want prefix fd7a:115c:a1e0:b1a:0:1:", addr)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &Server{
+				BackendMgr: &mockBackendManager{
+					backend: tt.backend,
+				},
+				GrantParser: grants.NewParser(),
+				Logf: func(format string, args ...any) {
+					t.Logf(format, args...)
+				},
+			}
+
+			response, err := server.handleAuthoritative4via6(tt.query, tt.grant, tt.domain)
+			tt.validate(t, response, err)
+		})
+	}
+}

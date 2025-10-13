@@ -471,10 +471,16 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 	}
 
 	// Handle 4via6 domains authoritatively (don't forward to backends)
-	// 4via6 domains are identified by having both translateid (0-65535) and DNS servers
-	// translateid 0 is valid and results in empty translator identifier
-	if grant.TranslateID >= 0 && len(grant.DNS) > 0 {
-		s.Logf("[v] 4via6 domain detected: %s (translateID=%d)", domain, grant.TranslateID)
+	// 4via6 domains are identified by translateid field (0-65535)
+	// translateid 0 is valid and results in passthrough mode (no 4via6 translation)
+	// If DNS servers aren't specified, use the default system resolver
+	if grant.TranslateID >= 0 {
+		// If no DNS servers specified, the grant will use default backends from BackendManager
+		if len(grant.DNS) == 0 {
+			s.Logf("[v] 4via6 domain detected: %s (translateID=%d, using default DNS)", domain, grant.TranslateID)
+		} else {
+			s.Logf("[v] 4via6 domain detected: %s (translateID=%d)", domain, grant.TranslateID)
+		}
 		return s.handleAuthoritative4via6(query, &grant, domain)
 	}
 
@@ -516,39 +522,95 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 		Questions: query.Questions,
 	}
 
-	// Only respond to AAAA queries with 4via6 addresses
-	if question.Type == dnsmessage.TypeAAAA {
-		// Create synthetic 4via6 address
-		via6Addr, err := s.createSynthetic4via6Address(question.Name.String(), domain, grant)
-		if err != nil {
-			s.Logf("failed to create synthetic 4via6 address for %s: %v", question.Name.String(), err)
-			response.RCode = dnsmessage.RCodeServerFailure
-		} else {
-			// Add AAAA record to response
-			response.Answers = []dnsmessage.Resource{
-				{
-					Header: dnsmessage.ResourceHeader{
-						Name:  question.Name,
-						Type:  dnsmessage.TypeAAAA,
-						Class: question.Class,
-						TTL:   300, // Default TTL
+	// Handle queries based on translateID:
+	// - translateID == 0: No 4via6 translation, return backend A/AAAA records directly
+	// - translateID > 0: 4via6 translation enabled, return 4via6 AAAA records, NODATA for A queries
+	if grant.TranslateID == 0 {
+		// No translation mode: serve A and AAAA records directly from backend
+		switch question.Type {
+		case dnsmessage.TypeA:
+			// Resolve backend and return IPv4 directly
+			ipv4, err := s.resolveBackendIPv4(question.Name.String(), domain, grant)
+			if err != nil {
+				s.Logf("failed to resolve IPv4 for %s: %v", question.Name.String(), err)
+				response.RCode = dnsmessage.RCodeServerFailure
+			} else {
+				// Add A record to response
+				response.Answers = []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{
+							Name:  question.Name,
+							Type:  dnsmessage.TypeA,
+							Class: question.Class,
+							TTL:   300, // Default TTL
+						},
+						Body: &dnsmessage.AResource{
+							A: ipv4.As4(),
+						},
 					},
-					Body: &dnsmessage.AAAAResource{
-						AAAA: via6Addr.As16(),
-					},
-				},
+				}
+				s.Logf("[v] authoritative A response for %s: %s", question.Name.String(), ipv4.String())
 			}
-			s.Logf("[v] 4via6 authoritative response for %s: %s", question.Name.String(), via6Addr.String())
+		case dnsmessage.TypeAAAA:
+			// Resolve backend and return IPv6 directly (no 4via6 translation)
+			ipv6, err := s.resolveBackendIPv6(question.Name.String(), domain, grant)
+			if err != nil {
+				s.Logf("failed to resolve IPv6 for %s: %v", question.Name.String(), err)
+				response.RCode = dnsmessage.RCodeServerFailure
+			} else {
+				// Add AAAA record to response
+				response.Answers = []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{
+							Name:  question.Name,
+							Type:  dnsmessage.TypeAAAA,
+							Class: question.Class,
+							TTL:   300, // Default TTL
+						},
+						Body: &dnsmessage.AAAAResource{
+							AAAA: ipv6.As16(),
+						},
+					},
+				}
+				s.Logf("[v] authoritative AAAA response for %s: %s", question.Name.String(), ipv6.String())
+			}
+		default:
+			// For other query types, return NODATA (empty answer section)
 		}
+	} else {
+		// 4via6 translation mode: serve AAAA records with 4via6 addresses
+		if question.Type == dnsmessage.TypeAAAA {
+			// Create synthetic 4via6 address
+			via6Addr, err := s.createSynthetic4via6Address(question.Name.String(), domain, grant)
+			if err != nil {
+				s.Logf("failed to create synthetic 4via6 address for %s: %v", question.Name.String(), err)
+				response.RCode = dnsmessage.RCodeServerFailure
+			} else {
+				// Add AAAA record to response
+				response.Answers = []dnsmessage.Resource{
+					{
+						Header: dnsmessage.ResourceHeader{
+							Name:  question.Name,
+							Type:  dnsmessage.TypeAAAA,
+							Class: question.Class,
+							TTL:   300, // Default TTL
+						},
+						Body: &dnsmessage.AAAAResource{
+							AAAA: via6Addr.As16(),
+						},
+					},
+				}
+				s.Logf("[v] 4via6 authoritative response for %s: %s", question.Name.String(), via6Addr.String())
+			}
+		}
+		// For A or other query types, return NODATA (empty answer section)
 	}
-	// For A queries or other types, return NODATA (empty answer section)
-	// This is RFC compliant - the domain exists but has no records of the requested type
 
 	return response.Pack()
 }
 
-// createSynthetic4via6Address creates a synthetic 4via6 IPv6 address by resolving the backend service
-func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
+// resolveBackendIPv4 resolves a query domain to its backend IPv4 address
+func (s *Server) resolveBackendIPv4(queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
 	// Determine what to resolve - use rewrite if available, otherwise resolve directly via backends
 	var targetDomain string
 	if grant.Rewrite != "" {
@@ -573,6 +635,17 @@ func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, gr
 	}
 	s.Logf("[v] resolved %s to IPv4: %s", targetDomain, ipv4)
 
+	return ipv4, nil
+}
+
+// createSynthetic4via6Address creates a synthetic 4via6 IPv6 address by resolving the backend service
+func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
+	// Resolve backend IPv4 address
+	ipv4, err := s.resolveBackendIPv4(queryDomain, grantDomain, grant)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+
 	// Create 4via6 address using tsaddr.MapVia
 	prefix := netip.PrefixFrom(ipv4, 32)
 	via6Prefix, err := tsaddr.MapVia(uint32(grant.TranslateID), prefix)
@@ -585,10 +658,39 @@ func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, gr
 	return via6Prefix.Addr(), nil
 }
 
+// resolveBackendIPv6 resolves a query domain to its backend IPv6 address
+func (s *Server) resolveBackendIPv6(queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
+	// Determine what to resolve - use rewrite if available, otherwise resolve directly via backends
+	var targetDomain string
+	if grant.Rewrite != "" {
+		targetDomain = s.GrantParser.RewriteDomain(queryDomain, grantDomain, grant.Rewrite)
+		s.Logf("[v] domain rewrite: %s -> %s", queryDomain, targetDomain)
+	} else {
+		targetDomain = queryDomain
+		s.Logf("[v] no rewrite, using original domain: %s", targetDomain)
+	}
+
+	// Ensure target domain has trailing dot for DNS resolution
+	if !strings.HasSuffix(targetDomain, ".") {
+		targetDomain += "."
+	}
+	s.Logf("[v] resolving backend domain: %s via DNS servers: %v", targetDomain, grant.DNS)
+
+	// Resolve the target domain to get IPv6 address
+	ipv6, err := s.resolveToIPv6(targetDomain, grant.DNS)
+	if err != nil {
+		s.Logf("failed to resolve %s via %v: %v", targetDomain, grant.DNS, err)
+		return netip.Addr{}, fmt.Errorf("failed to resolve %s: %w", targetDomain, err)
+	}
+	s.Logf("[v] resolved %s to IPv6: %s", targetDomain, ipv6)
+
+	return ipv6, nil
+}
+
 // resolveToIPv4 resolves a domain to an IPv4 address using the specified DNS servers
 func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, error) {
 	s.Logf("[v] resolveToIPv4: creating A query for %s", domain)
-	
+
 	// Create a basic A query
 	query := dnsmessage.Message{
 		Header: dnsmessage.Header{
@@ -609,7 +711,13 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 		s.Logf("failed to pack A query for %s: %v", domain, err)
 		return netip.Addr{}, fmt.Errorf("failed to pack query: %w", err)
 	}
-	s.Logf("[v] packed A query for %s, querying backends: %v", domain, dnsServers)
+
+	// If no DNS servers specified, use nil to get default backends from BackendManager
+	if len(dnsServers) == 0 {
+		s.Logf("[v] packed A query for %s, using default DNS servers", domain)
+	} else {
+		s.Logf("[v] packed A query for %s, querying backends: %v", domain, dnsServers)
+	}
 
 	// Try each DNS server until we get a response
 	backends := s.BackendMgr.CreateBackends(dnsServers)
@@ -618,7 +726,7 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 
 	responseBytes, err := s.BackendMgr.Query(ctx, backends, queryBytes)
 	if err != nil {
-		s.Logf("backend query failed for %s via %v: %v", domain, dnsServers, err)
+		s.Logf("backend query failed for %s: %v", domain, err)
 		return netip.Addr{}, fmt.Errorf("DNS resolution failed: %w", err)
 	}
 	s.Logf("[v] got response for %s (%d bytes)", domain, len(responseBytes))
@@ -645,6 +753,74 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 
 	s.Logf("no valid IPv4 address found in response for %s", domain)
 	return netip.Addr{}, fmt.Errorf("no IPv4 address found in response for %s", domain)
+}
+
+// resolveToIPv6 resolves a domain to an IPv6 address using the specified DNS servers
+func (s *Server) resolveToIPv6(domain string, dnsServers []string) (netip.Addr, error) {
+	s.Logf("[v] resolveToIPv6: creating AAAA query for %s", domain)
+
+	// Create a basic AAAA query
+	query := dnsmessage.Message{
+		Header: dnsmessage.Header{
+			ID:               1, // Simple ID
+			RecursionDesired: true,
+		},
+		Questions: []dnsmessage.Question{
+			{
+				Name:  dnsmessage.MustNewName(domain),
+				Type:  dnsmessage.TypeAAAA,
+				Class: dnsmessage.ClassINET,
+			},
+		},
+	}
+
+	queryBytes, err := query.Pack()
+	if err != nil {
+		s.Logf("failed to pack AAAA query for %s: %v", domain, err)
+		return netip.Addr{}, fmt.Errorf("failed to pack query: %w", err)
+	}
+
+	// If no DNS servers specified, use nil to get default backends from BackendManager
+	if len(dnsServers) == 0 {
+		s.Logf("[v] packed AAAA query for %s, using default DNS servers", domain)
+	} else {
+		s.Logf("[v] packed AAAA query for %s, querying backends: %v", domain, dnsServers)
+	}
+
+	// Try each DNS server until we get a response
+	backends := s.BackendMgr.CreateBackends(dnsServers)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	responseBytes, err := s.BackendMgr.Query(ctx, backends, queryBytes)
+	if err != nil {
+		s.Logf("backend query failed for %s: %v", domain, err)
+		return netip.Addr{}, fmt.Errorf("DNS resolution failed: %w", err)
+	}
+	s.Logf("[v] got response for %s (%d bytes)", domain, len(responseBytes))
+
+	// Parse response
+	var response dnsmessage.Message
+	if err := response.Unpack(responseBytes); err != nil {
+		s.Logf("failed to unpack response for %s: %v", domain, err)
+		return netip.Addr{}, fmt.Errorf("failed to unpack response: %w", err)
+	}
+	s.Logf("[v] unpacked response for %s: %d answers, RCode=%v", domain, len(response.Answers), response.RCode)
+
+	// Extract IPv6 address from AAAA records
+	for i, answer := range response.Answers {
+		s.Logf("[v] answer[%d]: Type=%v", i, answer.Header.Type)
+		if aaaa, ok := answer.Body.(*dnsmessage.AAAAResource); ok {
+			ipv6 := netip.AddrFrom16(aaaa.AAAA)
+			s.Logf("[v] found AAAA record: %s", ipv6)
+			if ipv6.IsValid() {
+				return ipv6, nil
+			}
+		}
+	}
+
+	s.Logf("no valid IPv6 address found in response for %s", domain)
+	return netip.Addr{}, fmt.Errorf("no IPv6 address found in response for %s", domain)
 }
 
 func (s *Server) rewriteQuery(query *dnsmessage.Message, targetDomain, rewriteDomain string) *dnsmessage.Message {

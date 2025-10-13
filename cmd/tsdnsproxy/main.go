@@ -38,7 +38,11 @@ func getHostDNSServers() []string {
 	
 	// Try to read from /etc/resolv.conf (Linux/Unix)
 	if file, err := os.Open("/etc/resolv.conf"); err == nil {
-		defer file.Close()
+		defer func() {
+			if err := file.Close(); err != nil {
+				log.Printf("failed to close /etc/resolv.conf: %v", err)
+			}
+		}()
 		scanner := bufio.NewScanner(file)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
