@@ -1,0 +1,39 @@
+# Git files
+.git
+.gitignore
+.github
+
+# Documentation
+*.md
+docs/
+
+# Development tools
+.golangci.yml
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Test files
+*_test.go
+cover.out
+coverage.html
+testdata/
+
+# Build artifacts
+bin/
+dist/
+tsdnsproxy
+tsdnsproxy-*
+
+# Kubernetes manifests
+k8s/
+
+# Logs and temporary files
+*.log
+tmp/
+temp/
+
+# State directory (runtime only)
+tsdnsproxy-state/
