@@ -214,14 +214,14 @@ func TestParser_ValidateGrant(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "invalid - negative translateID",
+			name: "valid - negative translateID for standard forwarding",
 			grant: GrantConfig{
 				"cluster.local": DNSGrant{
 					DNS:         []string{"10.0.0.1:53"},
 					TranslateID: -1,
 				},
 			},
-			wantErr: true,
+			wantErr: false,
 		},
 	}
 
