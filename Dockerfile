@@ -21,8 +21,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     go mod download
 
-# Copy source code
-COPY . .
+# Copy source code (only necessary directories)
+COPY cmd/ ./cmd/
+COPY internal/ ./internal/
 
 # Build with native Go cross-compilation
 ARG VERSION=dev
