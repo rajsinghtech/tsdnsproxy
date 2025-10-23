@@ -44,17 +44,21 @@ func (p *Parser) ParseGrants(capMap tailcfg.PeerCapMap) ([]GrantConfig, error) {
 	}
 
 	for i, raw := range rawMessages {
+		log.Printf("[v] parsing grant %d, raw: %s", i, raw)
 		var grant GrantConfig
 		if err := json.Unmarshal([]byte(raw), &grant); err != nil {
 			// Log the error to help with debugging configuration issues
 			log.Printf("warning: failed to unmarshal grant %d: %v", i, err)
+			log.Printf("warning: raw grant data: %s", raw)
 			continue // Skip invalid grants
 		}
 
+		log.Printf("[v] parsed grant %d successfully: %+v", i, grant)
 		if err := p.validateGrant(grant); err != nil {
 			log.Printf("warning: invalid grant %d: %v", i, err)
 			continue
 		}
+		log.Printf("[v] validated grant %d successfully", i)
 		grantConfigs = append(grantConfigs, grant)
 	}
 
@@ -116,9 +120,8 @@ func (p *Parser) validateGrant(grant GrantConfig) error {
 			}
 		}
 
-		if dnsGrant.TranslateID < 0 {
-			return fmt.Errorf("negative translate ID for %s", domain)
-		}
+		// TranslateID can be negative to indicate standard forwarding mode
+		// No validation needed for TranslateID
 	}
 
 	return nil

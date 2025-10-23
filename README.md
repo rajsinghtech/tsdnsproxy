@@ -29,7 +29,10 @@ Configure DNS behavior through Tailscale ACL grants:
 
 - **dns**: Backend DNS servers to forward queries to (with failover)
 - **rewrite**: optional - Rewrite domain before forwarding (e.g., `api.cluster1.local` → `api.cluster.local`)
-- **translateid**: optional - Site ID for 4via6 translation of A records to AAAA records
+- **translateid**: optional - Controls DNS handling mode:
+  - **Omit or < 0**: Standard forwarding mode (forwards queries to backends, returns responses as-is)
+  - **0**: Authoritative mode without 4via6 translation (resolves from backends, returns A/AAAA records directly)
+  - **> 0**: Authoritative mode with 4via6 translation (converts A records to AAAA using site ID)
 
 ```json
 {
@@ -47,7 +50,7 @@ Configure DNS behavior through Tailscale ACL grants:
             },
             "cluster2.local": {
               "dns": ["10.2.0.10:53"],
-              "translateid": 2
+              "translateid": -1
             }
           }
         ]
@@ -135,15 +138,67 @@ Most specific match wins:
 - Grants: `cluster.local`, `svc.cluster.local`
 - Winner: `svc.cluster.local`
 
-## 4via6 Translation
+## DNS Handling Modes
 
-When `translateid` is set, A records are converted to AAAA records using Tailscale's 4via6 format:
+tsdnsproxy supports three DNS handling modes controlled by the `translateid` field:
 
-- IPv4: `10.1.2.3`
-- Site ID: `42`
-- 4via6: `fd7a:115c:a1e0:b1a:0:2a:a01:203`
+### Standard Forwarding Mode (`translateid` < 0 or omitted)
 
-This allows IPv4-only services to be accessed over Tailscale's IPv6 network.
+Queries are forwarded to backend DNS servers and responses are returned as-is. Use this for normal DNS proxying without modification.
+
+```json
+{
+  "cluster.local": {
+    "dns": ["10.0.0.10:53"],
+    "rewrite": "svc.cluster.local",
+    "translateid": -1
+  }
+}
+```
+
+**Behavior:**
+- Forwards queries to backend servers
+- Returns responses unchanged (A, AAAA, CNAME, etc.)
+- Backend handles all query types
+- Recommended for most use cases
+
+### Authoritative Mode Without Translation (`translateid`: 0)
+
+tsdnsproxy resolves queries authoritatively by querying backends directly and returning A/AAAA records without modification.
+
+```json
+{
+  "cluster.local": {
+    "dns": ["10.0.0.10:53"],
+    "translateid": 0
+  }
+}
+```
+
+**Behavior:**
+- Queries backend for A/AAAA records
+- Returns records directly without forwarding full response
+- Other query types return NODATA
+- Use when you need authoritative responses without 4via6
+
+### 4via6 Translation Mode (`translateid` > 0)
+
+A records are converted to AAAA records using Tailscale's 4via6 format, allowing IPv4-only services to be accessed over Tailscale's IPv6 network.
+
+```json
+{
+  "cluster.local": {
+    "dns": ["10.0.0.10:53"],
+    "translateid": 42
+  }
+}
+```
+
+**Behavior:**
+- A queries return NODATA
+- AAAA queries return synthetic 4via6 addresses
+- IPv4 `10.1.2.3` with Site ID `42` → `fd7a:115c:a1e0:b1a:0:2a:a01:203`
+- Enables IPv4 services over Tailscale's IPv6 network
 
 ## Health Checks
 
@@ -160,16 +215,18 @@ Route DNS for different clusters while maintaining consistent naming:
 {
   "prod.cluster.local": {
     "dns": ["10.1.0.10:53"],
-    "rewrite": "cluster.local"
+    "rewrite": "cluster.local",
+    "translateid": -1
   },
   "staging.cluster.local": {
     "dns": ["10.2.0.10:53"],
-    "rewrite": "cluster.local"
+    "rewrite": "cluster.local",
+    "translateid": -1
   }
 }
 ```
 
-Developers can use `api.cluster.local` and get routed to the correct cluster based on their identity.
+Developers can use `api.cluster.local` and get routed to the correct cluster based on their identity. Using `translateid: -1` ensures standard DNS forwarding without modification.
 
 ### Split-Horizon DNS
 
@@ -183,7 +240,10 @@ Different teams see different DNS results:
       "dst": ["tag:tsdnsproxy"],
       "app": {
         "rajsingh.info/cap/tsdnsproxy": [{
-          "internal.local": {"dns": ["10.1.0.10:53"]}
+          "internal.local": {
+            "dns": ["10.1.0.10:53"],
+            "translateid": -1
+          }
         }]
       }
     },
@@ -192,13 +252,37 @@ Different teams see different DNS results:
       "dst": ["tag:tsdnsproxy"],
       "app": {
         "rajsingh.info/cap/tsdnsproxy": [{
-          "internal.local": {"dns": ["10.2.0.10:53"]}
+          "internal.local": {
+            "dns": ["10.2.0.10:53"],
+            "translateid": -1
+          }
         }]
       }
     }
   ]
 }
 ```
+
+### IPv4-only Services via Tailscale IPv6
+
+Access IPv4-only Kubernetes services over Tailscale's IPv6 network using 4via6 translation:
+
+```json
+{
+  "site1.k8s": {
+    "dns": ["10.1.0.10:53"],
+    "rewrite": "svc.cluster.local",
+    "translateid": 1
+  },
+  "site2.k8s": {
+    "dns": ["10.2.0.10:53"],
+    "rewrite": "svc.cluster.local",
+    "translateid": 2
+  }
+}
+```
+
+Queries for `api.site1.k8s` return synthetic AAAA records that route to the IPv4 service via Tailscale.
 
 ## Development
 
