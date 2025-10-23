@@ -122,14 +122,10 @@ jobs:
         uses: anchore/sbom-action@v0.20.6
         with:
           image: ghcr.io/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
-          artifact-name: sbom.spdx.json
+          artifact-name: sbom
           output-file: sbom.spdx.json
-
-      - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom
-          path: sbom.spdx.json
+          upload-artifact: true
+          upload-release-assets: false
 
   create-release:
     name: Create GitHub Release
@@ -142,6 +138,14 @@ jobs:
         uses: actions/download-artifact@v5
         with:
           path: ./artifacts
+          pattern: tsdnsproxy-*
+          merge-multiple: false
+
+      - name: Download SBOM
+        uses: actions/download-artifact@v5
+        with:
+          name: sbom
+          path: ./artifacts/sbom
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
