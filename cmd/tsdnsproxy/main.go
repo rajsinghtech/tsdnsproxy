@@ -129,6 +129,7 @@ func main() {
 		healthAddr   = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
 		listenAddrs  = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
 		acceptRoutes = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes")
+		useTSDialer  = flag.Bool("use-ts-dialer", envOr("TSDNSPROXY_USE_TS_DIALER", "false") == "true", "use Tailscale's dialer to allow to query DNS over tailnet")
 		verbose      = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
 	)
 	flag.Parse()
@@ -205,7 +206,14 @@ func main() {
 		defaultServers = getHostDNSServers()
 		log.Printf("using host DNS servers: %v", defaultServers)
 	}
-	backendMgr := backend.NewManager(defaultServers)
+
+	var dnsDialer backend.DNSDialer
+	if *useTSDialer {
+		log.Printf("using ts dialer to query DNS over tailnet")
+		dnsDialer = s
+	}
+
+	backendMgr := backend.NewManager(defaultServers, dnsDialer)
 	defer backendMgr.Close()
 
 	grantParser := grants.NewParser()
