@@ -108,6 +108,8 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TSDNSPROXY_OVERRIDE_DNS`: Override host DNS servers (comma-separated, defaults to host's resolvers)
 - `TSDNSPROXY_LISTEN_ADDRS`: Listen addresses (default: `tailscale`) - see Network Configuration
 - `TSDNSPROXY_HEALTH_ADDR`: Health check endpoint address (default: `:8080`)
+- `TSDNSPROXY_ACCEPT_ROUTES`: Accept subnet routes (default: `false`)
+- `TSDNSPROXY_USE_TS_DIALER`: Query DNS over tailnet routes (default: `false`)
 - `TSDNSPROXY_VERBOSE`: Enable verbose logging (default: `false`)
 
 ### Command Line Flags
@@ -262,6 +264,25 @@ Different teams see different DNS results:
   ]
 }
 ```
+
+### Split-Horizon DNS over 4via6
+
+Forwarding DNS queries over 4via6 allows DNS servers to run on overlapping IP or CIDR ranges. You need to enable `TSDNSPROXY_ACCEPT_ROUTES` to accept the 4via6 subnets and `TSDNSPROXY_USE_TS_DIALER` to send queries over tsnet.
+
+```json
+{
+  "site1.vpc": {
+    "dns": ["[fd7a:115c:a1e0:b1a:0:1:a0f:2]:53"],
+    "translateid": 1
+  },
+  "site2.vpc": {
+    "dns": ["[fd7a:115c:a1e0:b1a:0:2:a0f:2]:53"],
+    "translateid": 2
+  }
+}
+```
+
+In this case, Both DNS server for `site1.vpc` and `site2.vpc` run on `10.15.0.2/16 but it will be queried over 4via6. This setup is useful when a service discovery is enabled in your VPCs.
 
 ### IPv4-only Services via Tailscale IPv6
 
