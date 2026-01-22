@@ -9,6 +9,18 @@ import (
 	"time"
 )
 
+type DNSDialer interface {
+	Dial(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+type netDialer struct {
+	net.Dialer
+}
+
+func (d netDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	return d.DialContext(ctx, network, address)
+}
+
 // Backend represents a DNS backend that can handle queries
 type Backend interface {
 	// Query sends a DNS query and returns the response
@@ -30,18 +42,20 @@ type Manager struct {
 	mu              sync.RWMutex
 	unhealthy       map[string]*backendHealth
 	done            chan struct{}
+	dnsDialer       DNSDialer
 }
 
 // NewManager creates a new backend manager
-func NewManager(defaultServers []string) *Manager {
+func NewManager(defaultServers []string, dnsDialer DNSDialer) *Manager {
 	m := &Manager{
 		unhealthy: make(map[string]*backendHealth),
 		done:      make(chan struct{}),
+		dnsDialer: dnsDialer,
 	}
 
 	for _, server := range defaultServers {
 		if server != "" {
-			m.defaultBackends = append(m.defaultBackends, NewUDPBackend(server))
+			m.defaultBackends = append(m.defaultBackends, NewUDPBackend(server, dnsDialer))
 		}
 	}
 
@@ -86,7 +100,7 @@ func (m *Manager) CreateBackends(servers []string) []Backend {
 	var backends []Backend
 	for _, server := range servers {
 		if server != "" {
-			backends = append(backends, NewUDPBackend(server))
+			backends = append(backends, NewUDPBackend(server, m.dnsDialer))
 		}
 	}
 	return backends
@@ -163,20 +177,22 @@ func (m *Manager) Close() {
 
 // UDPBackend implements a UDP DNS backend
 type UDPBackend struct {
-	server  string
-	timeout time.Duration
+	server    string
+	timeout   time.Duration
+	dnsDialer DNSDialer
 }
 
 // NewUDPBackend creates a new UDP DNS backend
-func NewUDPBackend(server string) *UDPBackend {
+func NewUDPBackend(server string, dnsDialer DNSDialer) *UDPBackend {
 	// Ensure server has port
 	if _, _, err := net.SplitHostPort(server); err != nil {
 		server = net.JoinHostPort(server, "53")
 	}
 
 	return &UDPBackend{
-		server:  server,
-		timeout: 2 * time.Second,
+		server:    server,
+		timeout:   2 * time.Second,
+		dnsDialer: dnsDialer,
 	}
 }
 
@@ -186,7 +202,12 @@ func (b *UDPBackend) Query(ctx context.Context, query []byte) ([]byte, error) {
 		deadline = d
 	}
 
-	conn, err := net.Dial("udp", b.server)
+	var d DNSDialer = netDialer{net.Dialer{}}
+	if b.dnsDialer != nil {
+		d = b.dnsDialer
+	}
+
+	conn, err := d.Dial(ctx, "udp", b.server)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", b.server, err)
 	}
