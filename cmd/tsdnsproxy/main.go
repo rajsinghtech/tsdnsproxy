@@ -1,26 +1,28 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
-	"bufio"
-	"net"
 
 	"github.com/rajsinghtech/tsdnsproxy/internal/backend"
 	"github.com/rajsinghtech/tsdnsproxy/internal/cache"
 	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
 	"github.com/rajsinghtech/tsdnsproxy/internal/dns"
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
+	"tailscale.com/client/local"
 	"tailscale.com/hostinfo"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
 	"tailscale.com/tsnet"
@@ -35,7 +37,7 @@ func envOr(key, defaultVal string) string {
 
 func getHostDNSServers() []string {
 	var servers []string
-	
+
 	// Try to read from /etc/resolv.conf (Linux/Unix)
 	if file, err := os.Open("/etc/resolv.conf"); err == nil {
 		defer func() {
@@ -59,7 +61,7 @@ func getHostDNSServers() []string {
 			return servers
 		}
 	}
-	
+
 	// Fallback to system DNS resolution
 	config, err := net.DefaultResolver.LookupNS(context.Background(), ".")
 	if err == nil && len(config) > 0 {
@@ -74,7 +76,7 @@ func getHostDNSServers() []string {
 			return servers
 		}
 	}
-	
+
 	// Final fallback to common public DNS
 	log.Println("warning: could not determine host DNS servers, falling back to 8.8.8.8:53")
 	return []string{"8.8.8.8:53"}
@@ -117,16 +119,17 @@ func main() {
 	hostinfo.SetApp("tsdnsproxy")
 
 	var (
-		authKey     = flag.String("authkey", os.Getenv("TS_AUTHKEY"), "tailscale auth key")
-		hostname    = flag.String("hostname", envOr("TSDNSPROXY_HOSTNAME", "tsdnsproxy"), "hostname on tailnet")
-		stateDir    = flag.String("statedir", envOr("TSDNSPROXY_STATE_DIR", "/var/lib/tsdnsproxy"), "state directory")
-		state       = flag.String("state", os.Getenv("TSDNSPROXY_STATE"), "state storage (e.g., kube:<secret-name>)")
-		controlURL  = flag.String("controlurl", os.Getenv("TS_CONTROLURL"), "optional alternate control server URL")
-		overrideDNS = flag.String("override-dns", envOr("TSDNSPROXY_OVERRIDE_DNS", ""), "override DNS servers (comma-separated, defaults to host resolvers)")
-		cacheExpiry = flag.Duration("cache-expiry", constants.DefaultCacheExpiry, "whois cache expiry duration")
-		healthAddr  = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
-		listenAddrs = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
-		verbose     = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
+		authKey      = flag.String("authkey", os.Getenv("TS_AUTHKEY"), "tailscale auth key")
+		hostname     = flag.String("hostname", envOr("TSDNSPROXY_HOSTNAME", "tsdnsproxy"), "hostname on tailnet")
+		stateDir     = flag.String("statedir", envOr("TSDNSPROXY_STATE_DIR", "/var/lib/tsdnsproxy"), "state directory")
+		state        = flag.String("state", os.Getenv("TSDNSPROXY_STATE"), "state storage (e.g., kube:<secret-name>)")
+		controlURL   = flag.String("controlurl", os.Getenv("TS_CONTROLURL"), "optional alternate control server URL")
+		overrideDNS  = flag.String("override-dns", envOr("TSDNSPROXY_OVERRIDE_DNS", ""), "override DNS servers (comma-separated, defaults to host resolvers)")
+		cacheExpiry  = flag.Duration("cache-expiry", constants.DefaultCacheExpiry, "whois cache expiry duration")
+		healthAddr   = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
+		listenAddrs  = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
+		acceptRoutes = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes")
+		verbose      = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
 	)
 	flag.Parse()
 
@@ -235,6 +238,14 @@ func main() {
 		}
 	}
 
+	if *acceptRoutes {
+		log.Print("accepting subnet routes...")
+
+		if err := enableAcceptRoutes(ctx, lc); err != nil {
+			log.Fatalf("failed to enable accepting routes: %v", err)
+		}
+	}
+
 	dnsServer := &dns.Server{
 		TSServer:    s,
 		LocalClient: lc,
@@ -248,7 +259,7 @@ func main() {
 	healthServer := startHealthServer(ctx, *healthAddr, s)
 
 	// Start DNS server (handles both UDP and TCP)
-	log.Printf("starting DNS server")
+	log.Printf("starting DNS server: %v", *listenAddrs)
 	if err := dnsServer.RunWithAddrs(ctx, *listenAddrs, status); err != nil {
 		log.Printf("DNS server error: %v", err)
 	}
@@ -259,6 +270,29 @@ func main() {
 		log.Printf("health shutdown: %v", err)
 	}
 
+}
+
+// Enable --accept-routes to be able to route DNS traffic via subnet routes in tailnet
+func enableAcceptRoutes(ctx context.Context, lc *local.Client) error {
+	prefs, err := lc.GetPrefs(ctx)
+	if err != nil {
+		return err
+	}
+
+	if !prefs.RouteAll {
+		_, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+			Prefs: ipn.Prefs{
+				RouteAll: true,
+			},
+			RouteAllSet: true,
+		})
+
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func logf(verbose bool) func(format string, args ...any) {
