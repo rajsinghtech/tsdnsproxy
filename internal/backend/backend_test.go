@@ -314,7 +314,7 @@ func TestUDPBackend(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backend := NewUDPBackend(tt.server)
+			backend := NewUDPBackend(tt.server, nil)
 			if backend.String() != tt.want {
 				t.Errorf("NewUDPBackend(%q) server = %q, want %q", tt.server, backend.String(), tt.want)
 			}
@@ -326,7 +326,7 @@ func TestUDPBackend(t *testing.T) {
 }
 
 func TestCreateBackends(t *testing.T) {
-	m := NewManager(nil)
+	m := NewManager(nil, nil)
 	defer m.Close()
 
 	servers := []string{"8.8.8.8", "1.1.1.1:53", "", "8.8.4.4"}
@@ -347,7 +347,7 @@ func TestCreateBackends(t *testing.T) {
 
 func TestManagerWithDefaults(t *testing.T) {
 	defaultServers := []string{"8.8.8.8", "1.1.1.1"}
-	m := NewManager(defaultServers)
+	m := NewManager(defaultServers, nil)
 	defer m.Close()
 
 	if len(m.defaultBackends) != 2 {
