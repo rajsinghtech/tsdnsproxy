@@ -109,6 +109,7 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TSDNSPROXY_LISTEN_ADDRS`: Listen addresses (default: `tailscale`) - see Network Configuration
 - `TSDNSPROXY_HEALTH_ADDR`: Health check endpoint address (default: `:8080`)
 - `TSDNSPROXY_ACCEPT_ROUTES`: Accept subnet routes (default: `false`)
+- `TSDNSPROXY_ADVERTISE_TAGS`: ACL tags to advertise (comma-separated, default: none)
 - `TSDNSPROXY_USE_TS_DIALER`: Query DNS over tailnet routes (default: `false`)
 - `TSDNSPROXY_VERBOSE`: Enable verbose logging (default: `false`)
 
