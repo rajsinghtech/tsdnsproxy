@@ -119,18 +119,19 @@ func main() {
 	hostinfo.SetApp("tsdnsproxy")
 
 	var (
-		authKey      = flag.String("authkey", os.Getenv("TS_AUTHKEY"), "tailscale auth key")
-		hostname     = flag.String("hostname", envOr("TSDNSPROXY_HOSTNAME", "tsdnsproxy"), "hostname on tailnet")
-		stateDir     = flag.String("statedir", envOr("TSDNSPROXY_STATE_DIR", "/var/lib/tsdnsproxy"), "state directory")
-		state        = flag.String("state", os.Getenv("TSDNSPROXY_STATE"), "state storage (e.g., kube:<secret-name>)")
-		controlURL   = flag.String("controlurl", os.Getenv("TS_CONTROLURL"), "optional alternate control server URL")
-		overrideDNS  = flag.String("override-dns", envOr("TSDNSPROXY_OVERRIDE_DNS", ""), "override DNS servers (comma-separated, defaults to host resolvers)")
-		cacheExpiry  = flag.Duration("cache-expiry", constants.DefaultCacheExpiry, "whois cache expiry duration")
-		healthAddr   = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
-		listenAddrs  = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
-		acceptRoutes = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes")
-		useTSDialer  = flag.Bool("use-ts-dialer", envOr("TSDNSPROXY_USE_TS_DIALER", "false") == "true", "use Tailscale's dialer to allow to query DNS over tailnet")
-		verbose      = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
+		authKey       = flag.String("authkey", os.Getenv("TS_AUTHKEY"), "tailscale auth key")
+		hostname      = flag.String("hostname", envOr("TSDNSPROXY_HOSTNAME", "tsdnsproxy"), "hostname on tailnet")
+		stateDir      = flag.String("statedir", envOr("TSDNSPROXY_STATE_DIR", "/var/lib/tsdnsproxy"), "state directory")
+		state         = flag.String("state", os.Getenv("TSDNSPROXY_STATE"), "state storage (e.g., kube:<secret-name>)")
+		controlURL    = flag.String("controlurl", os.Getenv("TS_CONTROLURL"), "optional alternate control server URL")
+		advertiseTags = flag.String("advertise-tags", os.Getenv("TSDNSPROXY_ADVERTISE_TAGS"), "ACL tags to advertise (comma-separated, default: none)")
+		overrideDNS   = flag.String("override-dns", envOr("TSDNSPROXY_OVERRIDE_DNS", ""), "override DNS servers (comma-separated, defaults to host resolvers)")
+		cacheExpiry   = flag.Duration("cache-expiry", constants.DefaultCacheExpiry, "whois cache expiry duration")
+		healthAddr    = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
+		listenAddrs   = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
+		acceptRoutes  = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes")
+		useTSDialer   = flag.Bool("use-ts-dialer", envOr("TSDNSPROXY_USE_TS_DIALER", "false") == "true", "use Tailscale's dialer to allow to query DNS over tailnet")
+		verbose       = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
 	)
 	flag.Parse()
 
@@ -154,6 +155,10 @@ func main() {
 		Hostname: *hostname,
 		AuthKey:  *authKey,
 		Logf:     logf(*verbose),
+	}
+
+	if *advertiseTags != "" {
+		s.AdvertiseTags = strings.Split(*advertiseTags, ",")
 	}
 
 	if *controlURL != "" {
@@ -277,7 +282,6 @@ func main() {
 	if err := healthServer.Shutdown(ctx2); err != nil {
 		log.Printf("health shutdown: %v", err)
 	}
-
 }
 
 // Enable --accept-routes to be able to route DNS traffic via subnet routes in tailnet
@@ -294,7 +298,6 @@ func enableAcceptRoutes(ctx context.Context, lc *local.Client) error {
 			},
 			RouteAllSet: true,
 		})
-
 		if err != nil {
 			return err
 		}
