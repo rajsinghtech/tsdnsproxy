@@ -121,6 +121,7 @@ func TestManagerQuery(t *testing.T) {
 			m := &Manager{
 				unhealthy: make(map[string]*backendHealth),
 				done:      make(chan struct{}),
+				logf:      func(format string, args ...any) {},
 			}
 			defer m.Close()
 
@@ -143,6 +144,7 @@ func TestManagerHealthTracking(t *testing.T) {
 	m := &Manager{
 		unhealthy: make(map[string]*backendHealth),
 		done:      make(chan struct{}),
+		logf:      func(format string, args ...any) {},
 	}
 	defer m.Close()
 
@@ -176,6 +178,7 @@ func TestBackoffCalculation(t *testing.T) {
 	m := &Manager{
 		unhealthy: make(map[string]*backendHealth),
 		done:      make(chan struct{}),
+		logf:      func(format string, args ...any) {},
 	}
 	defer m.Close()
 
@@ -229,6 +232,7 @@ func TestHealthCleanup(t *testing.T) {
 	m := &Manager{
 		unhealthy: make(map[string]*backendHealth),
 		done:      make(chan struct{}),
+		logf:      func(format string, args ...any) {},
 	}
 
 	// Start cleanup goroutine
@@ -259,6 +263,7 @@ func TestConcurrentAccess(t *testing.T) {
 	m := &Manager{
 		unhealthy: make(map[string]*backendHealth),
 		done:      make(chan struct{}),
+		logf:      func(format string, args ...any) {},
 	}
 	defer m.Close()
 
@@ -326,7 +331,7 @@ func TestUDPBackend(t *testing.T) {
 }
 
 func TestCreateBackends(t *testing.T) {
-	m := NewManager(nil, nil)
+	m := NewManager(nil, nil, nil)
 	defer m.Close()
 
 	servers := []string{"8.8.8.8", "1.1.1.1:53", "", "8.8.4.4"}
@@ -347,7 +352,7 @@ func TestCreateBackends(t *testing.T) {
 
 func TestManagerWithDefaults(t *testing.T) {
 	defaultServers := []string{"8.8.8.8", "1.1.1.1"}
-	m := NewManager(defaultServers, nil)
+	m := NewManager(defaultServers, nil, nil)
 	defer m.Close()
 
 	if len(m.defaultBackends) != 2 {
@@ -384,6 +389,7 @@ func TestBackendFailoverWithUnhealthy(t *testing.T) {
 	m := &Manager{
 		unhealthy: make(map[string]*backendHealth),
 		done:      make(chan struct{}),
+		logf:      func(format string, args ...any) {},
 	}
 	defer m.Close()
 

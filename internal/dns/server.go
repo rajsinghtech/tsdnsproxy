@@ -387,6 +387,12 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 
 	identity := s.getIdentity(whois)
 	s.Logf("[v] client whois for %s: identity=%s", host, identity)
+	if whois.Node != nil {
+		s.Logf("[v] client node: name=%s tags=%v addresses=%v", whois.Node.Name, whois.Node.Tags, whois.Node.Addresses)
+	}
+	if whois.UserProfile != nil {
+		s.Logf("[v] client user: login=%s displayName=%s", whois.UserProfile.LoginName, whois.UserProfile.DisplayName)
+	}
 	s.Logf("[v] client capabilities: %+v", whois.CapMap)
 
 	cachedGrants, cached := s.GrantCache.Get(identity)
@@ -493,6 +499,7 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 
 	// Forward to configured backends
 	backends := s.BackendMgr.CreateBackends(grant.DNS)
+	s.Logf("[v] forwarding %s to backends: %v (rewrite=%q)", queryName, grant.DNS, grant.Rewrite)
 	response, err := s.forwardQuery(ctx, rewrittenQuery, backends, &grant, originalName)
 	if err != nil {
 		return nil, err

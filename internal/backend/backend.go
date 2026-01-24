@@ -43,14 +43,19 @@ type Manager struct {
 	unhealthy       map[string]*backendHealth
 	done            chan struct{}
 	dnsDialer       DNSDialer
+	logf            func(format string, args ...any)
 }
 
 // NewManager creates a new backend manager
-func NewManager(defaultServers []string, dnsDialer DNSDialer) *Manager {
+func NewManager(defaultServers []string, dnsDialer DNSDialer, logf func(format string, args ...any)) *Manager {
+	if logf == nil {
+		logf = func(format string, args ...any) {}
+	}
 	m := &Manager{
 		unhealthy: make(map[string]*backendHealth),
 		done:      make(chan struct{}),
 		dnsDialer: dnsDialer,
+		logf:      logf,
 	}
 
 	for _, server := range defaultServers {
@@ -69,22 +74,27 @@ func NewManager(defaultServers []string, dnsDialer DNSDialer) *Manager {
 func (m *Manager) Query(ctx context.Context, backends []Backend, query []byte) ([]byte, error) {
 	if len(backends) == 0 {
 		backends = m.defaultBackends
+		m.logf("[v] using default backends: %d available", len(backends))
 	}
 
 	var lastErr error
 	for _, backend := range backends {
 		// Check if backend is in unhealthy state
 		if m.isUnhealthy(backend.String()) {
+			m.logf("[v] skipping unhealthy backend: %s", backend.String())
 			continue
 		}
 
+		m.logf("[v] trying backend: %s (dialer=%T)", backend.String(), m.dnsDialer)
 		resp, err := backend.Query(ctx, query)
 		if err == nil {
 			// Mark backend as healthy on success
 			m.markHealthy(backend.String())
+			m.logf("[v] backend %s succeeded", backend.String())
 			return resp, nil
 		}
 
+		m.logf("[v] backend %s failed: %v", backend.String(), err)
 		lastErr = err
 		m.markUnhealthy(backend.String())
 	}
