@@ -110,7 +110,7 @@ jobs:
             VERSION=${{ steps.version.outputs.VERSION }}
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3.9.2
+        uses: sigstore/cosign-installer@v3.10.1
 
       - name: Sign container image
         env:
