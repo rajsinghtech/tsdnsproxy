@@ -222,7 +222,7 @@ func main() {
 		dnsDialer = s
 	}
 
-	backendMgr := backend.NewManager(defaultServers, dnsDialer)
+	backendMgr := backend.NewManager(defaultServers, dnsDialer, logf(*verbose))
 	defer backendMgr.Close()
 
 	grantParser := grants.NewParser()
