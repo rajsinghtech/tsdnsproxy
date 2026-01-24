@@ -60,7 +60,7 @@ func NewManager(defaultServers []string, dnsDialer DNSDialer, logf func(format s
 
 	for _, server := range defaultServers {
 		if server != "" {
-			m.defaultBackends = append(m.defaultBackends, NewUDPBackend(server, dnsDialer))
+			m.defaultBackends = append(m.defaultBackends, NewUDPBackend(server, dnsDialer, logf))
 		}
 	}
 
@@ -110,7 +110,7 @@ func (m *Manager) CreateBackends(servers []string) []Backend {
 	var backends []Backend
 	for _, server := range servers {
 		if server != "" {
-			backends = append(backends, NewUDPBackend(server, m.dnsDialer))
+			backends = append(backends, NewUDPBackend(server, m.dnsDialer, m.logf))
 		}
 	}
 	return backends
@@ -185,24 +185,30 @@ func (m *Manager) Close() {
 	close(m.done)
 }
 
-// UDPBackend implements a UDP DNS backend
+// UDPBackend implements a DNS backend that tries TCP first, then UDP
 type UDPBackend struct {
 	server    string
 	timeout   time.Duration
 	dnsDialer DNSDialer
+	logf      func(format string, args ...any)
 }
 
-// NewUDPBackend creates a new UDP DNS backend
-func NewUDPBackend(server string, dnsDialer DNSDialer) *UDPBackend {
+// NewUDPBackend creates a new DNS backend
+func NewUDPBackend(server string, dnsDialer DNSDialer, logf func(format string, args ...any)) *UDPBackend {
 	// Ensure server has port
 	if _, _, err := net.SplitHostPort(server); err != nil {
 		server = net.JoinHostPort(server, "53")
 	}
 
+	if logf == nil {
+		logf = func(format string, args ...any) {}
+	}
+
 	return &UDPBackend{
 		server:    server,
-		timeout:   2 * time.Second,
+		timeout:   10 * time.Second,
 		dnsDialer: dnsDialer,
+		logf:      logf,
 	}
 }
 
@@ -212,21 +218,76 @@ func (b *UDPBackend) Query(ctx context.Context, query []byte) ([]byte, error) {
 		deadline = d
 	}
 
-	var d DNSDialer = netDialer{net.Dialer{}}
+	var dnsDialer DNSDialer = netDialer{net.Dialer{}}
 	if b.dnsDialer != nil {
-		d = b.dnsDialer
+		dnsDialer = b.dnsDialer
 	}
 
-	conn, err := d.Dial(ctx, "udp", b.server)
-	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", b.server, err)
+	// Try TCP first - it properly waits for connection establishment with tsnet/netstack
+	// UDP dial returns immediately even if WireGuard tunnel isn't ready
+	b.logf("[v] dialing %s with TCP (dialer=%T)", b.server, dnsDialer)
+	resp, err := b.queryTCP(ctx, dnsDialer, query, deadline)
+	if err == nil {
+		return resp, nil
 	}
+	b.logf("[v] TCP query failed: %v, falling back to UDP", err)
+
+	// Fallback to UDP
+	return b.queryUDP(ctx, dnsDialer, query, deadline)
+}
+
+func (b *UDPBackend) queryTCP(ctx context.Context, d DNSDialer, query []byte, deadline time.Time) ([]byte, error) {
+	conn, err := d.Dial(ctx, "tcp", b.server)
+	if err != nil {
+		return nil, fmt.Errorf("tcp dial %s: %w", b.server, err)
+	}
+	b.logf("[v] TCP dial succeeded, conn_type=%T local=%s remote=%s", conn, conn.LocalAddr(), conn.RemoteAddr())
 	defer func() {
 		_ = conn.Close()
 	}()
 
 	if err := conn.SetDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("set deadline: %w", err)
+	}
+
+	// DNS over TCP requires 2-byte length prefix
+	tcpQuery := make([]byte, 2+len(query))
+	tcpQuery[0] = byte(len(query) >> 8)
+	tcpQuery[1] = byte(len(query))
+	copy(tcpQuery[2:], query)
+
+	if _, err := conn.Write(tcpQuery); err != nil {
+		return nil, fmt.Errorf("write query: %w", err)
+	}
+
+	// Read length prefix
+	lenBuf := make([]byte, 2)
+	if _, err := readFull(conn, lenBuf); err != nil {
+		return nil, fmt.Errorf("read length: %w", err)
+	}
+	respLen := int(lenBuf[0])<<8 | int(lenBuf[1])
+
+	// Read response
+	resp := make([]byte, respLen)
+	if _, err := readFull(conn, resp); err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	return resp, nil
+}
+
+func (b *UDPBackend) queryUDP(ctx context.Context, d DNSDialer, query []byte, deadline time.Time) ([]byte, error) {
+	b.logf("[v] dialing %s with UDP (dialer=%T)", b.server, d)
+	conn, err := d.Dial(ctx, "udp", b.server)
+	if err != nil {
+		return nil, fmt.Errorf("udp dial %s: %w", b.server, err)
+	}
+	b.logf("[v] UDP dial succeeded, conn_type=%T local=%s remote=%s", conn, conn.LocalAddr(), conn.RemoteAddr())
+	defer func() {
 		_ = conn.Close()
+	}()
+
+	if err := conn.SetDeadline(deadline); err != nil {
 		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 
@@ -242,6 +303,19 @@ func (b *UDPBackend) Query(ctx context.Context, query []byte) ([]byte, error) {
 	}
 
 	return resp[:n], nil
+}
+
+// readFull reads exactly len(buf) bytes from conn
+func readFull(conn net.Conn, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := conn.Read(buf[total:])
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 func (b *UDPBackend) String() string {
