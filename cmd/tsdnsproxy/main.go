@@ -129,11 +129,15 @@ func main() {
 		cacheExpiry   = flag.Duration("cache-expiry", constants.DefaultCacheExpiry, "whois cache expiry duration")
 		healthAddr    = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
 		listenAddrs   = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
-		acceptRoutes  = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes")
-		useTSDialer   = flag.Bool("use-ts-dialer", envOr("TSDNSPROXY_USE_TS_DIALER", "false") == "true", "use Tailscale's dialer to allow to query DNS over tailnet")
-		verbose       = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
+		acceptRoutes = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes and use TS dialer")
+		verbose      = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
 	)
 	flag.Parse()
+
+	// Log configuration for debugging
+	log.Printf("configuration: accept-routes=%v (env=%q), verbose=%v, listen-addrs=%q",
+		*acceptRoutes, os.Getenv("TSDNSPROXY_ACCEPT_ROUTES"),
+		*verbose, *listenAddrs)
 
 	if *authKey == "" {
 		log.Fatal("authkey is required (set TS_AUTHKEY or use -authkey)")
@@ -213,7 +217,7 @@ func main() {
 	}
 
 	var dnsDialer backend.DNSDialer
-	if *useTSDialer {
+	if *acceptRoutes {
 		log.Printf("using ts dialer to query DNS over tailnet")
 		dnsDialer = s
 	}
@@ -257,6 +261,7 @@ func main() {
 		if err := enableAcceptRoutes(ctx, lc); err != nil {
 			log.Fatalf("failed to enable accepting routes: %v", err)
 		}
+
 	}
 
 	dnsServer := &dns.Server{
@@ -291,8 +296,11 @@ func enableAcceptRoutes(ctx context.Context, lc *local.Client) error {
 		return err
 	}
 
+	log.Printf("current RouteAll preference: %v", prefs.RouteAll)
+
 	if !prefs.RouteAll {
-		_, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+		log.Print("setting RouteAll=true via EditPrefs...")
+		newPrefs, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
 			Prefs: ipn.Prefs{
 				RouteAll: true,
 			},
@@ -301,6 +309,9 @@ func enableAcceptRoutes(ctx context.Context, lc *local.Client) error {
 		if err != nil {
 			return err
 		}
+		log.Printf("EditPrefs succeeded, new RouteAll: %v", newPrefs.RouteAll)
+	} else {
+		log.Print("RouteAll already enabled, skipping EditPrefs")
 	}
 
 	return nil
