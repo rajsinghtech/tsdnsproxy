@@ -319,12 +319,12 @@ func TestUDPBackend(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			backend := NewUDPBackend(tt.server, nil)
+			backend := NewUDPBackend(tt.server, nil, nil)
 			if backend.String() != tt.want {
 				t.Errorf("NewUDPBackend(%q) server = %q, want %q", tt.server, backend.String(), tt.want)
 			}
-			if backend.timeout != 2*time.Second {
-				t.Errorf("Expected default timeout of 2s, got %v", backend.timeout)
+			if backend.timeout != 10*time.Second {
+				t.Errorf("Expected default timeout of 10s, got %v", backend.timeout)
 			}
 		})
 	}

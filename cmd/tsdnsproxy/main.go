@@ -199,6 +199,16 @@ func main() {
 		// LocalClient might become available later, but we'll continue
 	}
 
+	// Enable RouteAll BEFORE calling Up() so subnet routes are accepted
+	// in the initial WireGuard configuration
+	if *acceptRoutes && lc != nil {
+		log.Print("enabling accept-routes before tailnet up...")
+		if err := enableAcceptRoutes(ctx, lc); err != nil {
+			log.Printf("warning: failed to enable routes early: %v", err)
+			// Continue anyway, we'll try again after Up()
+		}
+	}
+
 	whoisCache := cache.NewWhoisCache(*cacheExpiry)
 	grantCache := cache.NewGrantCache(*cacheExpiry)
 
@@ -216,11 +226,11 @@ func main() {
 		log.Printf("using host DNS servers: %v", defaultServers)
 	}
 
-	var dnsDialer backend.DNSDialer
-	if *acceptRoutes {
-		log.Printf("using ts dialer to query DNS over tailnet")
-		dnsDialer = s
-	}
+	// Always use tsnet dialer for DNS backends - they may be Tailscale machines
+	// that require MagicDNS resolution. The accept-routes flag only controls
+	// whether we can reach subnet IPs, not Tailscale machine IPs.
+	log.Printf("using ts dialer to query DNS over tailnet")
+	var dnsDialer backend.DNSDialer = s
 
 	backendMgr := backend.NewManager(defaultServers, dnsDialer, logf(*verbose))
 	defer backendMgr.Close()
@@ -262,6 +272,22 @@ func main() {
 			log.Fatalf("failed to enable accepting routes: %v", err)
 		}
 
+	}
+
+	// Log peer status to help diagnose subnet route issues
+	if *verbose {
+		peerStatus, err := lc.Status(ctx)
+		if err != nil {
+			log.Printf("[DEBUG] failed to get peer status: %v", err)
+		} else {
+			log.Printf("[DEBUG] self: %s (%v)", peerStatus.Self.HostName, peerStatus.Self.TailscaleIPs)
+			for _, peer := range peerStatus.Peer {
+				if peer.PrimaryRoutes != nil && peer.PrimaryRoutes.Len() > 0 {
+					log.Printf("[DEBUG] peer %s (%s): routes=%v, online=%v, relay=%s",
+						peer.HostName, peer.TailscaleIPs, peer.PrimaryRoutes.AsSlice(), peer.Online, peer.Relay)
+				}
+			}
+		}
 	}
 
 	dnsServer := &dns.Server{
