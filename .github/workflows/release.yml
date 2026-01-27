@@ -119,7 +119,7 @@ jobs:
           cosign sign --yes ghcr.io/${{ env.IMAGE_NAME }}@${DIGEST}
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0.22.0
+        uses: anchore/sbom-action@v0.22.1
         with:
           image: ghcr.io/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
           artifact-name: sbom.spdx.json
