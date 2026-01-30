@@ -104,7 +104,7 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TS_CONTROLURL`: Custom control server URL (optional)
 - `TSDNSPROXY_HOSTNAME`: Hostname on tailnet (default: `tsdnsproxy`)
 - `TSDNSPROXY_STATE_DIR`: State directory (default: `/var/lib/tsdnsproxy`)
-- `TSDNSPROXY_STATE`: State storage backend (e.g., `kube:secret-name`)
+- `TSDNSPROXY_STATE`: State storage backend (e.g., `kube:secret-name` or `arn:aws:ssm:...`)
 - `TSDNSPROXY_OVERRIDE_DNS`: Override host DNS servers (comma-separated, defaults to host's resolvers)
 - `TSDNSPROXY_LISTEN_ADDRS`: Listen addresses (default: `tailscale`) - see Network Configuration
 - `TSDNSPROXY_HEALTH_ADDR`: Health check endpoint address (default: `:8080`)
