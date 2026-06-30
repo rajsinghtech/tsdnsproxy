@@ -7,12 +7,15 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/pires/go-proxyproto"
 	"github.com/rajsinghtech/tsdnsproxy/internal/backend"
 	"github.com/rajsinghtech/tsdnsproxy/internal/cache"
+	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
@@ -20,6 +23,12 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tsnet"
 )
+
+// serviceConfig describes a Tailscale Service to host DNS over.
+type serviceConfig struct {
+	name string // full service name, e.g. "svc:tsdnsproxy"
+	port uint16 // TCP port to advertise (must match the Service definition)
+}
 
 type LocalClient interface {
 	WhoIs(ctx context.Context, addr string) (*apitype.WhoIsResponse, error)
@@ -61,9 +70,11 @@ func (s *Server) Run(ctx context.Context) error {
 	return s.RunWithAddrs(ctx, "tailscale", status)
 }
 
-// RunWithAddrs starts DNS servers on specified addresses
+// RunWithAddrs starts DNS servers on specified addresses. In addition to
+// regular TCP/UDP listeners, addresses with a "svc:" or "service:" prefix
+// are hosted as named Tailscale Services via ListenService (TCP-only).
 func (s *Server) RunWithAddrs(ctx context.Context, listenAddrsStr string, status *ipnstate.Status) error {
-	s.workerPool = make(chan struct{}, 100)
+	s.workerPool = make(chan struct{}, constants.WorkerPoolSize)
 
 	// Load server's own grants
 	if err := s.loadServerGrants(ctx, status); err != nil {
@@ -73,15 +84,15 @@ func (s *Server) RunWithAddrs(ctx context.Context, listenAddrsStr string, status
 		s.grantsMu.Unlock()
 	}
 
-	// Parse listen addresses
-	listenAddrs := s.parseListenAddresses(listenAddrsStr, status)
+	// Parse listen addresses and services
+	listenAddrs, services := s.parseListenAddresses(listenAddrsStr, status)
 
-	// Create error channel for goroutines (2 per address)
-	errCh := make(chan error, len(listenAddrs)*2)
+	// Create error channel for goroutines (2 per regular address + 1 per service)
+	errCh := make(chan error, len(listenAddrs)*2+len(services))
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// Start UDP and TCP servers for each listen address
+	// Start UDP and TCP servers for each regular listen address
 	for _, addr := range listenAddrs {
 		// Start UDP server
 		go func(listenAddr string) {
@@ -98,6 +109,15 @@ func (s *Server) RunWithAddrs(ctx context.Context, listenAddrsStr string, status
 		}(addr)
 	}
 
+	// Start Tailscale Service listeners (TCP-only)
+	for _, svc := range services {
+		go func(svc serviceConfig) {
+			if err := s.runService(ctx, svc); err != nil {
+				errCh <- fmt.Errorf("service %s: %w", svc.name, err)
+			}
+		}(svc)
+	}
+
 	// Wait for any server to fail or context to be done
 	select {
 	case err := <-errCh:
@@ -108,39 +128,75 @@ func (s *Server) RunWithAddrs(ctx context.Context, listenAddrsStr string, status
 	}
 }
 
-// parseListenAddresses converts the listen addresses string into concrete addresses
-func (s *Server) parseListenAddresses(listenAddrsStr string, status *ipnstate.Status) []string {
-	addrs := strings.Split(listenAddrsStr, ",")
-	var result []string
-	
-	for _, addr := range addrs {
-		addr = strings.TrimSpace(addr)
-		switch addr {
+// parseListenAddresses converts the listen addresses string into concrete
+// addresses and Tailscale Service configurations. Addresses prefixed with
+// "svc:" or "service:" are returned as serviceConfig entries instead of raw
+// listen strings, since they are hosted via tsnet.ListenService (TCP-only).
+func (s *Server) parseListenAddresses(listenAddrsStr string, status *ipnstate.Status) ([]string, []serviceConfig) {
+	rawAddrs := strings.Split(listenAddrsStr, ",")
+	var addrs []string
+	var services []serviceConfig
+
+	for _, a := range rawAddrs {
+		a = strings.TrimSpace(a)
+		if a == "" {
+			continue
+		}
+
+		// Tailscale Service: "svc:<name>" or "service:<name>", optional "@<port>"
+		if name, ok := parseServiceAddr(a); ok {
+			port := uint16(constants.DNSDefaultPort)
+			if at := strings.LastIndex(name, "@"); at >= 0 {
+				portStr := name[at+1:]
+				name = name[:at]
+				if p, err := strconv.Atoi(portStr); err == nil && p > 0 && p <= 65535 {
+					port = uint16(p)
+				} else {
+					s.Logf("warning: invalid service port %q in %q, using default %d", portStr, a, port)
+				}
+			}
+			services = append(services, serviceConfig{name: name, port: port})
+			continue
+		}
+
+		switch a {
 		case "tailscale":
 			// Use the first tailscale IP
 			if status.Self != nil && len(status.Self.TailscaleIPs) > 0 {
-				result = append(result, fmt.Sprintf("%s:53", status.Self.TailscaleIPs[0]))
+				addrs = append(addrs, fmt.Sprintf("%s:53", status.Self.TailscaleIPs[0]))
 			} else {
 				s.Logf("warning: tailscale address requested but no Tailscale IPs available, using :53")
-				result = append(result, ":53")
+				addrs = append(addrs, ":53")
 			}
 		case "0.0.0.0:53", "0.0.0.0", "all":
-			result = append(result, "0.0.0.0:53")
+			addrs = append(addrs, "0.0.0.0:53")
 		case "127.0.0.1:53", "127.0.0.1", "localhost":
-			result = append(result, "127.0.0.1:53")
+			addrs = append(addrs, "127.0.0.1:53")
 		case "[::]:53", "[::]", "ipv6":
-			result = append(result, "[::]:53")
+			addrs = append(addrs, "[::]:53")
 		default:
 			// Custom address - validate it has a port
-			if !strings.Contains(addr, ":") {
-				addr += ":53"
+			if !strings.Contains(a, ":") {
+				a += ":53"
 			}
-			result = append(result, addr)
+			addrs = append(addrs, a)
 		}
 	}
-	
-	s.Logf("parsed listen addresses: %v", result)
-	return result
+
+	s.Logf("parsed listen addresses: %v (services: %v)", addrs, services)
+	return addrs, services
+}
+
+// parseServiceAddr checks whether an address token refers to a Tailscale
+// Service and returns the canonical "svc:<name>" form if so.
+func parseServiceAddr(token string) (string, bool) {
+	if strings.HasPrefix(token, "service:") {
+		return "svc:" + strings.TrimSpace(token[len("service:"):]), true
+	}
+	if strings.HasPrefix(token, "svc:") {
+		return "svc:" + strings.TrimSpace(token[len("svc:"):]), true
+	}
+	return "", false
 }
 
 // runUDP handles UDP DNS queries
@@ -296,6 +352,76 @@ func (s *Server) runTCP(ctx context.Context, listenAddr string) error {
 			s.Logf("dropping TCP connection from %s: worker pool full", conn.RemoteAddr())
 			if err := conn.Close(); err != nil {
 				s.Logf("failed to close TCP connection: %v", err)
+			}
+		}
+	}
+}
+
+// runService hosts the DNS server as a named Tailscale Service via
+// tsnet.ListenService. Services are TCP-only, so UDP DNS is not available
+// through this path. The node must be tagged (AdvertiseTags) to host a
+// Service; see https://tailscale.com/kb/1552/tailscale-services.
+//
+// PROXY protocol v2 is negotiated so that the real peer tailnet IP is
+// available to conn.RemoteAddr(), enabling per-identity whois lookups.
+func (s *Server) runService(ctx context.Context, svc serviceConfig) error {
+	ln, err := s.TSServer.ListenService(svc.name, tsnet.ServiceModeTCP{
+		Port:                  svc.port,
+		PROXYProtocolVersion:  2,
+	})
+	if err != nil {
+		return fmt.Errorf("listen service: %w", err)
+	}
+	defer func() {
+		if err := ln.Close(); err != nil {
+			s.Logf("failed to close service listener %s: %v", svc.name, err)
+		}
+	}()
+
+	s.Logf("listening on service %s (TCP port %d, FQDN: %s)", svc.name, svc.port, ln.FQDN)
+	s.Logf("note: UDP DNS is not available via Tailscale Service %s (TCP-only by design)", svc.name)
+
+	// Wrap the listener to parse PROXY protocol headers and recover the
+	// real peer tailnet IP for whois-based identity routing.
+	proxyLn := &proxyproto.Listener{Listener: ln.Listener}
+	defer func() {
+		if err := proxyLn.Close(); err != nil {
+			s.Logf("failed to close PROXY listener for %s: %v", svc.name, err)
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			s.waitForHandlers("service:" + svc.name)
+			return ctx.Err()
+		default:
+		}
+
+		conn, err := proxyLn.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			s.Logf("service %s accept: %v", svc.name, err)
+			continue
+		}
+
+		// Try to acquire a worker slot
+		select {
+		case s.workerPool <- struct{}{}:
+			s.handlerWg.Add(1)
+			go func() {
+				defer func() {
+					<-s.workerPool
+					s.handlerWg.Done()
+				}()
+				s.handleTCPConnection(ctx, conn)
+			}()
+		default:
+			s.Logf("dropping service connection from %s: worker pool full", conn.RemoteAddr())
+			if err := conn.Close(); err != nil {
+				s.Logf("failed to close service connection: %v", err)
 			}
 		}
 	}
