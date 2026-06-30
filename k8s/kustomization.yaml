@@ -9,7 +9,7 @@ resources:
 images:
 - name: tsdnsproxy
   newName: ghcr.io/rajsinghtech/tsdnsproxy
-  newTag: v1.1.2
+  newTag: "1.1.2"
 
 secretGenerator:
 - name: tsdnsproxy-auth
