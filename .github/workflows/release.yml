@@ -134,14 +134,14 @@ jobs:
       contents: write
     steps:
       - name: Download binary artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
           pattern: tsdnsproxy-*
           merge-multiple: false
 
       - name: Download SBOM
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: sbom.spdx.json
           path: ./artifacts/sbom
