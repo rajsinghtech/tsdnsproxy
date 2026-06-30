@@ -3,11 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -22,7 +20,6 @@ import (
 	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
 	"github.com/rajsinghtech/tsdnsproxy/internal/dns"
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
-	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/local"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -231,13 +228,11 @@ func main() {
 		log.Printf("using host DNS servers: %v", defaultServers)
 	}
 
-	// Use a tsnet-backed dialer that resolves hostnames via MagicDNS
-	// (100.100.100.100:53) through the tailnet before dialing. This lets
-	// DNS backends be specified as MagicDNS names (e.g.
-	// "robbinsdale-coredns.keiretsu.ts.net:53") which the host's resolver
-	// can't look up.
+	// tsnet.Server.Dial natively resolves MagicDNS hostnames via its
+	// internal resolver (resolveMemory) before dialing through the
+	// tailnet. No custom resolution wrapper is needed.
 	log.Printf("using ts dialer to query DNS over tailnet")
-	var dnsDialer backend.DNSDialer = &tsnetDNSDialer{srv: s}
+	var dnsDialer backend.DNSDialer = s
 
 	backendMgr := backend.NewManager(defaultServers, dnsDialer, logf(*verbose))
 	defer backendMgr.Close()
@@ -454,102 +449,4 @@ func (h *healthServer) handleReady(w http.ResponseWriter, r *http.Request) {
 			log.Printf("write error: %v", err)
 		}
 	}
-}
-
-// tsnetDNSDialer wraps a tsnet.Server so that hostnames are resolved via
-// MagicDNS (100.100.100.100:53) through the tailnet before dialing. This
-// allows DNS backends to be specified as MagicDNS device names (e.g.
-// "robbinsdale-coredns.keiretsu.ts.net:53") which the host's resolver
-// can't look up. Raw IPs are dialed directly through the tailnet.
-type tsnetDNSDialer struct {
-	srv *tsnet.Server
-}
-
-func (d *tsnetDNSDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return d.srv.Dial(ctx, network, address)
-	}
-
-	// If it's already an IP, dial directly through tsnet
-	if net.ParseIP(host) != nil {
-		return d.srv.Dial(ctx, network, address)
-	}
-
-	// Resolve hostname via MagicDNS by dialing 100.100.100.100:53 through
-	// the tsnet tunnel and doing a manual A-record lookup.
-	ips, err := d.resolveViaMagicDNS(ctx, host)
-	if err != nil {
-		return nil, fmt.Errorf("resolve %s via MagicDNS: %w", host, err)
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no addresses for %s", host)
-	}
-
-	resolved := net.JoinHostPort(ips[0], port)
-	log.Printf("[v] resolved %s -> %s via MagicDNS", address, resolved)
-	return d.srv.Dial(ctx, network, resolved)
-}
-
-// resolveViaMagicDNS resolves a hostname by sending a raw DNS A-record query
-// to 100.100.100.100:53 through the tsnet tunnel.
-func (d *tsnetDNSDialer) resolveViaMagicDNS(ctx context.Context, hostname string) ([]string, error) {
-	// Build a minimal DNS A query
-	name, err := dnsmessage.NewName(hostname + ".")
-	if err != nil {
-		return nil, err
-	}
-	msg := dnsmessage.Message{
-		Header: dnsmessage.Header{
-			ID:               1,
-			RecursionDesired: true,
-		},
-		Questions: []dnsmessage.Question{
-			{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
-		},
-	}
-	query, err := msg.Pack()
-	if err != nil {
-		return nil, err
-	}
-
-	// Dial MagicDNS resolver through tsnet (TCP for reliability)
-	conn, err := d.srv.Dial(ctx, "tcp", "100.100.100.100:53")
-	if err != nil {
-		return nil, fmt.Errorf("dial MagicDNS: %w", err)
-	}
-	defer conn.Close()
-
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	// DNS over TCP: 2-byte length prefix
-	if err := binary.Write(conn, binary.BigEndian, uint16(len(query))); err != nil {
-		return nil, err
-	}
-	if _, err := conn.Write(query); err != nil {
-		return nil, err
-	}
-
-	// Read response length
-	var respLen uint16
-	if err := binary.Read(conn, binary.BigEndian, &respLen); err != nil {
-		return nil, err
-	}
-	resp := make([]byte, respLen)
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		return nil, err
-	}
-
-	var response dnsmessage.Message
-	if err := response.Unpack(resp); err != nil {
-		return nil, err
-	}
-
-	var addrs []string
-	for _, ans := range response.Answers {
-		if a, ok := ans.Body.(*dnsmessage.AResource); ok {
-			addrs = append(addrs, net.IP(a.A[:]).String())
-		}
-	}
-	return addrs, nil
 }
