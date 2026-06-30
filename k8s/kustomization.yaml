@@ -15,7 +15,7 @@ secretGenerator:
 - name: tsdnsproxy-auth
   namespace: tsdnsproxy
   literals:
-  - TS_AUTHKEY=tskey-auth-REPLACE-ME
+  - TS_AUTHKEY_EPHEMERAL=tskey-auth-REPLACE-ME
   options:
     disableNameSuffixHash: true
 
