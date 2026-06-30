@@ -71,7 +71,7 @@ jobs:
       version: ${{ steps.version.outputs.VERSION }}
     steps:
       - uses: actions/checkout@v6
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Get version
         id: version
