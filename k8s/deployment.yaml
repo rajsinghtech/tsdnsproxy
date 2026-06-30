@@ -86,12 +86,12 @@ spec:
         - name: TSDNSPROXY_LISTEN_ADDRS
           value: "tailscale,svc:tsdnsproxy"
         - name: TSDNSPROXY_ADVERTISE_TAGS
-          value: "tag:tsdnsproxy"
+          value: "tag:k8s"
         - name: TS_AUTHKEY
           valueFrom:
             secretKeyRef:
               name: tsdnsproxy-auth
-              key: TS_AUTHKEY
+              key: TS_AUTHKEY_EPHEMERAL
         resources:
           requests:
             memory: "128Mi"
