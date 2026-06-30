@@ -37,7 +37,7 @@ subjects:
   namespace: tsdnsproxy
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: tsdnsproxy
   namespace: tsdnsproxy
@@ -45,6 +45,10 @@ metadata:
     app: tsdnsproxy
 spec:
   replicas: 1
+  serviceName: tsdnsproxy
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
   selector:
     matchLabels:
       app: tsdnsproxy
@@ -56,7 +60,7 @@ spec:
       serviceAccountName: tsdnsproxy
       containers:
       - name: tsdnsproxy
-        image: ghcr.io/rajsinghtech/tsdnsproxy:latest  # Update with your registry/image
+        image: ghcr.io/rajsinghtech/tsdnsproxy:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 53
@@ -69,16 +73,20 @@ spec:
           protocol: TCP
           name: health
         env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: TSDNSPROXY_STATE
           value: "kube:tsdnsproxy-state"
         - name: TSDNSPROXY_HOSTNAME
-          value: "tsdnsproxy"
+          value: "$(POD_NAME)"
         - name: TSDNSPROXY_VERBOSE
           value: "true"
-        - name: TSDNSPROXY_OVERRIDE_DNS
-          value: "8.8.8.8:53,8.8.4.4:53"  # Override host DNS with specific servers
         - name: TSDNSPROXY_LISTEN_ADDRS
-          value: "tailscale,0.0.0.0:53"  # Listen on both Tailscale and LAN
+          value: "tailscale,svc:tsdnsproxy"
+        - name: TSDNSPROXY_ADVERTISE_TAGS
+          value: "tag:tsdnsproxy"
         - name: TS_AUTHKEY
           valueFrom:
             secretKeyRef:
@@ -113,29 +121,4 @@ spec:
             drop:
             - ALL
             add:
-            - NET_BIND_SERVICE  # Required for binding to port 53
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: tsdnsproxy
-  namespace: tsdnsproxy
-  labels:
-    app: tsdnsproxy
-spec:
-  type: LoadBalancer  # Expose DNS service to LAN
-  selector:
-    app: tsdnsproxy
-  ports:
-  - name: dns-udp
-    port: 53
-    targetPort: dns-udp
-    protocol: UDP
-  - name: dns-tcp
-    port: 53
-    targetPort: dns-tcp
-    protocol: TCP
-  - name: health
-    port: 8080
-    targetPort: health
-    protocol: TCP
+            - NET_BIND_SERVICE

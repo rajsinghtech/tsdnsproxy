@@ -127,6 +127,59 @@ tsdnsproxy \
   -verbose
 ```
 
+### Tailscale Service Hosting
+
+In addition to binding to a specific address, tsdnsproxy can host DNS as a
+**named Tailscale Service** via `tsnet.ListenService`. This gives the proxy a
+stable MagicDNS name (`<service>.<tailnet>.ts.net`) that survives host
+migrations and can be load-balanced across multiple instances.
+
+Add `svc:<name>` (or `service:<name>`) to the listen addresses:
+
+```bash
+TSDNSPROXY_LISTEN_ADDRS="tailscale,svc:tsdnsproxy" \
+TSDNSPROXY_ADVERTISE_TAGS="tag:tsdnsproxy" \
+tsdnsproxy -authkey tskey-auth-YOUR-KEY
+```
+
+An optional `@<port>` overrides the advertised TCP port (default `53`):
+
+```bash
+-listen-addrs "svc:tsdnsproxy@5353"
+```
+
+**Requirements:**
+- The node **must** advertise an ACL tag (`-advertise-tags tag:...`).
+- The Service must be **defined** in the Tailscale admin console with a matching
+  `tcp:<port>` endpoint.
+- The host must be **approved** (manually in the console or via
+  `autoApprovers.services` in the ACL).
+- Consumers need a `grants` rule with `dst: ["svc:tsdnsproxy"]`.
+
+**Limitations:** Tailscale Services are TCP-only, so UDP DNS is not available
+through this path. PROXY protocol v2 is negotiated so the real peer tailnet IP
+is recovered for per-identity whois lookups. See the
+[Tailscale Services docs](https://tailscale.com/kb/1552/tailscale-services) for
+the full registration model.
+
+Example ACL:
+
+```json
+{
+  "tagOwners": { "tag:tsdnsproxy": ["autogroup:member"] },
+  "autoApprovers": {
+    "services": { "svc:tsdnsproxy": ["tag:tsdnsproxy"] }
+  },
+  "grants": [
+    {
+      "src": ["autogroup:member"],
+      "dst": ["svc:tsdnsproxy"],
+      "ip":  ["53"]
+    }
+  ]
+}
+```
+
 ## Domain Matching
 
 Domains in grants act as wildcards:

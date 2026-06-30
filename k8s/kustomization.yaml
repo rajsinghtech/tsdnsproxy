@@ -8,14 +8,14 @@ resources:
 
 images:
 - name: tsdnsproxy
-  newName: ghcr.io/rajsinghtech/tsdnsproxy  # Update with your registry
+  newName: ghcr.io/rajsinghtech/tsdnsproxy
   newTag: latest
 
 secretGenerator:
 - name: tsdnsproxy-auth
   namespace: tsdnsproxy
   literals:
-  - TS_AUTHKEY=tskey-auth-REPLACE-ME  # Replace with actual key
+  - TS_AUTHKEY=tskey-auth-REPLACE-ME
   options:
     disableNameSuffixHash: true
 
@@ -23,5 +23,6 @@ configMapGenerator:
 - name: tsdnsproxy-config
   namespace: tsdnsproxy
   literals:
-  - TSDNSPROXY_OVERRIDE_DNS=8.8.8.8:53,8.8.4.4:53
   - TSDNSPROXY_VERBOSE=true
+  options:
+    disableNameSuffixHash: true

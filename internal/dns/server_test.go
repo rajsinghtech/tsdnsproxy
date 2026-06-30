@@ -1238,3 +1238,131 @@ func TestServer_handleAuthoritative4via6(t *testing.T) {
 		})
 	}
 }
+
+func TestParseServiceAddr(t *testing.T) {
+	tests := []struct {
+		name     string
+		token    string
+		wantName string
+		wantOk   bool
+	}{
+		{name: "svc_prefix", token: "svc:tsdnsproxy", wantName: "svc:tsdnsproxy", wantOk: true},
+		{name: "service_prefix", token: "service:tsdnsproxy", wantName: "svc:tsdnsproxy", wantOk: true},
+		{name: "svc_with_port", token: "svc:tsdnsproxy@5353", wantName: "svc:tsdnsproxy@5353", wantOk: true},
+		{name: "regular_addr", token: "0.0.0.0:53", wantName: "", wantOk: false},
+		{name: "tailscale", token: "tailscale", wantName: "", wantOk: false},
+		{name: "empty", token: "", wantName: "", wantOk: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, ok := parseServiceAddr(tt.token)
+			if ok != tt.wantOk {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOk)
+			}
+			if ok && name != tt.wantName {
+				t.Errorf("name = %q, want %q", name, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestServer_parseListenAddresses(t *testing.T) {
+	status := &ipnstate.Status{
+		Self: &ipnstate.PeerStatus{
+			TailscaleIPs: []netip.Addr{netip.MustParseAddr("100.64.0.1")},
+		},
+	}
+
+	server := &Server{
+		Logf: func(format string, args ...any) {
+			t.Logf(format, args...)
+		},
+	}
+
+	tests := []struct {
+		name          string
+		input         string
+		wantAddrs     []string
+		wantServices  []serviceConfig
+	}{
+		{
+			name:         "tailscale_only",
+			input:        "tailscale",
+			wantAddrs:    []string{"100.64.0.1:53"},
+			wantServices: nil,
+		},
+		{
+			name:         "service_only",
+			input:        "svc:tsdnsproxy",
+			wantAddrs:    nil,
+			wantServices: []serviceConfig{{name: "svc:tsdnsproxy", port: 53}},
+		},
+		{
+			name:         "service_with_port",
+			input:        "service:tsdnsproxy@5353",
+			wantAddrs:    nil,
+			wantServices: []serviceConfig{{name: "svc:tsdnsproxy", port: 5353}},
+		},
+		{
+			name:         "mixed_tailscale_and_service",
+			input:        "tailscale,svc:tsdnsproxy",
+			wantAddrs:    []string{"100.64.0.1:53"},
+			wantServices: []serviceConfig{{name: "svc:tsdnsproxy", port: 53}},
+		},
+		{
+			name:         "all_and_service",
+			input:        "0.0.0.0,svc:dns",
+			wantAddrs:    []string{"0.0.0.0:53"},
+			wantServices: []serviceConfig{{name: "svc:dns", port: 53}},
+		},
+		{
+			name:         "empty_string",
+			input:        "",
+			wantAddrs:    nil,
+			wantServices: nil,
+		},
+		{
+			name:         "invalid_service_port",
+			input:        "svc:tsdnsproxy@99999",
+			wantAddrs:    nil,
+			wantServices: []serviceConfig{{name: "svc:tsdnsproxy", port: 53}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addrs, services := server.parseListenAddresses(tt.input, status)
+			if !equalStringSlices(addrs, tt.wantAddrs) {
+				t.Errorf("addrs = %v, want %v", addrs, tt.wantAddrs)
+			}
+			if !equalServiceSlices(services, tt.wantServices) {
+				t.Errorf("services = %v, want %v", services, tt.wantServices)
+			}
+		})
+	}
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalServiceSlices(a, b []serviceConfig) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
