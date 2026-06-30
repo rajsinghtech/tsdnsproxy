@@ -37,7 +37,7 @@ subjects:
   namespace: tsdnsproxy
 ---
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: tsdnsproxy
   namespace: tsdnsproxy
@@ -45,10 +45,6 @@ metadata:
     app: tsdnsproxy
 spec:
   replicas: 1
-  serviceName: tsdnsproxy
-  podManagementPolicy: Parallel
-  updateStrategy:
-    type: RollingUpdate
   selector:
     matchLabels:
       app: tsdnsproxy
