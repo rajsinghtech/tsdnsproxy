@@ -60,7 +60,7 @@ spec:
       serviceAccountName: tsdnsproxy
       containers:
       - name: tsdnsproxy
-        image: ghcr.io/rajsinghtech/tsdnsproxy:latest
+        image: ghcr.io/rajsinghtech/tsdnsproxy:v1.1.2
         imagePullPolicy: Always
         ports:
         - containerPort: 53
