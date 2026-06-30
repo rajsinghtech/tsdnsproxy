@@ -229,11 +229,13 @@ func main() {
 		log.Printf("using host DNS servers: %v", defaultServers)
 	}
 
-	// Always use tsnet dialer for DNS backends - they may be Tailscale machines
-	// that require MagicDNS resolution. The accept-routes flag only controls
-	// whether we can reach subnet IPs, not Tailscale machine IPs.
+	// Use a tsnet-backed dialer that resolves hostnames via MagicDNS
+	// (100.100.100.100:53) through the tailnet before dialing. This lets
+	// DNS backends be specified as MagicDNS names (e.g.
+	// "robbinsdale-coredns.keiretsu.ts.net:53") which the host's resolver
+	// can't look up.
 	log.Printf("using ts dialer to query DNS over tailnet")
-	var dnsDialer backend.DNSDialer = s
+	var dnsDialer backend.DNSDialer = &tsnetDNSDialer{srv: s}
 
 	backendMgr := backend.NewManager(defaultServers, dnsDialer, logf(*verbose))
 	defer backendMgr.Close()
@@ -450,4 +452,43 @@ func (h *healthServer) handleReady(w http.ResponseWriter, r *http.Request) {
 			log.Printf("write error: %v", err)
 		}
 	}
+}
+
+// tsnetDNSDialer wraps a tsnet.Server so that hostnames are resolved via
+// MagicDNS (100.100.100.100:53) through the tailnet before dialing. This
+// allows DNS backends to be specified as MagicDNS device names (e.g.
+// "robbinsdale-coredns.keiretsu.ts.net:53") which the host's resolver
+// can't look up. Raw IPs are dialed directly through the tailnet.
+type tsnetDNSDialer struct {
+	srv *tsnet.Server
+}
+
+func (d *tsnetDNSDialer) Dial(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return d.srv.Dial(ctx, network, address)
+	}
+
+	// If it's already an IP, dial directly through tsnet
+	if net.ParseIP(host) != nil {
+		return d.srv.Dial(ctx, network, address)
+	}
+
+	// Resolve hostname via MagicDNS through the tsnet tunnel
+	resolver := &net.Resolver{
+		Dial: func(rctx context.Context, _, _ string) (net.Conn, error) {
+			return d.srv.Dial(rctx, "udp", "100.100.100.100:53")
+		},
+	}
+	ips, err := resolver.LookupHost(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s via MagicDNS: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no addresses for %s", host)
+	}
+
+	resolved := net.JoinHostPort(ips[0], port)
+	log.Printf("[v] resolved %s -> %s via MagicDNS", address, resolved)
+	return d.srv.Dial(ctx, network, resolved)
 }
