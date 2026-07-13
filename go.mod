@@ -3,7 +3,7 @@ module github.com/rajsinghtech/tsdnsproxy
 go 1.26.4
 
 require (
-	github.com/pires/go-proxyproto v0.14.0
+	github.com/pires/go-proxyproto v0.15.0
 	golang.org/x/net v0.56.0
 	tailscale.com v1.100.0
 )
