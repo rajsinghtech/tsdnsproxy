@@ -5,7 +5,7 @@ go 1.26.6
 require (
 	github.com/pires/go-proxyproto v0.15.0
 	golang.org/x/net v0.58.0
-	tailscale.com v1.102.3
+	tailscale.com v1.102.4
 )
 
 require (
