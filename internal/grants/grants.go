@@ -32,6 +32,9 @@ type DNSGrant struct {
 	// DenyIPs are never translated. Both use the shared CIDR matcher.
 	AllowIPs []string `json:"allowips,omitempty"`
 	DenyIPs  []string `json:"denyips,omitempty"`
+	// IPNames synthesizes answers for dashed IPv4 labels under this zone.
+	// It cannot be combined with Rewrite or TranslateID.
+	IPNames *IPNamesConfig `json:"ipnames,omitempty"`
 }
 
 // IPPolicy builds the translation filter for this grant.
@@ -115,7 +118,7 @@ func (p *Parser) ParseGrants(capMap tailcfg.PeerCapMap) ([]GrantConfig, error) {
 		grantConfigs = append(grantConfigs, grant)
 	}
 
-	return grantConfigs, nil
+	return resolveIPNamesConflicts(grantConfigs), nil
 }
 
 // FindBestMatch finds the most specific domain match for a query
@@ -197,12 +200,34 @@ func (p *Parser) validateGrant(grant GrantConfig) error {
 
 		hasFilter := len(dnsGrant.AllowIPs) > 0 || len(dnsGrant.DenyIPs) > 0
 		hasTranslate := dnsGrant.TranslateID != nil
+		hasIPNames := dnsGrant.IPNames != nil
+		if hasIPNames && isPrefix {
+			return fmt.Errorf("ipnames cannot use CIDR key %s", domain)
+		}
 		if isPrefix {
-			if !hasFilter && !hasTranslate && len(dnsGrant.DNS) == 0 && dnsGrant.Rewrite == "" {
+			if !hasFilter && !hasTranslate && !hasIPNames && len(dnsGrant.DNS) == 0 && dnsGrant.Rewrite == "" {
 				return fmt.Errorf("empty grant for %s", domain)
 			}
-		} else if len(dnsGrant.DNS) == 0 && dnsGrant.Rewrite == "" {
+		} else if !hasIPNames && len(dnsGrant.DNS) == 0 && dnsGrant.Rewrite == "" {
 			return fmt.Errorf("empty grant for %s", domain)
+		}
+		if hasIPNames {
+			if err := validateIPNamesZone(domain); err != nil {
+				return err
+			}
+			if dnsGrant.Rewrite != "" {
+				return fmt.Errorf("ipnames cannot be combined with rewrite for %s", domain)
+			}
+			if dnsGrant.TranslateID != nil {
+				return fmt.Errorf("ipnames cannot be combined with translateid for %s", domain)
+			}
+			if len(dnsGrant.DNS) > 0 {
+				log.Printf("warning: dns on ipnames zone %s is ignored", domain)
+			}
+			if err := dnsGrant.IPNames.prepare(); err != nil {
+				return fmt.Errorf("ipnames %s: %w", domain, err)
+			}
+			grant[domain] = dnsGrant
 		}
 
 		// Validate DNS server addresses
