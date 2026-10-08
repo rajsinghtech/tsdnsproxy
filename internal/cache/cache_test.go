@@ -318,7 +318,7 @@ func TestGrantCache(t *testing.T) {
 		{
 			"cluster.local": grants.DNSGrant{
 				DNS:         []string{"10.0.0.1:53"},
-				TranslateID: 1,
+				TranslateID: intPtr(1),
 			},
 		},
 	}
@@ -349,8 +349,8 @@ func TestGrantCache(t *testing.T) {
 	if grant, ok := cached[1]["cluster.local"]; !ok {
 		t.Error("expected cluster.local in second grant config")
 	} else {
-		if grant.TranslateID != 1 {
-			t.Errorf("expected TranslateID 1, got %d", grant.TranslateID)
+		if grant.TranslateID == nil || *grant.TranslateID != 1 {
+			t.Errorf("expected TranslateID 1, got %v", grant.TranslateID)
 		}
 	}
 }
@@ -444,3 +444,5 @@ func BenchmarkCacheGetOrSet(b *testing.B) {
 		}
 	})
 }
+
+func intPtr(v int) *int { return &v }

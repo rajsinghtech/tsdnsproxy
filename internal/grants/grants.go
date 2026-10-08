@@ -14,11 +14,32 @@ func NormalizeDomain(domain string) string {
 	return strings.TrimSuffix(strings.ToLower(domain), ".")
 }
 
-// DNSGrant represents a DNS configuration grant
+// MaxTranslateID is the largest site id that can be encoded for translation.
+const MaxTranslateID = 65535
+
+// DNSGrant represents a DNS configuration grant.
+// TranslateID is nil when the field is omitted. Nil and any negative value
+// forward the query. An explicit value from 0 through MaxTranslateID is
+// authoritative: 0 returns backend addresses unchanged, and a positive value
+// is the site id used for translation.
 type DNSGrant struct {
-	DNS         []string `json:"dns"`         // Backend DNS servers
-	Rewrite     string   `json:"rewrite"`     // Domain rewrite target
-	TranslateID int      `json:"translateid"` // 4via6 site ID for translation
+	DNS         []string `json:"dns"`     // Backend DNS servers
+	Rewrite     string   `json:"rewrite"` // Domain rewrite target
+	TranslateID *int     `json:"translateid"`
+}
+
+// ExplicitTranslateID reports whether translateid was present in the grant.
+func (g DNSGrant) ExplicitTranslateID() (int, bool) {
+	if g.TranslateID == nil {
+		return 0, false
+	}
+	return *g.TranslateID, true
+}
+
+// Authoritative reports whether the grant should answer the query itself.
+func (g DNSGrant) Authoritative() bool {
+	id, ok := g.ExplicitTranslateID()
+	return ok && id >= 0 && id <= MaxTranslateID
 }
 
 // GrantConfig maps domains to their DNS grants
@@ -120,8 +141,10 @@ func (p *Parser) validateGrant(grant GrantConfig) error {
 			}
 		}
 
-		// TranslateID can be negative to indicate standard forwarding mode
-		// No validation needed for TranslateID
+		// Negative values select forwarding. Only a non-negative site id is bounded.
+		if id, ok := dnsGrant.ExplicitTranslateID(); ok && id > MaxTranslateID {
+			return fmt.Errorf("translateid %d for %s is outside 0-%d", id, domain, MaxTranslateID)
+		}
 	}
 
 	return nil

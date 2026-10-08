@@ -74,6 +74,8 @@ func (m *mockBackendManager) Query(ctx context.Context, backends []backend.Backe
 	return backends[0].Query(ctx, query)
 }
 
+func translateID(v int) *int { return &v }
+
 func (m *mockBackendManager) CreateBackends(servers []string) []backend.Backend {
 	if m.backend != nil {
 		return []backend.Backend{m.backend}
@@ -557,7 +559,10 @@ func TestServer_rewriteQuery(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			rewriteed := server.rewriteQuery(tt.query, tt.targetDomain, tt.rewriteDomain)
+			rewriteed, err := server.rewriteQuery(tt.query, tt.targetDomain, tt.rewriteDomain)
+			if err != nil {
+				t.Fatalf("rewriteQuery: %v", err)
+			}
 			tt.validate(t, rewriteed)
 		})
 	}
@@ -571,7 +576,7 @@ func TestServer_processQuery(t *testing.T) {
 			"test.local": grants.DNSGrant{
 				DNS:         []string{"10.0.0.10:53"},
 				Rewrite:     "prod.local",
-				TranslateID: 1,
+				TranslateID: translateID(1),
 			},
 		},
 	}
@@ -933,7 +938,7 @@ func TestServer_handleAuthoritative4via6(t *testing.T) {
 			grant: &grants.DNSGrant{
 				DNS:         []string{"10.0.0.10:53"},
 				Rewrite:     "svc.cluster.local",
-				TranslateID: 0,
+				TranslateID: translateID(0),
 			},
 			domain: "test.local",
 			backend: &mockBackend{
@@ -1010,7 +1015,7 @@ func TestServer_handleAuthoritative4via6(t *testing.T) {
 			grant: &grants.DNSGrant{
 				DNS:         []string{"10.0.0.10:53"},
 				Rewrite:     "svc.cluster.local",
-				TranslateID: 0,
+				TranslateID: translateID(0),
 			},
 			domain: "test.local",
 			backend: &mockBackend{
@@ -1087,7 +1092,7 @@ func TestServer_handleAuthoritative4via6(t *testing.T) {
 			grant: &grants.DNSGrant{
 				DNS:         []string{"10.0.0.10:53"},
 				Rewrite:     "svc.cluster.local",
-				TranslateID: 1,
+				TranslateID: translateID(1),
 			},
 			domain: "test.local",
 			backend: &mockBackend{
@@ -1157,7 +1162,7 @@ func TestServer_handleAuthoritative4via6(t *testing.T) {
 			grant: &grants.DNSGrant{
 				DNS:         []string{"10.0.0.10:53"},
 				Rewrite:     "svc.cluster.local",
-				TranslateID: 1,
+				TranslateID: translateID(1),
 			},
 			domain: "test.local",
 			backend: &mockBackend{
@@ -1281,10 +1286,10 @@ func TestServer_parseListenAddresses(t *testing.T) {
 	}
 
 	tests := []struct {
-		name          string
-		input         string
-		wantAddrs     []string
-		wantServices  []serviceConfig
+		name         string
+		input        string
+		wantAddrs    []string
+		wantServices []serviceConfig
 	}{
 		{
 			name:         "tailscale_only",

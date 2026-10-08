@@ -187,7 +187,7 @@ func TestParser_ValidateGrant(t *testing.T) {
 			grant: GrantConfig{
 				"cluster.local": DNSGrant{
 					DNS:         []string{"10.0.0.1:53"},
-					TranslateID: 42,
+					TranslateID: tid(42),
 				},
 			},
 			wantErr: false,
@@ -218,10 +218,40 @@ func TestParser_ValidateGrant(t *testing.T) {
 			grant: GrantConfig{
 				"cluster.local": DNSGrant{
 					DNS:         []string{"10.0.0.1:53"},
-					TranslateID: -1,
+					TranslateID: tid(-1),
 				},
 			},
 			wantErr: false,
+		},
+		{
+			name: "valid - explicit zero translateID",
+			grant: GrantConfig{
+				"cluster.local": DNSGrant{
+					DNS:         []string{"10.0.0.1:53"},
+					TranslateID: tid(0),
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid - max site id",
+			grant: GrantConfig{
+				"cluster.local": DNSGrant{
+					DNS:         []string{"10.0.0.1:53"},
+					TranslateID: tid(MaxTranslateID),
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid - translateid above 65535",
+			grant: GrantConfig{
+				"cluster.local": DNSGrant{
+					DNS:         []string{"10.0.0.1:53"},
+					TranslateID: tid(MaxTranslateID + 1),
+				},
+			},
+			wantErr: true,
 		},
 	}
 
@@ -419,14 +449,14 @@ func TestParser_FindBestMatch_ComplexScenarios(t *testing.T) {
 				{"test.local": DNSGrant{
 					DNS:         []string{"10.0.0.1:53", "10.0.0.2:53"},
 					Rewrite:     "prod.local",
-					TranslateID: 42,
+					TranslateID: tid(42),
 				}},
 			},
 			wantDomain: "test.local",
 			wantGrant: DNSGrant{
 				DNS:         []string{"10.0.0.1:53", "10.0.0.2:53"},
 				Rewrite:     "prod.local",
-				TranslateID: 42,
+				TranslateID: tid(42),
 			},
 			wantFound: true,
 		},
@@ -468,10 +498,85 @@ func TestParser_FindBestMatch_ComplexScenarios(t *testing.T) {
 				if grant.Rewrite != tt.wantGrant.Rewrite {
 					t.Errorf("FindBestMatch() grant.Rewrite = %v, want %v", grant.Rewrite, tt.wantGrant.Rewrite)
 				}
-				if grant.TranslateID != tt.wantGrant.TranslateID {
+				if !sameTranslateID(grant.TranslateID, tt.wantGrant.TranslateID) {
 					t.Errorf("FindBestMatch() grant.TranslateID = %v, want %v", grant.TranslateID, tt.wantGrant.TranslateID)
 				}
 			}
 		})
 	}
+}
+
+func TestParseGrants_TranslateIDPresence(t *testing.T) {
+	p := NewParser()
+
+	capMap := tailcfg.PeerCapMap{
+		"rajsingh.info/cap/tsdnsproxy": []tailcfg.RawMessage{
+			`{"omitted.example":{"dns":["10.0.0.1:53"]}}`,
+			`{"null.example":{"dns":["10.0.0.1:53"],"translateid":null}}`,
+			`{"zero.example":{"dns":["10.0.0.1:53"],"translateid":0}}`,
+			`{"positive.example":{"dns":["10.0.0.1:53"],"translateid":42}}`,
+			`{"negative.example":{"dns":["10.0.0.1:53"],"translateid":-7}}`,
+			`{"max.example":{"dns":["10.0.0.1:53"],"translateid":65535}}`,
+			`{"huge.example":{"dns":["10.0.0.1:53"],"translateid":65536}}`,
+		},
+	}
+
+	parsed, err := p.ParseGrants(capMap)
+	if err != nil {
+		t.Fatalf("ParseGrants: %v", err)
+	}
+	if len(parsed) != 6 {
+		t.Fatalf("parsed %d grants, want 6 (out of range grant dropped)", len(parsed))
+	}
+
+	byDomain := map[string]DNSGrant{}
+	for _, cfg := range parsed {
+		for domain, grant := range cfg {
+			byDomain[domain] = grant
+		}
+	}
+	if _, ok := byDomain["huge.example"]; ok {
+		t.Fatal("translateid 65536 should be rejected")
+	}
+
+	checks := []struct {
+		domain   string
+		wantNil  bool
+		want     int
+		wantAuth bool
+	}{
+		{domain: "omitted.example", wantNil: true, wantAuth: false},
+		{domain: "null.example", wantNil: true, wantAuth: false},
+		{domain: "zero.example", want: 0, wantAuth: true},
+		{domain: "positive.example", want: 42, wantAuth: true},
+		{domain: "negative.example", want: -7, wantAuth: false},
+		{domain: "max.example", want: MaxTranslateID, wantAuth: true},
+	}
+	for _, tc := range checks {
+		t.Run(tc.domain, func(t *testing.T) {
+			grant, ok := byDomain[tc.domain]
+			if !ok {
+				t.Fatalf("missing grant %s", tc.domain)
+			}
+			if tc.wantNil {
+				if grant.TranslateID != nil {
+					t.Fatalf("TranslateID = %d, want omitted", *grant.TranslateID)
+				}
+			} else if grant.TranslateID == nil || *grant.TranslateID != tc.want {
+				t.Fatalf("TranslateID = %v, want %d", grant.TranslateID, tc.want)
+			}
+			if grant.Authoritative() != tc.wantAuth {
+				t.Fatalf("Authoritative() = %v, want %v", grant.Authoritative(), tc.wantAuth)
+			}
+		})
+	}
+}
+
+func tid(v int) *int { return &v }
+
+func sameTranslateID(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
