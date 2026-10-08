@@ -75,6 +75,8 @@ docker run -d \
   ghcr.io/rajsinghtech/tsdnsproxy:latest
 ```
 
+Release images are tagged with the version and no leading `v` (`1.1.5`), and that same release also moves `latest`. Builds of the default branch are tagged `main` and `sha-<short commit>` and do not move `latest`. The manifests in `k8s/` pin the unprefixed release tag.
+
 ### Kubernetes
 
 1. Update the auth key in `k8s/deployment.yaml`

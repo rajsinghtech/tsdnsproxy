@@ -7,8 +7,7 @@ resources:
 - deployment.yaml
 
 images:
-- name: tsdnsproxy
-  newName: ghcr.io/rajsinghtech/tsdnsproxy
+- name: ghcr.io/rajsinghtech/tsdnsproxy
   newTag: "1.1.5"
 
 secretGenerator:
