@@ -22,7 +22,6 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/net/tsaddr"
 	"tailscale.com/tsnet"
 )
 
@@ -510,7 +509,7 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 		s.sendError(pc, addr, &msg, dnsmessage.RCodeServerFailure)
 		return
 	}
-	response, err := s.processQuery(queryCtx, &msg, grants)
+	response, err := s.processQuery(queryCtx, &msg, grants, sourceAddr(addr))
 	if err != nil {
 		if queryCtx.Err() != nil {
 			s.Logf("query timeout from %s: %v", addr, queryCtx.Err())
@@ -629,7 +628,22 @@ func (s *Server) loadServerGrants(ctx context.Context, status *ipnstate.Status) 
 	return nil
 }
 
-func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, grantConfigs []grants.GrantConfig) ([]byte, error) {
+func sourceAddr(addr net.Addr) netip.Addr {
+	if addr == nil {
+		return netip.Addr{}
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return netip.Addr{}
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}
+	}
+	return ip
+}
+
+func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, grantConfigs []grants.GrantConfig, src netip.Addr) ([]byte, error) {
 	if len(query.Questions) == 0 {
 		return nil, fmt.Errorf("no questions in query")
 	}
@@ -641,6 +655,9 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 	domain, grant, found := s.GrantParser.FindBestMatch(queryName, grantConfigs)
 	if !found {
 		return s.forwardQuery(ctx, query, nil, nil, dnsmessage.Name{}, nil)
+	}
+	if grant.IPNames != nil {
+		return s.handleIPNames(query, domain, &grant, src)
 	}
 
 	// Omitted and negative translateid values forward the query.
@@ -856,13 +873,13 @@ func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, gr
 }
 
 func (s *Server) mapVia6(ipv4 netip.Addr, siteID uint32) (netip.Addr, error) {
-	via, err := tsaddr.MapVia(siteID, netip.PrefixFrom(ipv4, 32))
+	via, err := via6For(siteID, ipv4)
 	if err != nil {
 		s.Logf("failed to map address for %s (site %d): %v", ipv4, siteID, err)
-		return netip.Addr{}, fmt.Errorf("failed to map address for %s (site %d): %w", ipv4, siteID, err)
+		return netip.Addr{}, err
 	}
-	s.Logf("[v] mapped %s site %d -> %s", ipv4, siteID, via.Addr())
-	return via.Addr(), nil
+	s.Logf("[v] mapped %s site %d -> %s", ipv4, siteID, via)
+	return via, nil
 }
 
 // translationTarget reports the site id to use when ip should be translated.

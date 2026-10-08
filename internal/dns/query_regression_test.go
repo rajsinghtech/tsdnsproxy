@@ -211,7 +211,7 @@ func TestProcessQueryTranslateIDModes(t *testing.T) {
 					Class: dnsmessage.ClassINET,
 				}},
 			}
-			response, err := server.processQuery(context.Background(), query, []grants.GrantConfig{mustGrant(t, tc.grantJSON)})
+			response, err := server.processQuery(context.Background(), query, []grants.GrantConfig{mustGrant(t, tc.grantJSON)}, netip.Addr{})
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("expected error")
@@ -275,7 +275,7 @@ func TestProcessQueryRejectsSiteIDAboveMax(t *testing.T) {
 	grant := grants.GrantConfig{
 		"test.local": {DNS: []string{"10.0.0.1:53"}, TranslateID: translateID(grants.MaxTranslateID + 1)},
 	}
-	_, err := server.processQuery(context.Background(), query, []grants.GrantConfig{grant})
+	_, err := server.processQuery(context.Background(), query, []grants.GrantConfig{grant}, netip.Addr{})
 	if err == nil {
 		t.Fatal("expected error for translateid above 65535")
 	}

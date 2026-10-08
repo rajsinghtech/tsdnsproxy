@@ -766,7 +766,7 @@ func TestServer_processQuery(t *testing.T) {
 				backend: tt.backend,
 			}
 
-			response, err := server.processQuery(ctx, tt.query, tt.grants)
+			response, err := server.processQuery(ctx, tt.query, tt.grants, netip.Addr{})
 			tt.validate(t, response, err)
 		})
 	}
