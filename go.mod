@@ -1,6 +1,6 @@
 module github.com/rajsinghtech/tsdnsproxy
 
-go 1.26.6
+go 1.27.1
 
 require (
 	github.com/pires/go-proxyproto v0.15.0

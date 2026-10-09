@@ -5,10 +5,9 @@ on:
     branches: [ main ]
     tags: [ 'v*' ]
   pull_request:
-    branches: [ main ]
 
 env:
-  GO_VERSION: '1.26'
+  GO_VERSION: '1.27'
   REGISTRY: ghcr.io
   IMAGE_NAME: rajsinghtech/tsdnsproxy
 
