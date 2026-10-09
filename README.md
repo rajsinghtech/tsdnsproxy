@@ -31,8 +31,9 @@ Configure DNS behavior through Tailscale ACL grants:
 - **rewrite**: optional - Rewrite domain before forwarding (e.g., `api.cluster1.local` → `api.cluster.local`)
 - **translateid**: optional - Controls DNS handling mode:
   - **Omit or < 0**: Standard forwarding mode (forwards queries to backends, returns responses as-is)
-  - **0**: Authoritative mode without 4via6 translation (resolves from backends, returns A/AAAA records directly)
-  - **> 0**: Authoritative mode with 4via6 translation (converts A records to AAAA using site ID)
+  - **0**: Authoritative mode without 4via6 translation (resolves from backends, returns A/AAAA records directly). This must be explicit; omitting the field does not select it
+  - **1–65535**: Authoritative mode with 4via6 translation (converts A records to AAAA using site ID)
+  - **Above 65535**: Invalid. The grant is ignored and a warning is logged
 
 ```json
 {
@@ -236,7 +237,7 @@ tsdnsproxy resolves queries authoritatively by querying backends directly and re
 - Other query types return NODATA
 - Use when you need authoritative responses without 4via6
 
-### 4via6 Translation Mode (`translateid` > 0)
+### 4via6 Translation Mode (`translateid` 1–65535)
 
 A records are converted to AAAA records using Tailscale's 4via6 format, allowing IPv4-only services to be accessed over Tailscale's IPv6 network.
 

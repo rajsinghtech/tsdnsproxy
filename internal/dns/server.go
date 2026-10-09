@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -203,7 +204,7 @@ func parseServiceAddr(token string) (string, bool) {
 func (s *Server) runUDP(ctx context.Context, listenAddr string) error {
 	var pc net.PacketConn
 	var err error
-	
+
 	// Determine if we should use tsnet or standard networking
 	if s.shouldUseTSNet(listenAddr) {
 		pc, err = s.TSServer.ListenPacket("udp", listenAddr)
@@ -265,10 +266,13 @@ func (s *Server) runUDP(ctx context.Context, listenAddr string) error {
 			s.handlerWg.Add(1)
 			go func() {
 				defer func() {
+					if rec := recover(); rec != nil {
+						s.Logf("panic in udp listener: %v\n%s", rec, debug.Stack())
+					}
 					<-s.workerPool // Release worker slot
 					s.handlerWg.Done()
 				}()
-				s.handleQuery(ctx, pc, addr, packet)
+				s.handleQuery(ctx, pc, addr, packet, "udp")
 			}()
 		default:
 			// Worker pool is full, drop the query
@@ -285,7 +289,7 @@ func (s *Server) shouldUseTSNet(listenAddr string) bool {
 		// If we can't parse, assume it's a tsnet address
 		return true
 	}
-	
+
 	// Use standard networking for common non-tailscale addresses
 	switch host {
 	case "0.0.0.0", "127.0.0.1", "localhost", "", "[::]":
@@ -300,7 +304,7 @@ func (s *Server) shouldUseTSNet(listenAddr string) bool {
 func (s *Server) runTCP(ctx context.Context, listenAddr string) error {
 	var listener net.Listener
 	var err error
-	
+
 	// Determine if we should use tsnet or standard networking
 	if s.shouldUseTSNet(listenAddr) {
 		listener, err = s.TSServer.Listen("tcp", listenAddr)
@@ -342,10 +346,13 @@ func (s *Server) runTCP(ctx context.Context, listenAddr string) error {
 			s.handlerWg.Add(1)
 			go func() {
 				defer func() {
+					if rec := recover(); rec != nil {
+						s.Logf("panic in tcp listener: %v\n%s", rec, debug.Stack())
+					}
 					<-s.workerPool // Release worker slot
 					s.handlerWg.Done()
 				}()
-				s.handleTCPConnection(ctx, conn)
+				s.handleTCPConnection(ctx, conn, "tcp")
 			}()
 		default:
 			// Worker pool is full, close the connection
@@ -366,8 +373,8 @@ func (s *Server) runTCP(ctx context.Context, listenAddr string) error {
 // available to conn.RemoteAddr(), enabling per-identity whois lookups.
 func (s *Server) runService(ctx context.Context, svc serviceConfig) error {
 	ln, err := s.TSServer.ListenService(svc.name, tsnet.ServiceModeTCP{
-		Port:                  svc.port,
-		PROXYProtocolVersion:  2,
+		Port:                 svc.port,
+		PROXYProtocolVersion: 2,
 	})
 	if err != nil {
 		return fmt.Errorf("listen service: %w", err)
@@ -413,10 +420,13 @@ func (s *Server) runService(ctx context.Context, svc serviceConfig) error {
 			s.handlerWg.Add(1)
 			go func() {
 				defer func() {
+					if rec := recover(); rec != nil {
+						s.Logf("panic in service listener: %v\n%s", rec, debug.Stack())
+					}
 					<-s.workerPool
 					s.handlerWg.Done()
 				}()
-				s.handleTCPConnection(ctx, conn)
+				s.handleTCPConnection(ctx, conn, "service")
 			}()
 		default:
 			s.Logf("dropping service connection from %s: worker pool full", conn.RemoteAddr())
@@ -444,12 +454,28 @@ func (s *Server) waitForHandlers(protocol string) {
 	}
 }
 
-func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Addr, packet []byte) {
+func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Addr, packet []byte, via string) {
 	// Create request-scoped context with timeout
 	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	var msg dnsmessage.Message
+	responded := false
+	// UDP, TCP, and service listeners all dispatch each query here.
+	// Recover so one bad query cannot crash the process, and answer
+	// SERVFAIL when the query was parsed but not yet sent.
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		s.Logf("panic handling %s query from %v: %v\n%s", via, addr, rec, debug.Stack())
+		if responded || pc == nil || addr == nil || len(msg.Questions) == 0 {
+			return
+		}
+		s.sendError(pc, addr, &msg, dnsmessage.RCodeServerFailure)
+	}()
+
 	if err := msg.Unpack(packet); err != nil {
 		s.Logf("[v] failed to parse DNS message from %s: %v", addr, err)
 		return
@@ -485,6 +511,8 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 	// Send response
 	if _, err := pc.WriteTo(response, addr); err != nil {
 		s.Logf("failed to send response to %s: %v", addr, err)
+	} else {
+		responded = true
 	}
 }
 
@@ -602,23 +630,31 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 		return s.forwardQuery(ctx, query, nil, nil, dnsmessage.Name{})
 	}
 
-	// Handle 4via6 domains authoritatively (don't forward to backends)
-	// 4via6 domains are identified by translateid field (0-65535)
-	// translateid 0 is valid and results in passthrough mode (no 4via6 translation)
-	// If DNS servers aren't specified, use the default system resolver
-	if grant.TranslateID >= 0 {
+	// Omitted and negative translateid values forward the query.
+	// An explicit id above the encodable range is rejected.
+	// 0 through MaxTranslateID are answered here instead of forwarding.
+	if id, ok := grant.ExplicitTranslateID(); ok && id > grants.MaxTranslateID {
+		s.Logf("rejecting grant for %s: translateid %d is outside 0-%d", domain, id, grants.MaxTranslateID)
+		return nil, fmt.Errorf("translateid %d is outside 0-%d", id, grants.MaxTranslateID)
+	}
+	if grant.Authoritative() {
 		// If no DNS servers specified, the grant will use default backends from BackendManager
 		if len(grant.DNS) == 0 {
-			s.Logf("[v] 4via6 domain detected: %s (translateID=%d, using default DNS)", domain, grant.TranslateID)
+			s.Logf("[v] authoritative domain: %s (translateID=%d, using default DNS)", domain, *grant.TranslateID)
 		} else {
-			s.Logf("[v] 4via6 domain detected: %s (translateID=%d)", domain, grant.TranslateID)
+			s.Logf("[v] authoritative domain: %s (translateID=%d)", domain, *grant.TranslateID)
 		}
 		return s.handleAuthoritative4via6(query, &grant, domain)
 	}
 
 	var rewrittenQuery *dnsmessage.Message
 	if grant.Rewrite != "" {
-		rewrittenQuery = s.rewriteQuery(query, domain, grant.Rewrite)
+		var rewriteErr error
+		rewrittenQuery, rewriteErr = s.rewriteQuery(query, domain, grant.Rewrite)
+		if rewriteErr != nil {
+			// An unencodable rewrite is a server failure, not a policy refusal.
+			return nil, rewriteErr
+		}
 	} else {
 		rewrittenQuery = query
 	}
@@ -656,9 +692,15 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 	}
 
 	// Handle queries based on translateID:
-	// - translateID == 0: No 4via6 translation, return backend A/AAAA records directly
-	// - translateID > 0: 4via6 translation enabled, return 4via6 AAAA records, NODATA for A queries
-	if grant.TranslateID == 0 {
+	// - translateID == 0: No translation, return backend A/AAAA records directly
+	// - translateID > 0: Translation enabled, return synthetic AAAA records, NODATA for A queries
+	siteID, ok := grant.ExplicitTranslateID()
+	if !ok || siteID < 0 || siteID > grants.MaxTranslateID {
+		s.Logf("rejecting authoritative grant: translateid outside 0-%d", grants.MaxTranslateID)
+		response.RCode = dnsmessage.RCodeServerFailure
+		return response.Pack()
+	}
+	if siteID == 0 {
 		// No translation mode: serve A and AAAA records directly from backend
 		switch question.Type {
 		case dnsmessage.TypeA:
@@ -781,10 +823,14 @@ func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, gr
 
 	// Create 4via6 address using tsaddr.MapVia
 	prefix := netip.PrefixFrom(ipv4, 32)
-	via6Prefix, err := tsaddr.MapVia(uint32(grant.TranslateID), prefix)
+	siteID, ok := grant.ExplicitTranslateID()
+	if !ok || siteID <= 0 || siteID > grants.MaxTranslateID {
+		return netip.Addr{}, fmt.Errorf("translateid outside 1-%d", grants.MaxTranslateID)
+	}
+	via6Prefix, err := tsaddr.MapVia(uint32(siteID), prefix)
 	if err != nil {
-		s.Logf("failed to map 4via6 for %s (site %d): %v", ipv4, grant.TranslateID, err)
-		return netip.Addr{}, fmt.Errorf("failed to map 4via6 for %s (site %d): %w", ipv4, grant.TranslateID, err)
+		s.Logf("failed to map 4via6 for %s (site %d): %v", ipv4, siteID, err)
+		return netip.Addr{}, fmt.Errorf("failed to map 4via6 for %s (site %d): %w", ipv4, siteID, err)
 	}
 	s.Logf("[v] created 4via6 address: %s -> %s", ipv4, via6Prefix.Addr())
 
@@ -824,6 +870,11 @@ func (s *Server) resolveBackendIPv6(queryDomain, grantDomain string, grant *gran
 func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, error) {
 	s.Logf("[v] resolveToIPv4: creating A query for %s", domain)
 
+	qname, err := newDNSName(domain)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+
 	// Create a basic A query
 	query := dnsmessage.Message{
 		Header: dnsmessage.Header{
@@ -832,7 +883,7 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 		},
 		Questions: []dnsmessage.Question{
 			{
-				Name:  dnsmessage.MustNewName(domain),
+				Name:  qname,
 				Type:  dnsmessage.TypeA,
 				Class: dnsmessage.ClassINET,
 			},
@@ -892,6 +943,11 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 func (s *Server) resolveToIPv6(domain string, dnsServers []string) (netip.Addr, error) {
 	s.Logf("[v] resolveToIPv6: creating AAAA query for %s", domain)
 
+	qname, err := newDNSName(domain)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+
 	// Create a basic AAAA query
 	query := dnsmessage.Message{
 		Header: dnsmessage.Header{
@@ -900,7 +956,7 @@ func (s *Server) resolveToIPv6(domain string, dnsServers []string) (netip.Addr, 
 		},
 		Questions: []dnsmessage.Question{
 			{
-				Name:  dnsmessage.MustNewName(domain),
+				Name:  qname,
 				Type:  dnsmessage.TypeAAAA,
 				Class: dnsmessage.ClassINET,
 			},
@@ -956,7 +1012,7 @@ func (s *Server) resolveToIPv6(domain string, dnsServers []string) (netip.Addr, 
 	return netip.Addr{}, fmt.Errorf("no IPv6 address found in response for %s", domain)
 }
 
-func (s *Server) rewriteQuery(query *dnsmessage.Message, targetDomain, rewriteDomain string) *dnsmessage.Message {
+func (s *Server) rewriteQuery(query *dnsmessage.Message, targetDomain, rewriteDomain string) (*dnsmessage.Message, error) {
 	rewritten := *query
 	rewritten.Questions = make([]dnsmessage.Question, len(query.Questions))
 
@@ -968,18 +1024,15 @@ func (s *Server) rewriteQuery(query *dnsmessage.Message, targetDomain, rewriteDo
 		if !strings.HasSuffix(rewrittenName, ".") {
 			rewrittenName += "."
 		}
-		// Use NewName instead of MustNewName to avoid panic
-		name, err := dnsmessage.NewName(rewrittenName)
+		name, err := newDNSName(rewrittenName)
 		if err != nil {
 			s.Logf("failed to create rewritten name %q: %v", rewrittenName, err)
-			// Keep original name on error
-			rewritten.Questions[i].Name = q.Name
-		} else {
-			rewritten.Questions[i].Name = name
+			return nil, err
 		}
+		rewritten.Questions[i].Name = name
 	}
 
-	return &rewritten
+	return &rewritten, nil
 }
 
 func (s *Server) forwardQuery(ctx context.Context, query *dnsmessage.Message, backends []backend.Backend, grant *grants.DNSGrant, originalName dnsmessage.Name) ([]byte, error) {
@@ -1000,8 +1053,10 @@ func (s *Server) forwardQuery(ctx context.Context, query *dnsmessage.Message, ba
 		return nil, fmt.Errorf("unpack response: %w", err)
 	}
 
-	if grant != nil && grant.TranslateID > 0 {
-		s.translate4via6(&response, uint32(grant.TranslateID), query)
+	if grant != nil {
+		if id, ok := grant.ExplicitTranslateID(); ok && id > 0 && id <= grants.MaxTranslateID {
+			s.translate4via6(&response, uint32(id), query)
+		}
 	}
 
 	if grant != nil && grant.Rewrite != "" && originalName.String() != "" {
@@ -1036,7 +1091,7 @@ func (s *Server) translate4via6(response *dnsmessage.Message, siteID uint32, ori
 				// Client requested A records, keep original A record
 				translatedAnswers = append(translatedAnswers, ans)
 			}
-			
+
 			if queryTypes[dnsmessage.TypeAAAA] {
 				// Client requested AAAA records, provide 4via6 translation
 				aaaa := dnsmessage.Resource{
@@ -1103,8 +1158,19 @@ func (s *Server) sendError(pc net.PacketConn, addr net.Addr, query *dnsmessage.M
 	}
 }
 
-// handleTCPConnection handles a single TCP connection
-func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn) {
+// newDNSName builds a query name without panicking when the name is too long
+// or otherwise not encodable. Callers turn that error into SERVFAIL.
+func newDNSName(domain string) (dnsmessage.Name, error) {
+	name, err := dnsmessage.NewName(domain)
+	if err != nil {
+		return dnsmessage.Name{}, fmt.Errorf("invalid DNS name %q: %w", domain, err)
+	}
+	return name, nil
+}
+
+// handleTCPConnection handles a single TCP connection.
+// via is "tcp" or "service"; each query is recovered inside handleQuery.
+func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn, via string) {
 	defer func() {
 		if err := conn.Close(); err != nil {
 			s.Logf("failed to close TCP connection: %v", err)
@@ -1142,7 +1208,7 @@ func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn) {
 
 		// Process the query
 		tcpWriter := &tcpResponseWriter{conn: conn}
-		s.handleQuery(ctx, tcpWriter, conn.RemoteAddr(), packet)
+		s.handleQuery(ctx, tcpWriter, conn.RemoteAddr(), packet, via)
 
 		// Reset deadline for next query
 		if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
