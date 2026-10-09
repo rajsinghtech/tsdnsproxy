@@ -91,6 +91,28 @@
           }
         ]
       }
+    },
+    {
+      "comment": "Dashed IPv4 names for two sites",
+      "src": ["group:engineering"],
+      "dst": ["tag:tsdnsproxy"],
+      "app": {
+        "rajsingh.info/cap/tsdnsproxy": [
+          {
+            "site-a.example": {
+              "ipnames": { "siteid": 1, "a": "never", "ttl": 300 }
+            },
+            "site-b.example": {
+              "ipnames": {
+                "siteid": 2,
+                "a": "direct",
+                "directsrc": ["192.168.10.0/24"],
+                "allowips": ["10.0.0.0/8"]
+              }
+            }
+          }
+        ]
+      }
     }
   ]
 }

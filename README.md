@@ -281,6 +281,40 @@ A grant key that is a CIDR matches the resolved address instead of the query nam
 }
 ```
 
+## Encoded IPv4 names
+
+A zone can answer `10-0-0-1.site-a.example` with no per-host records. The single label is four decimal octets separated by dashes, with no leading zeros. Each zone has its own site id. The name cannot also set `rewrite` or `translateid`.
+
+```json
+{
+  "site-a.example": {
+    "ipnames": { "siteid": 1, "a": "never", "ttl": 300 }
+  },
+  "site-b.example": {
+    "ipnames": {
+      "siteid": 2,
+      "a": "direct",
+      "directsrc": ["192.168.10.0/24"],
+      "allowips": ["10.0.0.0/8"],
+      "allowsrc": ["192.0.2.0/24"],
+      "negttl": 60
+    }
+  }
+}
+```
+
+- `siteid` is required, from 0 through 65535.
+- `a` is `never` (default), `always`, or `direct`. `direct` returns an A record only when the client address is inside `directsrc`. AAAA is still returned.
+- `ttl` defaults to 300. `negttl` defaults to 60 and is the SOA minimum on negative answers.
+- `allowips` limits which addresses a label may encode. The same built-in ranges used by translation filters are rejected unless `allowips` covers them. A rejected or malformed name is NXDOMAIN.
+- `allowsrc`, when set, refuses clients outside those prefixes.
+- Other query types, and A when A is off, are NODATA. The zone apex answers SOA and is NODATA for everything else.
+- Two labels are required. The same zone with different settings in two grants is dropped, and so are nested encoded-name zones. A normal rule may still be more specific than an encoded-name zone.
+
+Publish one split-DNS suffix per zone, aimed at this proxy. The suffix covers every name under the zone. The split applies to the whole network; per-user control is the grant. Clients must accept the network's DNS. AAAA answers are only useful when a router advertises the translated prefix and clients accept those routes. Do not add these zones as search domains. `a` set to `always` can stall address selection, which is why `direct` exists. A shared resolver caches one client's answer for others, so keep `ttl` low when using `direct`.
+
+Synthesized answers are not cached.
+
 ## Health Checks
 
 - `/health`: Returns JSON health status
