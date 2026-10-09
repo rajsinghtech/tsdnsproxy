@@ -460,7 +460,9 @@ func TestServer_translate4via6(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server.translate4via6(tt.response, tt.siteID, tt.originalQuery)
+			id := int(tt.siteID)
+			grant := &grants.DNSGrant{TranslateID: &id}
+			server.translate4via6(tt.response, tt.originalQuery, grant, nil)
 			tt.validate(t, tt.response)
 		})
 	}
@@ -1238,7 +1240,7 @@ func TestServer_handleAuthoritative4via6(t *testing.T) {
 				},
 			}
 
-			response, err := server.handleAuthoritative4via6(tt.query, tt.grant, tt.domain)
+			response, err := server.handleAuthoritative4via6(tt.query, tt.grant, tt.domain, nil)
 			tt.validate(t, response, err)
 		})
 	}

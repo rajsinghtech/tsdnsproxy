@@ -253,10 +253,33 @@ A records are converted to AAAA records using Tailscale's 4via6 format, allowing
 ```
 
 **Behavior:**
-- A queries return NODATA
-- AAAA queries return synthetic 4via6 addresses
+- A queries return NODATA when the address is translated
+- AAAA queries return a synthetic address
 - IPv4 `10.1.2.3` with Site ID `42` → `fd7a:115c:a1e0:b1a:0:2a:a01:203`
-- Enables IPv4 services over Tailscale's IPv6 network
+- Addresses in `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`, `224.0.0.0/4`, `255.255.255.255/32`, and `100.64.0.0/10` are not translated unless `allowips` covers them. An excluded A answer is returned unchanged, and the AAAA answer is empty
+
+## Translation filters
+
+`allowips` and `denyips` limit which resolved IPv4 addresses are translated. `denyips` always wins. A non-empty `allowips` list translates only addresses inside it. The built-in ranges above are skipped unless `allowips` covers them, which keeps shared `100.64.0.0/10` answers unchanged.
+
+A grant key that is a CIDR matches the resolved address instead of the query name. The longest matching prefix wins and overrides the domain rule for that address. A prefix rule with `translateid` omitted or `0` leaves the address unchanged. A positive `translateid` translates with that site id.
+
+```json
+{
+  "site-a.example": {
+    "dns": ["10.1.0.10:53"],
+    "translateid": 1,
+    "allowips": ["10.0.0.0/8"],
+    "denyips": ["10.1.50.0/24"]
+  },
+  "10.9.0.0/16": {
+    "translateid": 2
+  },
+  "100.64.0.0/10": {
+    "translateid": 0
+  }
+}
+```
 
 ## Health Checks
 

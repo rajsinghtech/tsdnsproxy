@@ -3,6 +3,7 @@ package dns
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -221,7 +222,11 @@ func (s *Server) runUDP(ctx context.Context, listenAddr string) error {
 	}()
 
 	s.Logf("listening on %s (UDP)", listenAddr)
+	return s.serveUDP(ctx, pc)
+}
 
+// serveUDP reads queries from pc until ctx is canceled.
+func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn) error {
 	buf := make([]byte, 65535)
 
 	for {
@@ -292,7 +297,7 @@ func (s *Server) shouldUseTSNet(listenAddr string) bool {
 
 	// Use standard networking for common non-tailscale addresses
 	switch host {
-	case "0.0.0.0", "127.0.0.1", "localhost", "", "[::]":
+	case "0.0.0.0", "127.0.0.1", "localhost", "", "::", "[::]":
 		return false
 	default:
 		// If it looks like a tailscale IP or custom address, use tsnet
@@ -321,7 +326,15 @@ func (s *Server) runTCP(ctx context.Context, listenAddr string) error {
 	}()
 
 	s.Logf("listening on %s (TCP)", listenAddr)
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
+	return s.serveTCP(ctx, listener)
+}
 
+// serveTCP accepts connections until ctx is canceled.
+func (s *Server) serveTCP(ctx context.Context, listener net.Listener) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -627,7 +640,7 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 
 	domain, grant, found := s.GrantParser.FindBestMatch(queryName, grantConfigs)
 	if !found {
-		return s.forwardQuery(ctx, query, nil, nil, dnsmessage.Name{})
+		return s.forwardQuery(ctx, query, nil, nil, dnsmessage.Name{}, nil)
 	}
 
 	// Omitted and negative translateid values forward the query.
@@ -644,7 +657,7 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 		} else {
 			s.Logf("[v] authoritative domain: %s (translateID=%d)", domain, *grant.TranslateID)
 		}
-		return s.handleAuthoritative4via6(query, &grant, domain)
+		return s.handleAuthoritative4via6(query, &grant, domain, grantConfigs)
 	}
 
 	var rewrittenQuery *dnsmessage.Message
@@ -662,7 +675,7 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 	// Forward to configured backends
 	backends := s.BackendMgr.CreateBackends(grant.DNS)
 	s.Logf("[v] forwarding %s to backends: %v (rewrite=%q)", queryName, grant.DNS, grant.Rewrite)
-	response, err := s.forwardQuery(ctx, rewrittenQuery, backends, &grant, originalName)
+	response, err := s.forwardQuery(ctx, rewrittenQuery, backends, &grant, originalName, grantConfigs)
 	if err != nil {
 		return nil, err
 	}
@@ -671,7 +684,10 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 }
 
 // handleAuthoritative4via6 handles 4via6 domains authoritatively without forwarding to backends
-func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *grants.DNSGrant, domain string) ([]byte, error) {
+// errSkipTranslate means the address must be returned unchanged.
+var errSkipTranslate = errors.New("skip translation")
+
+func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *grants.DNSGrant, domain string, configs []grants.GrantConfig) ([]byte, error) {
 	if len(query.Questions) == 0 {
 		return nil, fmt.Errorf("no questions in query")
 	}
@@ -753,32 +769,45 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 			// For other query types, return NODATA (empty answer section)
 		}
 	} else {
-		// 4via6 translation mode: serve AAAA records with 4via6 addresses
-		if question.Type == dnsmessage.TypeAAAA {
-			// Create synthetic 4via6 address
-			via6Addr, err := s.createSynthetic4via6Address(question.Name.String(), domain, grant)
+		// Translation mode. Addresses outside the grant's ranges are served unchanged.
+		switch question.Type {
+		case dnsmessage.TypeA:
+			ipv4, err := s.resolveBackendIPv4(question.Name.String(), domain, grant)
 			if err != nil {
-				s.Logf("failed to create synthetic 4via6 address for %s: %v", question.Name.String(), err)
+				s.Logf("failed to resolve IPv4 for %s: %v", question.Name.String(), err)
+				response.RCode = dnsmessage.RCodeServerFailure
+				break
+			}
+			if _, ok := s.translationTarget(ipv4, grant, configs); !ok {
+				response.Answers = []dnsmessage.Resource{aRecord(question, ipv4)}
+				s.Logf("[v] passthrough A for %s: %s", question.Name.String(), ipv4)
+			}
+		case dnsmessage.TypeAAAA:
+			via6Addr, err := s.createSynthetic4via6Address(question.Name.String(), domain, grant, configs)
+			if errors.Is(err, errSkipTranslate) {
+				s.Logf("[v] passthrough AAAA for %s: address excluded from translation", question.Name.String())
+			} else if err != nil {
+				s.Logf("failed to create synthetic address for %s: %v", question.Name.String(), err)
 				response.RCode = dnsmessage.RCodeServerFailure
 			} else {
-				// Add AAAA record to response
 				response.Answers = []dnsmessage.Resource{
 					{
 						Header: dnsmessage.ResourceHeader{
 							Name:  question.Name,
 							Type:  dnsmessage.TypeAAAA,
 							Class: question.Class,
-							TTL:   300, // Default TTL
+							TTL:   300,
 						},
 						Body: &dnsmessage.AAAAResource{
 							AAAA: via6Addr.As16(),
 						},
 					},
 				}
-				s.Logf("[v] 4via6 authoritative response for %s: %s", question.Name.String(), via6Addr.String())
+				s.Logf("[v] translated AAAA for %s: %s", question.Name.String(), via6Addr.String())
 			}
+		default:
+			// Other query types return NODATA.
 		}
-		// For A or other query types, return NODATA (empty answer section)
 	}
 
 	return response.Pack()
@@ -814,27 +843,73 @@ func (s *Server) resolveBackendIPv4(queryDomain, grantDomain string, grant *gran
 }
 
 // createSynthetic4via6Address creates a synthetic 4via6 IPv6 address by resolving the backend service
-func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
-	// Resolve backend IPv4 address
+func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, grant *grants.DNSGrant, configs []grants.GrantConfig) (netip.Addr, error) {
 	ipv4, err := s.resolveBackendIPv4(queryDomain, grantDomain, grant)
 	if err != nil {
 		return netip.Addr{}, err
 	}
-
-	// Create 4via6 address using tsaddr.MapVia
-	prefix := netip.PrefixFrom(ipv4, 32)
-	siteID, ok := grant.ExplicitTranslateID()
-	if !ok || siteID <= 0 || siteID > grants.MaxTranslateID {
-		return netip.Addr{}, fmt.Errorf("translateid outside 1-%d", grants.MaxTranslateID)
+	siteID, ok := s.translationTarget(ipv4, grant, configs)
+	if !ok {
+		return netip.Addr{}, errSkipTranslate
 	}
-	via6Prefix, err := tsaddr.MapVia(uint32(siteID), prefix)
+	return s.mapVia6(ipv4, siteID)
+}
+
+func (s *Server) mapVia6(ipv4 netip.Addr, siteID uint32) (netip.Addr, error) {
+	via, err := tsaddr.MapVia(siteID, netip.PrefixFrom(ipv4, 32))
 	if err != nil {
-		s.Logf("failed to map 4via6 for %s (site %d): %v", ipv4, siteID, err)
-		return netip.Addr{}, fmt.Errorf("failed to map 4via6 for %s (site %d): %w", ipv4, siteID, err)
+		s.Logf("failed to map address for %s (site %d): %v", ipv4, siteID, err)
+		return netip.Addr{}, fmt.Errorf("failed to map address for %s (site %d): %w", ipv4, siteID, err)
 	}
-	s.Logf("[v] created 4via6 address: %s -> %s", ipv4, via6Prefix.Addr())
+	s.Logf("[v] mapped %s site %d -> %s", ipv4, siteID, via.Addr())
+	return via.Addr(), nil
+}
 
-	return via6Prefix.Addr(), nil
+// translationTarget reports the site id to use when ip should be translated.
+// A matching CIDR grant overrides the domain grant. Omitted or non-positive
+// ids on a CIDR grant leave the address unchanged.
+func (s *Server) translationTarget(ip netip.Addr, domainGrant *grants.DNSGrant, configs []grants.GrantConfig) (uint32, bool) {
+	if domainGrant == nil || !ip.Is4() {
+		return 0, false
+	}
+	if s.GrantParser == nil {
+		s.GrantParser = grants.NewParser()
+	}
+	if _, ipGrant, found := s.GrantParser.MatchPrefix(ip, configs); found {
+		return siteIfPermitted(ip, ipGrant, true)
+	}
+	return siteIfPermitted(ip, *domainGrant, false)
+}
+
+func siteIfPermitted(ip netip.Addr, grant grants.DNSGrant, prefixRule bool) (uint32, bool) {
+	policy, err := grant.IPPolicy()
+	if err != nil {
+		return 0, false
+	}
+	if prefixRule {
+		// The CIDR key itself selects this address, so built-in blocks do not apply.
+		policy.ApplyDefaults = false
+	}
+	if !policy.Permits(ip) {
+		return 0, false
+	}
+	id, ok := grant.ExplicitTranslateID()
+	if !ok || id <= 0 || id > grants.MaxTranslateID {
+		return 0, false
+	}
+	return uint32(id), true
+}
+
+func aRecord(question dnsmessage.Question, ipv4 netip.Addr) dnsmessage.Resource {
+	return dnsmessage.Resource{
+		Header: dnsmessage.ResourceHeader{
+			Name:  question.Name,
+			Type:  dnsmessage.TypeA,
+			Class: question.Class,
+			TTL:   300,
+		},
+		Body: &dnsmessage.AResource{A: ipv4.As4()},
+	}
 }
 
 // resolveBackendIPv6 resolves a query domain to its backend IPv6 address
@@ -1035,7 +1110,7 @@ func (s *Server) rewriteQuery(query *dnsmessage.Message, targetDomain, rewriteDo
 	return &rewritten, nil
 }
 
-func (s *Server) forwardQuery(ctx context.Context, query *dnsmessage.Message, backends []backend.Backend, grant *grants.DNSGrant, originalName dnsmessage.Name) ([]byte, error) {
+func (s *Server) forwardQuery(ctx context.Context, query *dnsmessage.Message, backends []backend.Backend, grant *grants.DNSGrant, originalName dnsmessage.Name, configs []grants.GrantConfig) ([]byte, error) {
 	// Pack query for forwarding
 	queryBytes, err := query.Pack()
 	if err != nil {
@@ -1055,7 +1130,7 @@ func (s *Server) forwardQuery(ctx context.Context, query *dnsmessage.Message, ba
 
 	if grant != nil {
 		if id, ok := grant.ExplicitTranslateID(); ok && id > 0 && id <= grants.MaxTranslateID {
-			s.translate4via6(&response, uint32(id), query)
+			s.translate4via6(&response, query, grant, configs)
 		}
 	}
 
@@ -1067,8 +1142,7 @@ func (s *Server) forwardQuery(ctx context.Context, query *dnsmessage.Message, ba
 	return response.Pack()
 }
 
-func (s *Server) translate4via6(response *dnsmessage.Message, siteID uint32, originalQuery *dnsmessage.Message) {
-	// Determine what the client originally requested
+func (s *Server) translate4via6(response *dnsmessage.Message, originalQuery *dnsmessage.Message, grant *grants.DNSGrant, configs []grants.GrantConfig) {
 	var queryTypes = make(map[dnsmessage.Type]bool)
 	for _, q := range originalQuery.Questions {
 		queryTypes[q.Type] = true
@@ -1077,45 +1151,36 @@ func (s *Server) translate4via6(response *dnsmessage.Message, siteID uint32, ori
 	var translatedAnswers []dnsmessage.Resource
 
 	for _, ans := range response.Answers {
-		if a, ok := ans.Body.(*dnsmessage.AResource); ok && ans.Header.Type == dnsmessage.TypeA {
-			ip4 := netip.AddrFrom4(a.A)
-			via, err := tsaddr.MapVia(siteID, netip.PrefixFrom(ip4, 32))
-			if err != nil {
-				s.Logf("failed to map 4via6 for %v: %v", ip4, err)
-				translatedAnswers = append(translatedAnswers, ans)
-				continue
-			}
-
-			// Handle different query types appropriately
-			if queryTypes[dnsmessage.TypeA] {
-				// Client requested A records, keep original A record
-				translatedAnswers = append(translatedAnswers, ans)
-			}
-
-			if queryTypes[dnsmessage.TypeAAAA] {
-				// Client requested AAAA records, provide 4via6 translation
-				aaaa := dnsmessage.Resource{
-					Header: dnsmessage.ResourceHeader{
-						Name:  ans.Header.Name,
-						Type:  dnsmessage.TypeAAAA,
-						Class: ans.Header.Class,
-						TTL:   ans.Header.TTL,
-					},
-					Body: &dnsmessage.AAAAResource{
-						AAAA: via.Addr().As16(),
-					},
-				}
-				translatedAnswers = append(translatedAnswers, aaaa)
-			}
-
-			// If client requested neither A nor AAAA specifically (shouldn't happen in practice),
-			// default to keeping the original A record for compatibility
-			if !queryTypes[dnsmessage.TypeA] && !queryTypes[dnsmessage.TypeAAAA] {
-				translatedAnswers = append(translatedAnswers, ans)
-			}
-		} else {
-			// Pass through non-A records unchanged
+		a, isA := ans.Body.(*dnsmessage.AResource)
+		if !isA || ans.Header.Type != dnsmessage.TypeA {
 			translatedAnswers = append(translatedAnswers, ans)
+			continue
+		}
+		ip4 := netip.AddrFrom4(a.A)
+		siteID, ok := s.translationTarget(ip4, grant, configs)
+		if !ok {
+			translatedAnswers = append(translatedAnswers, ans)
+			continue
+		}
+		via, err := s.mapVia6(ip4, siteID)
+		if err != nil {
+			translatedAnswers = append(translatedAnswers, ans)
+			continue
+		}
+
+		if queryTypes[dnsmessage.TypeA] || (!queryTypes[dnsmessage.TypeA] && !queryTypes[dnsmessage.TypeAAAA]) {
+			translatedAnswers = append(translatedAnswers, ans)
+		}
+		if queryTypes[dnsmessage.TypeAAAA] {
+			translatedAnswers = append(translatedAnswers, dnsmessage.Resource{
+				Header: dnsmessage.ResourceHeader{
+					Name:  ans.Header.Name,
+					Type:  dnsmessage.TypeAAAA,
+					Class: ans.Header.Class,
+					TTL:   ans.Header.TTL,
+				},
+				Body: &dnsmessage.AAAAResource{AAAA: via.As16()},
+			})
 		}
 	}
 

@@ -1,6 +1,8 @@
 package grants
 
 import (
+	"encoding/json"
+	"net/netip"
 	"testing"
 
 	"tailscale.com/tailcfg"
@@ -569,6 +571,57 @@ func TestParseGrants_TranslateIDPresence(t *testing.T) {
 				t.Fatalf("Authoritative() = %v, want %v", grant.Authoritative(), tc.wantAuth)
 			}
 		})
+	}
+}
+
+func TestPrefixRulesAndFilters(t *testing.T) {
+	p := NewParser()
+	if err := p.validateGrant(GrantConfig{
+		"10.0.0.0/8": {TranslateID: tid(1), AllowIPs: []string{"10.0.0.0/8"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.validateGrant(GrantConfig{
+		"10.0.0.0/99": {TranslateID: tid(1)},
+	}); err == nil {
+		t.Fatal("expected invalid prefix")
+	}
+	if err := p.validateGrant(GrantConfig{
+		"site-a.example": {AllowIPs: []string{"nope"}},
+	}); err == nil {
+		t.Fatal("expected invalid allowips and empty grant")
+	}
+	if err := p.validateGrant(GrantConfig{
+		"site-a.example": {DNS: []string{"10.0.0.1:53"}, DenyIPs: []string{"bad"}},
+	}); err == nil {
+		t.Fatal("expected invalid denyips")
+	}
+
+	raw := `{
+		"site-a.example": {"dns":["10.1.0.10:53"],"translateid":1,"allowips":["10.0.0.0/8"],"denyips":["10.1.50.0/24"]},
+		"10.9.0.0/16": {"translateid":2},
+		"100.64.0.0/10": {"translateid":0}
+	}`
+	var cfg GrantConfig
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.validateGrant(cfg); err != nil {
+		t.Fatal(err)
+	}
+	domain, grant, ok := p.FindBestMatch("svc.site-a.example", []GrantConfig{cfg})
+	if !ok || domain != "site-a.example" || !grant.Authoritative() {
+		t.Fatalf("domain match = %q %#v %v", domain, grant, ok)
+	}
+	if _, _, ok := p.FindBestMatch("10.9.0.0/16", []GrantConfig{cfg}); ok {
+		t.Fatal("prefix key must not match as a domain")
+	}
+	prefix, ipGrant, ok := p.MatchPrefix(netip.MustParseAddr("10.9.1.1"), []GrantConfig{cfg})
+	if !ok || prefix.String() != "10.9.0.0/16" || *ipGrant.TranslateID != 2 {
+		t.Fatalf("prefix match = %v %#v %v", prefix, ipGrant, ok)
+	}
+	if _, _, ok := p.MatchPrefix(netip.MustParseAddr("192.0.2.1"), []GrantConfig{cfg}); ok {
+		t.Fatal("unexpected prefix match")
 	}
 }
 

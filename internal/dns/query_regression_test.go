@@ -147,6 +147,8 @@ func TestProcessQueryTranslateIDModes(t *testing.T) {
 			qtype:       dnsmessage.TypeA,
 			wantRCode:   dnsmessage.RCodeSuccess,
 			wantAnswers: 0,
+			wantBackend: true,
+			wantQType:   dnsmessage.TypeA,
 		},
 		{
 			name:        "positive synthesizes AAAA",
