@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -132,6 +133,8 @@ func main() {
 		acceptRoutes  = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes and use TS dialer")
 		verbose       = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
 		capName       = flag.String("cap-name", envOr("TSDNSPROXY_CAP_NAME", grants.DefaultCapName), "capability name for DNS grants (domain/path)")
+		rulesFile     = flag.String("rules-file", os.Getenv("TSDNSPROXY_RULES_FILE"), "JSON or HuJSON rules file applied to every client")
+		rulesOnly     = flag.Bool("rules-only", envOr("TSDNSPROXY_RULES_ONLY", "false") == "true", "ignore ACL grants and use only the rules file")
 	)
 	flag.Parse()
 
@@ -141,24 +144,59 @@ func main() {
 	}
 
 	// Log configuration for debugging
-	log.Printf("configuration: accept-routes=%v (env=%q), verbose=%v, listen-addrs=%q, cap-name=%q",
+	log.Printf("configuration: accept-routes=%v (env=%q), verbose=%v, listen-addrs=%q, cap-name=%q, rules-file=%q, rules-only=%v",
 		*acceptRoutes, os.Getenv("TSDNSPROXY_ACCEPT_ROUTES"),
-		*verbose, *listenAddrs, grantParser.CapName())
+		*verbose, *listenAddrs, grantParser.CapName(), *rulesFile, *rulesOnly)
 
 	if *authKey == "" {
 		log.Fatal("authkey is required (set TS_AUTHKEY or use -authkey)")
+	}
+	if *rulesOnly && *rulesFile == "" {
+		log.Fatal("-rules-only requires -rules-file")
+	}
+
+	var rules *grants.RulesFile
+	if *rulesFile != "" {
+		loaded, err := grants.OpenRulesFile(*rulesFile)
+		if err != nil {
+			log.Fatalf("rules file: %v", err)
+		}
+		rules = loaded
+		logLoadedRules(rules)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
-		<-sigCh
-		log.Println("shutting down...")
-		cancel()
+		for sig := range sigCh {
+			if sig == syscall.SIGHUP {
+				if rules == nil {
+					log.Print("SIGHUP ignored, no rules file configured")
+					continue
+				}
+				changed, err := rules.Reload()
+				if err != nil {
+					log.Printf("SIGHUP: rules reload failed: %v", err)
+					continue
+				}
+				if changed {
+					log.Printf("SIGHUP: reloaded rules from %s", rules.Path())
+					continue
+				}
+				log.Print("SIGHUP: rules file unchanged")
+				continue
+			}
+			log.Println("shutting down...")
+			cancel()
+			return
+		}
 	}()
+	if rules != nil {
+		go rules.Watch(ctx, grants.RulesPollInterval)
+	}
 
 	s := &tsnet.Server{
 		Dir:      *stateDir,
@@ -304,6 +342,8 @@ func main() {
 		GrantParser: grantParser,
 		BackendMgr:  backendMgr,
 		Logf:        logf(*verbose),
+		Rules:       rules,
+		RulesOnly:   *rulesOnly,
 	}
 
 	healthServer := startHealthServer(ctx, *healthAddr, s)
@@ -347,6 +387,22 @@ func enableAcceptRoutes(ctx context.Context, lc *local.Client) error {
 	}
 
 	return nil
+}
+
+func logLoadedRules(rules *grants.RulesFile) {
+	cfg, ok := rules.Current()
+	if !ok {
+		return
+	}
+	names := make([]string, 0, len(cfg))
+	for domain := range cfg {
+		names = append(names, domain)
+	}
+	sort.Strings(names)
+	log.Printf("loaded %d rules from %s", len(names), rules.Path())
+	for _, name := range names {
+		log.Printf("  - rule for %s", name)
+	}
 }
 
 func logf(verbose bool) func(format string, args ...any) {
