@@ -15,9 +15,15 @@ metadata:
   name: tsdnsproxy
   namespace: tsdnsproxy
 rules:
+# get, update, and patch the named state Secret from TSDNSPROXY_STATE.
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["get", "update", "patch", "create"]
+  resourceNames: ["tsdnsproxy-state"]
+  verbs: ["get", "update", "patch"]
+# create is not limited to a name; the store creates the Secret when it is missing.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["create"]
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["create"]

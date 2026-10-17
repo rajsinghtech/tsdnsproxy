@@ -26,6 +26,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/ipn/store"
+	_ "tailscale.com/ipn/store/kubestore" // registers the kube: state store; no build tag, so -tags netgo keeps it
 	"tailscale.com/tsnet"
 )
 
@@ -215,6 +216,9 @@ func main() {
 
 	if *state != "" {
 		log.Printf("available store: awsstore: %v kube:%v", store.HasKnownProviderPrefix("arn:"), store.HasKnownProviderPrefix("kube:"))
+		if strings.HasPrefix(*state, "kube:") && !store.HasKnownProviderPrefix(*state) {
+			log.Fatal("kube: state store provider is not registered")
+		}
 
 		stateStore, err := store.New(log.Printf, *state)
 		if err != nil {
