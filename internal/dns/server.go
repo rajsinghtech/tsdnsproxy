@@ -63,6 +63,16 @@ type Server struct {
 	// MaxUDP is the largest UDP response written to a client.
 	// Zero means 1232 bytes. Clients that send no EDNS OPT still get 512.
 	MaxUDP int
+	// MaxInflight is the worker pool size. Zero means the built-in default.
+	MaxInflight int
+	// MaxMessage is the largest accepted query. Zero means 65535.
+	MaxMessage int
+	// RatePerSec is the per-client query rate. Zero disables the limit.
+	RatePerSec float64
+	// RateBurst is the per-client burst size.
+	RateBurst int
+
+	limiter *sourceLimiter
 
 	// Service hosts DNS as a Tailscale Service when set, for example "svc:dns".
 	// The listener is TCP. Port 53 is used unless the value ends in @port.
@@ -94,7 +104,15 @@ func (s *Server) Run(ctx context.Context) error {
 // regular TCP/UDP listeners, addresses with a "svc:" or "service:" prefix
 // are hosted as named Tailscale Services via ListenService (TCP-only).
 func (s *Server) RunWithAddrs(ctx context.Context, listenAddrsStr string, status *ipnstate.Status) error {
-	s.workerPool = make(chan struct{}, constants.WorkerPoolSize)
+	inflight := s.MaxInflight
+	if inflight <= 0 {
+		inflight = constants.WorkerPoolSize
+	}
+	s.workerPool = make(chan struct{}, inflight)
+	if s.RateBurst <= 0 {
+		s.RateBurst = 1
+	}
+	s.limiter = newSourceLimiter(s.RatePerSec, s.RateBurst)
 
 	// Load server's own grants
 	if err := s.loadServerGrants(ctx, status); err != nil {
@@ -325,8 +343,7 @@ func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn) error {
 			continue
 		}
 
-		// Validate DNS message size (minimum 12 bytes for header)
-		if n < 12 || n > 65535 {
+		if n < 12 || n > s.maxMessage() {
 			s.Logf("[v] invalid DNS message size %d from %s", n, addr)
 			continue
 		}
@@ -491,6 +508,29 @@ func (s *Server) waitForHandlers(protocol string) {
 	}
 }
 
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+func (s *Server) maxMessage() int {
+	if s != nil && s.MaxMessage > 0 {
+		return s.MaxMessage
+	}
+	return 65535
+}
+
+func (s *Server) tcpLifetime() time.Duration {
+	timeout := 30 * time.Second
+	if s != nil && s.QueryTimeout > 0 && s.QueryTimeout*3 < timeout {
+		timeout = s.QueryTimeout * 3
+	}
+	if timeout < time.Second {
+		timeout = time.Second
+	}
+	return timeout
+}
+
 func (s *Server) queryTimeout() time.Duration {
 	if s != nil && s.QueryTimeout > 0 {
 		return s.QueryTimeout
@@ -527,6 +567,20 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 
 	// Only handle queries
 	if msg.Response {
+		return
+	}
+	if len(msg.Questions) != 1 {
+		s.sendError(pc, addr, &msg, dnsmessage.RCodeFormatError)
+		return
+	}
+	if err := validateQueryName(msg.Questions[0].Name); err != nil {
+		s.Logf("[v] rejected name from %s: %v", addr, err)
+		s.sendError(pc, addr, &msg, dnsmessage.RCodeFormatError)
+		return
+	}
+	if !s.limiter.allow(addr.String()) {
+		s.Logf("refusing %s: rate limit", addr)
+		s.sendError(pc, addr, &msg, dnsmessage.RCodeRefused)
 		return
 	}
 
@@ -1383,24 +1437,29 @@ func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn, via str
 		}
 	}()
 
-	// Set connection deadline
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	lifetime := s.tcpLifetime()
+	deadline := time.Now().Add(lifetime)
+	if err := conn.SetDeadline(deadline); err != nil {
 		s.Logf("failed to set connection deadline for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 
-	for {
+	const maxQueriesPerConn = 128
+	for n := 0; n < maxQueriesPerConn; n++ {
+		if err := conn.SetReadDeadline(time.Now().Add(s.queryTimeout())); err != nil {
+			s.Logf("failed to set read deadline for %s: %v", conn.RemoteAddr(), err)
+			return
+		}
 		// Read DNS message length (2 bytes)
 		var length uint16
 		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-			if err != io.EOF {
+			if err != io.EOF && !isTimeout(err) {
 				s.Logf("failed to read message length from %s: %v", conn.RemoteAddr(), err)
 			}
 			return
 		}
 
-		// Sanity check length
-		if length == 0 {
+		if length == 0 || int(length) > s.maxMessage() {
 			s.Logf("invalid message length %d from %s", length, conn.RemoteAddr())
 			return
 		}
@@ -1416,9 +1475,7 @@ func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn, via str
 		tcpWriter := &tcpResponseWriter{conn: conn}
 		s.handleQuery(ctx, tcpWriter, conn.RemoteAddr(), packet, via)
 
-		// Reset deadline for next query
-		if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			s.Logf("failed to reset deadline for %s: %v", conn.RemoteAddr(), err)
+		if time.Now().After(deadline) {
 			return
 		}
 	}

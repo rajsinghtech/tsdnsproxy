@@ -220,6 +220,11 @@ func (p *Parser) validateGrant(grant GrantConfig) error {
 		if isPrefix && !prefix.IsValid() {
 			return fmt.Errorf("invalid CIDR %q", domain)
 		}
+		if !isPrefix {
+			if err := validateZoneName(domain); err != nil {
+				return err
+			}
+		}
 
 		hasFilter := len(dnsGrant.AllowIPs) > 0 || len(dnsGrant.DenyIPs) > 0
 		hasTranslate := dnsGrant.TranslateID != nil

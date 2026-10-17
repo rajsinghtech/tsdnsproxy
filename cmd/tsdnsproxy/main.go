@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/rajsinghtech/tsdnsproxy/internal/backend"
 	"github.com/rajsinghtech/tsdnsproxy/internal/cache"
+	"github.com/rajsinghtech/tsdnsproxy/internal/config"
 	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
 	"github.com/rajsinghtech/tsdnsproxy/internal/dns"
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
@@ -33,13 +33,6 @@ import (
 
 // version is set with -ldflags "-X main.version=..." at release build time.
 var version = "dev"
-
-func envOr(key, defaultVal string) string {
-	if v, ok := os.LookupEnv(key); ok {
-		return v
-	}
-	return defaultVal
-}
 
 func getHostDNSServers() []string {
 	var servers []string
@@ -137,59 +130,44 @@ func main() {
 	hostinfo.SetApp("tsdnsproxy")
 	log.Printf("version %s", version)
 
-	var (
-		authKey       = flag.String("authkey", os.Getenv("TS_AUTHKEY"), "tailscale auth key")
-		hostname      = flag.String("hostname", envOr("TSDNSPROXY_HOSTNAME", "tsdnsproxy"), "hostname on tailnet")
-		stateDir      = flag.String("statedir", envOr("TSDNSPROXY_STATE_DIR", "/var/lib/tsdnsproxy"), "state directory")
-		state         = flag.String("state", os.Getenv("TSDNSPROXY_STATE"), "state storage (e.g., kube:<secret-name>)")
-		controlURL    = flag.String("controlurl", os.Getenv("TS_CONTROLURL"), "optional alternate control server URL")
-		advertiseTags = flag.String("advertise-tags", os.Getenv("TSDNSPROXY_ADVERTISE_TAGS"), "ACL tags to advertise (comma-separated, default: none)")
-		overrideDNS   = flag.String("override-dns", envOr("TSDNSPROXY_OVERRIDE_DNS", ""), "override DNS servers (comma-separated, defaults to host resolvers)")
-		cacheExpiry   = flag.Duration("cache-expiry", constants.DefaultCacheExpiry, "whois cache expiry duration")
-		healthAddr    = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
-		listenAddrs   = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
-		service       = flag.String("service", envOr("TSDNSPROXY_SERVICE", ""), "Tailscale Service to host, for example svc:dns (TCP 53)")
-		acceptRoutes  = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes (also implied by an explicit tailnet dial)")
-		dialModeFlag  = flag.String("dial", envOr("TSDNSPROXY_DIAL", "tailnet"), "default backend dial mode: tailnet or direct (host network)")
-		verbose       = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
-		capName       = flag.String("cap-name", envOr("TSDNSPROXY_CAP_NAME", grants.DefaultCapName), "capability name for DNS grants (domain/path)")
-		rulesFile     = flag.String("rules-file", os.Getenv("TSDNSPROXY_RULES_FILE"), "JSON or HuJSON rules file applied to every client")
-		rulesOnly     = flag.Bool("rules-only", envOr("TSDNSPROXY_RULES_ONLY", "false") == "true", "ignore ACL grants and use only the rules file")
-	)
-	flag.Parse()
+	cfg, err := config.Parse(os.Args[1:], os.Getenv)
+	if err != nil {
+		log.Fatal(err)
+	}
+	verbose := strings.EqualFold(cfg.LogLevel, "debug")
 
-	grantParser, err := grants.NewParserWithName(*capName)
+	grantParser, err := grants.NewParserWithName(cfg.CapName)
 	if err != nil {
 		log.Fatalf("invalid cap-name: %v", err)
 	}
-	dialMode, err := backend.ParseDialMode(*dialModeFlag)
+	dialMode, err := backend.ParseDialMode(cfg.Dial)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Log configuration for debugging
-	hostedService, err := dns.ParseHostedService(*service)
+	hostedService, err := dns.ParseHostedService(cfg.Service)
 	if err != nil {
 		log.Fatalf("service: %v", err)
 	}
-	if hostedService.Name != "" && !hasAdvertiseTag(*advertiseTags) {
+	if hostedService.Name != "" && !hasAdvertiseTag(cfg.AdvertiseTags) {
 		log.Fatal("advertise-tags is required to host a Tailscale Service (set -advertise-tags or TSDNSPROXY_ADVERTISE_TAGS)")
 	}
 
 	log.Printf("configuration: accept-routes=%v (env=%q), dial=%s, verbose=%v, listen-addrs=%q, service=%q, cap-name=%q, rules-file=%q, rules-only=%v",
-		*acceptRoutes, os.Getenv("TSDNSPROXY_ACCEPT_ROUTES"), dialMode,
-		*verbose, *listenAddrs, hostedService.Name, grantParser.CapName(), *rulesFile, *rulesOnly)
+		cfg.AcceptRoutes, os.Getenv("TSDNSPROXY_ACCEPT_ROUTES"), dialMode,
+		verbose, cfg.ListenAddrs, hostedService.Name, grantParser.CapName(), cfg.RulesFile, cfg.RulesOnly)
 
-	if *authKey == "" {
-		log.Fatal("authkey is required (set TS_AUTHKEY or use -authkey)")
+	if cfg.AuthKey == "" {
+		log.Fatal("auth key is required (set TS_AUTHKEY or use -auth-key)")
 	}
-	if *rulesOnly && *rulesFile == "" {
+	if cfg.RulesOnly && cfg.RulesFile == "" {
 		log.Fatal("-rules-only requires -rules-file")
 	}
 
 	var rules *grants.RulesFile
-	if *rulesFile != "" {
-		loaded, err := grants.OpenRulesFile(*rulesFile)
+	if cfg.RulesFile != "" {
+		loaded, err := grants.OpenRulesFile(cfg.RulesFile)
 		if err != nil {
 			log.Fatalf("rules file: %v", err)
 		}
@@ -231,46 +209,46 @@ func main() {
 		go rules.Watch(ctx, grants.RulesPollInterval)
 	}
 
-	*hostname = expandEnvRefs(*hostname)
-	*state = expandEnvRefs(*state)
-	if err := os.MkdirAll(*stateDir, 0o700); err != nil {
-		log.Printf("state dir %s: %v", *stateDir, err)
+	cfg.Hostname = expandEnvRefs(cfg.Hostname)
+	cfg.State = expandEnvRefs(cfg.State)
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		log.Printf("state dir %s: %v", cfg.StateDir, err)
 	}
 
-	defaultServers := hostOrOverrideDNS(*overrideDNS)
-	needRoutes, err := needsTailnetRoutes(*acceptRoutes, explicitDialTailnet(dialMode), defaultServers, rules)
+	defaultServers := hostOrOverrideDNS(cfg.OverrideDNS)
+	needRoutes, err := needsTailnetRoutes(cfg.AcceptRoutes, explicitDialTailnet(dialMode, cfg.DialSet), defaultServers, rules)
 	if err != nil {
 		log.Fatalf("backend dial: %v", err)
 	}
 	log.Printf("using DNS servers: %v (dial=%s, tailnet-routes=%v)", defaultServers, dialMode, needRoutes)
 
 	s := &tsnet.Server{
-		Dir:      *stateDir,
-		Hostname: *hostname,
-		AuthKey:  *authKey,
-		Logf:     logf(*verbose),
+		Dir:      cfg.StateDir,
+		Hostname: cfg.Hostname,
+		AuthKey:  cfg.AuthKey,
+		Logf:     logf(verbose),
 	}
 
-	if *advertiseTags != "" {
-		s.AdvertiseTags = strings.Split(*advertiseTags, ",")
+	if cfg.AdvertiseTags != "" {
+		s.AdvertiseTags = strings.Split(cfg.AdvertiseTags, ",")
 	}
 
-	if *controlURL != "" {
-		s.ControlURL = *controlURL
+	if cfg.ControlURL != "" {
+		s.ControlURL = cfg.ControlURL
 	}
 
-	if *state != "" {
+	if cfg.State != "" {
 		log.Printf("available store: awsstore: %v kube:%v", store.HasKnownProviderPrefix("arn:"), store.HasKnownProviderPrefix("kube:"))
-		if strings.HasPrefix(*state, "kube:") && !store.HasKnownProviderPrefix(*state) {
+		if strings.HasPrefix(cfg.State, "kube:") && !store.HasKnownProviderPrefix(cfg.State) {
 			log.Fatal("kube: state store provider is not registered")
 		}
 
-		stateStore, err := store.New(log.Printf, *state)
+		stateStore, err := store.New(log.Printf, cfg.State)
 		if err != nil {
 			log.Fatalf("failed to create state store: %v", err)
 		}
 		s.Store = stateStore
-		log.Printf("using state store: %s", *state)
+		log.Printf("using state store: %s", cfg.State)
 	}
 
 	defer func() {
@@ -279,7 +257,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("starting tsnet server as %q", *hostname)
+	log.Printf("starting tsnet server as %q", cfg.Hostname)
 
 	if err := retryWithBackoff(ctx, constants.StartupMaxRetries, func() error {
 		return s.Start()
@@ -307,8 +285,8 @@ func main() {
 		}
 	}
 
-	whoisCache := cache.NewWhoisCache(*cacheExpiry)
-	grantCache := cache.NewGrantCache(*cacheExpiry)
+	whoisCache := cache.NewWhoisCache(cfg.CacheTTL)
+	grantCache := cache.NewGrantCache(cfg.CacheTTL)
 	defer whoisCache.Close()
 	defer grantCache.Close()
 
@@ -319,7 +297,7 @@ func main() {
 		Tailnet:       s,
 		TailnetRoutes: backend.NewEnsuringDialer(s, routes.Ensure),
 		Default:       dialMode,
-	}, logf(*verbose))
+	}, logf(verbose))
 	if err != nil {
 		log.Fatalf("backend dial: %v", err)
 	}
@@ -362,7 +340,7 @@ func main() {
 	}
 
 	// Log peer status to help diagnose subnet route issues
-	if *verbose {
+	if verbose {
 		peerStatus, err := lc.Status(ctx)
 		if err != nil {
 			log.Printf("[DEBUG] failed to get peer status: %v", err)
@@ -378,23 +356,29 @@ func main() {
 	}
 
 	dnsServer := &dns.Server{
-		TSServer:    s,
-		LocalClient: lc,
-		WhoisCache:  whoisCache,
-		GrantCache:  grantCache,
-		GrantParser: grantParser,
-		BackendMgr:  backendMgr,
-		Logf:        logf(*verbose),
-		Rules:       rules,
-		RulesOnly:   *rulesOnly,
-		Service:     *service,
+		TSServer:     s,
+		LocalClient:  lc,
+		WhoisCache:   whoisCache,
+		GrantCache:   grantCache,
+		GrantParser:  grantParser,
+		BackendMgr:   backendMgr,
+		Logf:         logf(verbose),
+		Rules:        rules,
+		RulesOnly:    cfg.RulesOnly,
+		Service:      cfg.Service,
+		QueryTimeout: cfg.QueryTimeout,
+		MaxUDP:       cfg.MaxUDPBytes,
+		MaxInflight:  cfg.MaxInflight,
+		MaxMessage:   cfg.MaxMessageBytes,
+		RatePerSec:   cfg.RateLimit,
+		RateBurst:    cfg.RateBurst,
 	}
 
-	healthServer := startHealthServer(ctx, *healthAddr, s)
+	healthServer := startHealthServer(ctx, cfg.HTTPAddr, s)
 
 	// Start DNS server (handles both UDP and TCP)
-	log.Printf("starting DNS server: %v", *listenAddrs)
-	if err := dnsServer.RunWithAddrs(ctx, *listenAddrs, status); err != nil {
+	log.Printf("starting DNS server: %v", cfg.ListenAddrs)
+	if err := dnsServer.RunWithAddrs(ctx, cfg.ListenAddrs, status); err != nil {
 		log.Printf("DNS server error: %v", err)
 	}
 
@@ -424,17 +408,11 @@ func hostOrOverrideDNS(override string) []string {
 
 // explicitDialTailnet reports whether the operator set -dial or
 // TSDNSPROXY_DIAL to tailnet. The built-in default does not count.
-func explicitDialTailnet(mode backend.DialMode) bool {
+func explicitDialTailnet(mode backend.DialMode, flagSet bool) bool {
 	if mode != backend.DialTailnet {
 		return false
 	}
-	set := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "dial" {
-			set = true
-		}
-	})
-	if set {
+	if flagSet {
 		return true
 	}
 	_, ok := os.LookupEnv("TSDNSPROXY_DIAL")

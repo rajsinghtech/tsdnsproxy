@@ -110,19 +110,22 @@ func TestExplicitDialTailnet(t *testing.T) {
 	if err := os.Unsetenv("TSDNSPROXY_DIAL"); err != nil {
 		t.Fatal(err)
 	}
-	if explicitDialTailnet(backend.DialTailnet) {
+	if explicitDialTailnet(backend.DialTailnet, false) {
 		t.Fatal("the built-in tailnet default should not count as explicit")
 	}
 	if err := os.Setenv("TSDNSPROXY_DIAL", "tailnet"); err != nil {
 		t.Fatal(err)
 	}
-	if !explicitDialTailnet(backend.DialTailnet) {
+	if !explicitDialTailnet(backend.DialTailnet, false) {
 		t.Fatal("env tailnet should be explicit")
 	}
 	if err := os.Setenv("TSDNSPROXY_DIAL", "direct"); err != nil {
 		t.Fatal(err)
 	}
-	if explicitDialTailnet(backend.DialDirect) {
+	if explicitDialTailnet(backend.DialDirect, true) {
 		t.Fatal("direct dial should not request tailnet routes")
+	}
+	if !explicitDialTailnet(backend.DialTailnet, true) {
+		t.Fatal("an explicit tailnet flag should count")
 	}
 }
