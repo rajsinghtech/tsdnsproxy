@@ -131,6 +131,7 @@ func main() {
 		cacheExpiry   = flag.Duration("cache-expiry", constants.DefaultCacheExpiry, "whois cache expiry duration")
 		healthAddr    = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
 		listenAddrs   = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
+		service       = flag.String("service", envOr("TSDNSPROXY_SERVICE", ""), "Tailscale Service to host, for example svc:dns (TCP 53)")
 		acceptRoutes  = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes and use TS dialer")
 		verbose       = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
 		capName       = flag.String("cap-name", envOr("TSDNSPROXY_CAP_NAME", grants.DefaultCapName), "capability name for DNS grants (domain/path)")
@@ -145,9 +146,17 @@ func main() {
 	}
 
 	// Log configuration for debugging
-	log.Printf("configuration: accept-routes=%v (env=%q), verbose=%v, listen-addrs=%q, cap-name=%q, rules-file=%q, rules-only=%v",
+	hostedService, err := dns.ParseHostedService(*service)
+	if err != nil {
+		log.Fatalf("service: %v", err)
+	}
+	if hostedService.Name != "" && !hasAdvertiseTag(*advertiseTags) {
+		log.Fatal("advertise-tags is required to host a Tailscale Service (set -advertise-tags or TSDNSPROXY_ADVERTISE_TAGS)")
+	}
+
+	log.Printf("configuration: accept-routes=%v (env=%q), verbose=%v, listen-addrs=%q, service=%q, cap-name=%q, rules-file=%q, rules-only=%v",
 		*acceptRoutes, os.Getenv("TSDNSPROXY_ACCEPT_ROUTES"),
-		*verbose, *listenAddrs, grantParser.CapName(), *rulesFile, *rulesOnly)
+		*verbose, *listenAddrs, hostedService.Name, grantParser.CapName(), *rulesFile, *rulesOnly)
 
 	if *authKey == "" {
 		log.Fatal("authkey is required (set TS_AUTHKEY or use -authkey)")
@@ -198,6 +207,9 @@ func main() {
 	if rules != nil {
 		go rules.Watch(ctx, grants.RulesPollInterval)
 	}
+
+	*hostname = expandEnvRefs(*hostname)
+	*state = expandEnvRefs(*state)
 
 	s := &tsnet.Server{
 		Dir:      *stateDir,
@@ -348,6 +360,7 @@ func main() {
 		Logf:        logf(*verbose),
 		Rules:       rules,
 		RulesOnly:   *rulesOnly,
+		Service:     *service,
 	}
 
 	healthServer := startHealthServer(ctx, *healthAddr, s)
@@ -407,6 +420,15 @@ func logLoadedRules(rules *grants.RulesFile) {
 	for _, name := range names {
 		log.Printf("  - rule for %s", name)
 	}
+}
+
+func hasAdvertiseTag(raw string) bool {
+	for _, part := range strings.Split(raw, ",") {
+		if strings.TrimSpace(part) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func logf(verbose bool) func(format string, args ...any) {

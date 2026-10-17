@@ -161,6 +161,7 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TSDNSPROXY_STATE`: State storage backend. `kube:secret-name` stores state in that Kubernetes Secret. The ServiceAccount needs a Role with get, update, and patch on that named Secret, plus create on Secrets. An `arn:` value selects AWS SSM.
 - `TSDNSPROXY_OVERRIDE_DNS`: Override host DNS servers (comma-separated, defaults to host's resolvers)
 - `TSDNSPROXY_LISTEN_ADDRS`: Listen addresses (default: `tailscale`) - see Network Configuration
+- `TSDNSPROXY_SERVICE`: Tailscale Service to host (`-service`), for example `svc:dns`. This is TCP port 53 unless the value ends in `@port`
 - `TSDNSPROXY_HEALTH_ADDR`: Health check endpoint address (default: `:8080`)
 - `TSDNSPROXY_ACCEPT_ROUTES`: Accept subnet routes and query DNS over tailnet (default: `false`)
 - `TSDNSPROXY_ADVERTISE_TAGS`: ACL tags to advertise (comma-separated, default: none)
@@ -175,7 +176,9 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 tsdnsproxy \
   -authkey tskey-auth-YOUR-KEY \
   -hostname tsdnsproxy \
-  -listen-addrs tailscale,0.0.0.0:53 \
+  -service svc:dns \
+  -advertise-tags tag:tsdnsproxy \
+  -listen-addrs tailscale \
   -statedir /var/lib/tsdnsproxy \
   -state kube:tsdnsproxy-state \
   -override-dns 8.8.8.8:53,8.8.4.4:53 \
@@ -186,58 +189,87 @@ tsdnsproxy \
   -verbose
 ```
 
-### Tailscale Service Hosting
+### Tailscale Service
 
-In addition to binding to a specific address, tsdnsproxy can host DNS as a
-**named Tailscale Service** via `tsnet.ListenService`. This gives the proxy a
-stable MagicDNS name (`<service>.<tailnet>.ts.net`) that survives host
-migrations and can be load-balanced across multiple instances.
+`-service svc:dns` (or `TSDNSPROXY_SERVICE`) hosts DNS over TCP on the
+service VIP. UDP 53 stays on the node's own Tailscale address
+(`-listen-addrs tailscale`, which is the default). Clients that use the VIP,
+or the MagicDNS name `dns.example.ts.net` on a tailnet whose suffix is
+`example.ts.net`, must send DNS over TCP to port 53. The service does not
+answer UDP. The name stays put when this node is replaced.
+`tsnet.ListenService` advertises the node as a host of `svc:dns` and accepts
+TCP port 53. PROXY protocol v2 is on, so whois still sees the client address.
 
-Add `svc:<name>` (or `service:<name>`) to the listen addresses:
+`svc:<name>@<port>` changes the TCP port. `service:dns` is accepted and
+treated as `svc:dns`. The same token can also be added to `-listen-addrs`.
+A name listed in both places is hosted once.
 
-```bash
-TSDNSPROXY_LISTEN_ADDRS="tailscale,svc:tsdnsproxy" \
-TSDNSPROXY_ADVERTISE_TAGS="tag:tsdnsproxy" \
-tsdnsproxy -authkey tskey-auth-YOUR-KEY
-```
+The node must advertise a tag. For this example that is
+`-advertise-tags tag:tsdnsproxy`. Startup fails if `-service` is set and no
+tag is given.
 
-An optional `@<port>` overrides the advertised TCP port (default `53`):
+Before the process can serve the name, an admin defines the Service and
+approves this tag as a host:
 
-```bash
--listen-addrs "svc:tsdnsproxy@5353"
-```
-
-**Requirements:**
-- The node **must** advertise an ACL tag (`-advertise-tags tag:...`).
-- The Service must be **defined** in the Tailscale admin console with a matching
-  `tcp:<port>` endpoint.
-- The host must be **approved** (manually in the console or via
-  `autoApprovers.services` in the ACL).
-- Consumers need a `grants` rule with `dst: ["svc:tsdnsproxy"]`.
-
-**Limitations:** Tailscale Services are TCP-only, so UDP DNS is not available
-through this path. PROXY protocol v2 is negotiated so the real peer tailnet IP
-is recovered for per-identity whois lookups. See the
-[Tailscale Services docs](https://tailscale.com/kb/1552/tailscale-services) for
-the full registration model.
-
-Example ACL:
+- Service name: `svc:dns`
+- Port on that Service: `tcp:53` (every port defined on the Service has to be advertised by the host)
+- Tag: `tag:tsdnsproxy`, owned in `tagOwners`, and granted to the auth key or OAuth client so the node actually comes up tagged
+- Host approval: `autoApprovers.services` maps `svc:dns` to `tag:tsdnsproxy`, or an admin approves the host in the console
+- Client access: a grant with `dst` `svc:dns` and port `53`
 
 ```json
 {
   "tagOwners": { "tag:tsdnsproxy": ["autogroup:member"] },
   "autoApprovers": {
-    "services": { "svc:tsdnsproxy": ["tag:tsdnsproxy"] }
+    "services": { "svc:dns": ["tag:tsdnsproxy"] }
   },
   "grants": [
     {
       "src": ["autogroup:member"],
-      "dst": ["svc:tsdnsproxy"],
-      "ip":  ["53"]
+      "dst": ["svc:dns"],
+      "ip": ["53"]
     }
   ]
 }
 ```
+
+Clients using the VIP need TCP DNS. In tailscale.com v1.104.1,
+`ListenService` only has TCP and HTTP modes. Both open a local TCP socket,
+and the serve config advertises TCP ports. UDP on a service VIP exists only
+in Tun mode, which this API does not enable.
+
+MagicDNS and split DNS do not always fall back to TCP when the nameserver is that VIP.
+
+- If the operating system applies the split itself, it sends UDP straight to the VIP. That happens when every split domain uses the same IP resolvers and the OS can split. `Manager.compileConfig` then sets `OSConfig.Nameservers` to those IPs and returns. Windows and sandboxed Apple are not on that path. A missing UDP answer is a timeout. The OS retries over TCP only after a truncated UDP response, and this service never sends one.
+- If the query goes through Tailscale's resolver at `100.100.100.100`, `forwarder.send` tries the upstream over UDP and starts TCP when that UDP attempt returns an error, or after 2 seconds if UDP is still waiting (`udpRaceTimeout`). A silent UDP VIP can then succeed over TCP, two seconds slower, unless `TS_DNS_FORWARD_SKIP_TCP_RETRY` or the control knob `DisableDNSForwarderTCPRetries` is set. A UDP answer that does arrive, including a truncated one, is returned as it is when the client asked over UDP.
+
+Point split DNS at the node address when clients only send UDP. Point TCP clients at `dns.example.ts.net`.
+
+### Several replicas, one service
+
+More than one pod can host `svc:dns`. Each one advertises the same service, so clients keep the VIP and `dns.example.ts.net` while a pod is replaced. Each pod still needs its own node identity. Share the service name, and do not share the hostname or the state Secret.
+
+`k8s/service-ha.yaml` is a StatefulSet. `POD_NAME` comes from the downward API (`metadata.name`). Kubernetes replaces `$(POD_NAME)` in later env vars. The process also expands `$POD_NAME`, `${POD_NAME}`, and `$(POD_NAME)` if that text is still present when it starts.
+
+Service mode uses these variables:
+
+```text
+POD_NAME=metadata.name
+TSDNSPROXY_SERVICE=svc:dns
+TSDNSPROXY_ADVERTISE_TAGS=tag:tsdnsproxy
+TSDNSPROXY_LISTEN_ADDRS=tailscale
+TSDNSPROXY_HOSTNAME=$(POD_NAME)
+TSDNSPROXY_STATE=kube:tsdnsproxy-state-$(POD_NAME)
+TS_AUTHKEY=<reusable tagged key>
+```
+
+`TSDNSPROXY_LISTEN_ADDRS=tailscale` keeps UDP 53 on that pod's own Tailscale address. `TSDNSPROXY_SERVICE` is the shared TCP listener. The hostname has to differ per pod, or the nodes collide. The auth key has to be reusable and tagged `tag:tsdnsproxy`, because every replica logs in. A one-time ephemeral key cannot start the second pod.
+
+The policy is the same one in the example above: `tagOwners` owns `tag:tsdnsproxy`, `autoApprovers.services` lets that tag host `svc:dns`, and clients have a grant to `svc:dns` port 53. In the admin console, define the service as name `svc:dns` with endpoint `tcp:53`. Every replica must advertise that port. There is no UDP endpoint on the service.
+
+A StatefulSet pod is named `tsdnsproxy-0`, `tsdnsproxy-1`, and so on. The state Secrets are `tsdnsproxy-state-tsdnsproxy-0` and `tsdnsproxy-state-tsdnsproxy-1`. The Role lists those names for get, update, and patch. Create stays open because the Secret is created on first write. Add a name to the Role when you add a replica.
+
+A Deployment pod name is assigned at schedule time (`tsdnsproxy-xxxxx-yyyyy`), so the Secret name is not known when you write the Role. `resourceNames` cannot list it. Granting get, update, and patch on every Secret in the namespace lets the pods store state, and it also lets them read Secrets that are not theirs. Use the StatefulSet when you want the Role limited to the state Secrets.
 
 ## Domain Matching
 
