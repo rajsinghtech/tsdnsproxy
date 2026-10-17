@@ -16,6 +16,7 @@ func TestIPNamesValidation(t *testing.T) {
 		`{"site-b.example":{"ipnames":{"siteid":2,"a":"always","allowips":["10.0.0.0/8"]}}}`,
 		`{"site-a.example":{"ipnames":{"siteid":3,"a":"direct","directsrc":["192.168.10.0/24"],"allowsrc":["192.0.2.0/24"]}}}`,
 		`{"site-a.example":{"dns":["10.1.0.10:53"],"ipnames":{"siteid":1}}}`,
+		`{"ip":{"ipnames":{"siteid":1,"a":"never","allowips":["10.0.0.0/8"]}}}`,
 	}
 	for _, raw := range valid {
 		cfgs, err := parseOne(t, p, raw)
@@ -28,7 +29,6 @@ func TestIPNamesValidation(t *testing.T) {
 		`{"site-a.example":{"ipnames":{}}}`,
 		`{"site-a.example":{"ipnames":{"siteid":65536}}}`,
 		`{"site-a.example":{"ipnames":{"siteid":-1}}}`,
-		`{"example":{"ipnames":{"siteid":1}}}`,
 		`{".":{"ipnames":{"siteid":1}}}`,
 		`{"site-a.example":{"rewrite":"other.example","ipnames":{"siteid":1}}}`,
 		`{"site-a.example":{"translateid":1,"ipnames":{"siteid":1}}}`,
