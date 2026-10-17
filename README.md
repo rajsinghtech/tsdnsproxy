@@ -161,6 +161,7 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TSDNSPROXY_STATE`: State storage backend. `kube:secret-name` stores state in that Kubernetes Secret. The ServiceAccount needs a Role with get, update, and patch on that named Secret, plus create on Secrets. An `arn:` value selects AWS SSM.
 - `TSDNSPROXY_OVERRIDE_DNS`: Override host DNS servers (comma-separated, defaults to host's resolvers)
 - `TSDNSPROXY_LISTEN_ADDRS`: Listen addresses (default: `tailscale`) - see Network Configuration
+- `TSDNSPROXY_SERVICE`: Tailscale Service to host (`-service`), for example `svc:dns`. This is TCP port 53 unless the value ends in `@port`
 - `TSDNSPROXY_HEALTH_ADDR`: Health check endpoint address (default: `:8080`)
 - `TSDNSPROXY_ACCEPT_ROUTES`: Accept subnet routes and query DNS over tailnet (default: `false`)
 - `TSDNSPROXY_ADVERTISE_TAGS`: ACL tags to advertise (comma-separated, default: none)
@@ -175,7 +176,9 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 tsdnsproxy \
   -authkey tskey-auth-YOUR-KEY \
   -hostname tsdnsproxy \
-  -listen-addrs tailscale,0.0.0.0:53 \
+  -service svc:dns \
+  -advertise-tags tag:tsdnsproxy \
+  -listen-addrs tailscale \
   -statedir /var/lib/tsdnsproxy \
   -state kube:tsdnsproxy-state \
   -override-dns 8.8.8.8:53,8.8.4.4:53 \
@@ -186,58 +189,56 @@ tsdnsproxy \
   -verbose
 ```
 
-### Tailscale Service Hosting
+### Tailscale Service
 
-In addition to binding to a specific address, tsdnsproxy can host DNS as a
-**named Tailscale Service** via `tsnet.ListenService`. This gives the proxy a
-stable MagicDNS name (`<service>.<tailnet>.ts.net`) that survives host
-migrations and can be load-balanced across multiple instances.
+`-service svc:dns` (or `TSDNSPROXY_SERVICE`) hosts DNS as a Tailscale Service.
+Clients reach a stable virtual IP and the MagicDNS name `dns.example.ts.net`
+on a tailnet whose suffix is `example.ts.net`. That name stays put when this
+node is replaced. `tsnet.ListenService` advertises the node as a host of
+`svc:dns` and accepts TCP port 53. PROXY protocol v2 is on, so whois still
+sees the client address.
 
-Add `svc:<name>` (or `service:<name>`) to the listen addresses:
+`svc:<name>@<port>` changes the TCP port. `service:dns` is accepted and
+treated as `svc:dns`. The same token can also be added to `-listen-addrs`.
+A name listed in both places is hosted once.
 
-```bash
-TSDNSPROXY_LISTEN_ADDRS="tailscale,svc:tsdnsproxy" \
-TSDNSPROXY_ADVERTISE_TAGS="tag:tsdnsproxy" \
-tsdnsproxy -authkey tskey-auth-YOUR-KEY
-```
+The node must advertise a tag. For this example that is
+`-advertise-tags tag:tsdnsproxy`. Startup fails if `-service` is set and no
+tag is given.
 
-An optional `@<port>` overrides the advertised TCP port (default `53`):
+Before the process can serve the name, an admin defines the Service and
+approves this tag as a host:
 
-```bash
--listen-addrs "svc:tsdnsproxy@5353"
-```
-
-**Requirements:**
-- The node **must** advertise an ACL tag (`-advertise-tags tag:...`).
-- The Service must be **defined** in the Tailscale admin console with a matching
-  `tcp:<port>` endpoint.
-- The host must be **approved** (manually in the console or via
-  `autoApprovers.services` in the ACL).
-- Consumers need a `grants` rule with `dst: ["svc:tsdnsproxy"]`.
-
-**Limitations:** Tailscale Services are TCP-only, so UDP DNS is not available
-through this path. PROXY protocol v2 is negotiated so the real peer tailnet IP
-is recovered for per-identity whois lookups. See the
-[Tailscale Services docs](https://tailscale.com/kb/1552/tailscale-services) for
-the full registration model.
-
-Example ACL:
+- Service name: `svc:dns`
+- Port on that Service: `tcp:53` (every port defined on the Service has to be advertised by the host)
+- Tag: `tag:tsdnsproxy`, owned in `tagOwners`, and granted to the auth key or OAuth client so the node actually comes up tagged
+- Host approval: `autoApprovers.services` maps `svc:dns` to `tag:tsdnsproxy`, or an admin approves the host in the console
+- Client access: a grant with `dst` `svc:dns` and port `53`
 
 ```json
 {
   "tagOwners": { "tag:tsdnsproxy": ["autogroup:member"] },
   "autoApprovers": {
-    "services": { "svc:tsdnsproxy": ["tag:tsdnsproxy"] }
+    "services": { "svc:dns": ["tag:tsdnsproxy"] }
   },
   "grants": [
     {
       "src": ["autogroup:member"],
-      "dst": ["svc:tsdnsproxy"],
-      "ip":  ["53"]
+      "dst": ["svc:dns"],
+      "ip": ["53"]
     }
   ]
 }
 ```
+
+UDP 53 is not available on the Service. In tailscale.com v1.104.1,
+`ListenService` only has TCP and HTTP modes. Both open a local TCP socket,
+and the serve config advertises TCP ports. UDP on a Service VIP exists only
+in Tun mode, which this API does not enable. Keep `-listen-addrs tailscale`
+so the node still answers UDP 53 on its own address. Point resolvers that
+can use TCP at `dns.example.ts.net`. A resolver that only sends UDP can keep
+using the node address, or a forwarder on the client can accept UDP and
+send TCP to that name.
 
 ## Domain Matching
 

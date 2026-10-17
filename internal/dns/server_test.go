@@ -1418,6 +1418,57 @@ func TestServer_parseListenAddresses(t *testing.T) {
 	}
 }
 
+func TestParseHostedService(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		want    HostedService
+		wantErr string
+	}{
+		{name: "empty", raw: "  ", want: HostedService{}},
+		{name: "svc_dns", raw: "svc:dns", want: HostedService{Name: "svc:dns", Port: 53}},
+		{name: "service_prefix", raw: "service:dns", want: HostedService{Name: "svc:dns", Port: 53}},
+		{name: "custom_port", raw: "svc:dns@5353", want: HostedService{Name: "svc:dns", Port: 5353}},
+		{name: "missing_prefix", raw: "dns", wantErr: "svc:dns"},
+		{name: "empty_name", raw: "svc:", wantErr: "svc:"},
+		{name: "bad_port", raw: "svc:dns@0", wantErr: "invalid port"},
+		{name: "bad_label", raw: "svc:-dns", wantErr: "not a valid DNS label"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseHostedService(tt.raw)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("err = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseHostedService: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("got %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMergeHostedService(t *testing.T) {
+	fromListen := []serviceConfig{{name: "svc:dns", port: 53}}
+	same := mergeHostedService(fromListen, HostedService{Name: "svc:dns", Port: 53})
+	if len(same) != 1 {
+		t.Fatalf("duplicate service was added: %+v", same)
+	}
+	added := mergeHostedService(fromListen, HostedService{Name: "svc:other", Port: 53})
+	if len(added) != 2 || added[1].name != "svc:other" {
+		t.Fatalf("merged = %+v", added)
+	}
+	untouched := mergeHostedService(fromListen, HostedService{})
+	if len(untouched) != 1 {
+		t.Fatalf("empty flag changed services: %+v", untouched)
+	}
+}
+
 func equalStringSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

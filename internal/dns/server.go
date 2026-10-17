@@ -22,6 +22,7 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
 
@@ -55,6 +56,10 @@ type Server struct {
 	// RulesOnly ignores ACL grants and uses the file alone.
 	Rules     *grants.RulesFile
 	RulesOnly bool
+
+	// Service hosts DNS as a Tailscale Service when set, for example "svc:dns".
+	// The listener is TCP. Port 53 is used unless the value ends in @port.
+	Service string
 
 	// Worker pool for handling queries
 	workerPool chan struct{}
@@ -90,8 +95,14 @@ func (s *Server) RunWithAddrs(ctx context.Context, listenAddrsStr string, status
 		s.grantsMu.Unlock()
 	}
 
-	// Parse listen addresses and services
+	// Parse listen addresses and services. -service is merged in here so a
+	// name given on the flag is hosted even when it is absent from listen-addrs.
 	listenAddrs, services := s.parseListenAddresses(listenAddrsStr, status)
+	hosted, err := ParseHostedService(s.Service)
+	if err != nil {
+		return err
+	}
+	services = mergeHostedService(services, hosted)
 
 	// Create error channel for goroutines (2 per regular address + 1 per service)
 	errCh := make(chan error, len(listenAddrs)*2+len(services))
@@ -191,6 +202,53 @@ func (s *Server) parseListenAddresses(listenAddrsStr string, status *ipnstate.St
 
 	s.Logf("parsed listen addresses: %v (services: %v)", addrs, services)
 	return addrs, services
+}
+
+// HostedService is one Tailscale Service listener. Name is "svc:<label>".
+// Port is the TCP port advertised to the tailnet.
+type HostedService struct {
+	Name string
+	Port uint16
+}
+
+// ParseHostedService parses -service / TSDNSPROXY_SERVICE.
+// An empty value means the flag is unset. "service:" is accepted and
+// rewritten to "svc:". A trailing @port overrides TCP port 53.
+func ParseHostedService(raw string) (HostedService, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return HostedService{}, nil
+	}
+	name, ok := parseServiceAddr(raw)
+	if !ok {
+		return HostedService{}, fmt.Errorf("service %q must look like svc:dns", raw)
+	}
+	port := uint16(constants.DNSDefaultPort)
+	if at := strings.LastIndex(name, "@"); at >= 0 {
+		portStr := name[at+1:]
+		name = name[:at]
+		p, err := strconv.Atoi(portStr)
+		if err != nil || p <= 0 || p > 65535 {
+			return HostedService{}, fmt.Errorf("service %q has invalid port %q", raw, portStr)
+		}
+		port = uint16(p)
+	}
+	if err := tailcfg.ServiceName(name).Validate(); err != nil {
+		return HostedService{}, fmt.Errorf("service %q: %w", raw, err)
+	}
+	return HostedService{Name: name, Port: port}, nil
+}
+
+func mergeHostedService(services []serviceConfig, extra HostedService) []serviceConfig {
+	if extra.Name == "" {
+		return services
+	}
+	for _, svc := range services {
+		if svc.name == extra.Name && svc.port == extra.Port {
+			return services
+		}
+	}
+	return append(services, serviceConfig{name: extra.Name, port: extra.Port})
 }
 
 // parseServiceAddr checks whether an address token refers to a Tailscale
