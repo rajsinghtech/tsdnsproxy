@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,12 +14,12 @@ import (
 )
 
 func TestQueryUsesUDPWhenComplete(t *testing.T) {
-	udpN, tcpN := 0, 0
+	var udpN, tcpN atomic.Int32
 	addr := serveDNS(t, func(q []byte) []byte {
-		udpN++
+		udpN.Add(1)
 		return dnsAnswer(q, [4]byte{10, 1, 2, 3})
 	}, func(q []byte) []byte {
-		tcpN++
+		tcpN.Add(1)
 		return dnsAnswer(q, [4]byte{10, 9, 9, 9})
 	})
 	b := NewUDPBackend(addr, HostDialer(), nil)
@@ -27,8 +28,8 @@ func TestQueryUsesUDPWhenComplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tcpN != 0 || udpN == 0 {
-		t.Fatalf("udp calls=%d tcp calls=%d", udpN, tcpN)
+	if tcpN.Load() != 0 || udpN.Load() == 0 {
+		t.Fatalf("udp calls=%d tcp calls=%d", udpN.Load(), tcpN.Load())
 	}
 	if !bytesEqual(dnsA(t, got), [4]byte{10, 1, 2, 3}) {
 		t.Fatalf("answer = %v", dnsA(t, got))
@@ -217,7 +218,7 @@ func serveDNS(t *testing.T, udpFn, tcpFn func([]byte) []byte) string {
 			_ = pc.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 			n, addr, err := pc.ReadFrom(buf)
 			if err != nil {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if isNetTimeout(err) {
 					continue
 				}
 				return
@@ -321,6 +322,11 @@ func dnsA(t *testing.T, raw []byte) [4]byte {
 		t.Fatalf("body %T", msg.Answers[0].Body)
 	}
 	return a.A
+}
+
+func isNetTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func messageHasTC(raw []byte) bool {

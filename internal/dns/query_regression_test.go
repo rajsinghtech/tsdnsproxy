@@ -445,7 +445,7 @@ func mustGrant(t *testing.T, raw string) grants.GrantConfig {
 	return cfg
 }
 
-func packQuestion(t *testing.T, id uint16, name string, qtype dnsmessage.Type) []byte {
+func packQuestion(t testing.TB, id uint16, name string, qtype dnsmessage.Type) []byte {
 	t.Helper()
 	msg := dnsmessage.Message{
 		Header: dnsmessage.Header{ID: id, RecursionDesired: true},

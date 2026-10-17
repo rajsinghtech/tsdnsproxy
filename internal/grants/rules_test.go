@@ -15,6 +15,21 @@ import (
 	"tailscale.com/tailcfg"
 )
 
+func FuzzParseRules(f *testing.F) {
+	f.Add([]byte(`{"example.internal":{"dns":["10.0.0.53:53"],"translateid":1}}`))
+	f.Add([]byte(`{"ip":{"ipnames":{"siteid":1}}}`))
+	f.Add([]byte("{"))
+	f.Add([]byte(""))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				t.Fatalf("panic: %v", rec)
+			}
+		}()
+		_, _ = ParseRules(data)
+	})
+}
+
 func TestParseRulesJSONAndHuJSON(t *testing.T) {
 	jsonBody := `{
 		"Example.Internal.": {

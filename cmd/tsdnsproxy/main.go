@@ -163,9 +163,16 @@ func main() {
 		log.Fatal("advertise-tags is required to host a Tailscale Service (set -advertise-tags or TSDNSPROXY_ADVERTISE_TAGS)")
 	}
 
-	log.Printf("configuration: accept-routes=%v (env=%q), dial=%s, verbose=%v, listen-addrs=%q, service=%q, cap-name=%q, rules-file=%q, rules-only=%v",
-		cfg.AcceptRoutes, os.Getenv("TSDNSPROXY_ACCEPT_ROUTES"), dialMode,
-		verbose, cfg.ListenAddrs, hostedService.Name, grantParser.CapName(), cfg.RulesFile, cfg.RulesOnly)
+	slog.Info("configuration",
+		"accept_routes", cfg.AcceptRoutes,
+		"dial", string(dialMode),
+		"log_level", cfg.LogLevel,
+		"listen", cfg.ListenAddrs,
+		"service", hostedService.Name,
+		"cap_name", grantParser.CapName(),
+		"rules_file", cfg.RulesFile,
+		"rules_only", cfg.RulesOnly,
+	)
 
 	if cfg.AuthKey == "" {
 		log.Fatal("auth key is required (set TS_AUTHKEY or use -auth-key)")

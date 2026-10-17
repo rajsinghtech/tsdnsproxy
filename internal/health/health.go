@@ -116,7 +116,7 @@ func Start(ctx context.Context, addr string, state *State, metrics http.Handler)
 	}()
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		_ = s.http.Shutdown(shutdownCtx)
 	}()

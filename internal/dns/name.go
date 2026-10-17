@@ -15,9 +15,7 @@ func validateQueryName(name dnsmessage.Name) error {
 	if s == "." || s == "" {
 		return nil
 	}
-	if strings.HasSuffix(s, ".") {
-		s = s[:len(s)-1]
-	}
+	s = strings.TrimSuffix(s, ".")
 	if len(s) > 253 {
 		return fmt.Errorf("name is %d bytes", len(s))
 	}

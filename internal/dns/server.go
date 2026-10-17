@@ -344,7 +344,7 @@ func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn) error {
 
 		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			if isTimeout(err) {
 				continue
 			}
 			if ctx.Err() != nil {
@@ -1571,7 +1571,7 @@ func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn, via str
 		// Read DNS message length (2 bytes)
 		var length uint16
 		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-			if err != io.EOF && !isTimeout(err) {
+			if !errors.Is(err, io.EOF) && !isTimeout(err) {
 				s.Logf("failed to read message length from %s: %v", conn.RemoteAddr(), err)
 			}
 			return
@@ -1605,8 +1605,11 @@ type tcpResponseWriter struct {
 }
 
 func (w *tcpResponseWriter) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	// TCP DNS messages are prefixed with a 2-byte length field
-	length := uint16(len(p))
+	if len(p) > 65535 {
+		return 0, fmt.Errorf("tcp response is %d bytes", len(p))
+	}
+	// The length check above keeps this conversion inside uint16.
+	length := uint16(len(p)) //nolint:gosec // bounded by the check above
 	if err := binary.Write(w.conn, binary.BigEndian, length); err != nil {
 		return 0, err
 	}

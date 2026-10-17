@@ -105,7 +105,7 @@ func optFor(query *dnsmessage.Message, limit int) []dnsmessage.Resource {
 		Header: dnsmessage.ResourceHeader{
 			Name:  dnsmessage.MustNewName("."),
 			Type:  dnsmessage.TypeOPT,
-			Class: dnsmessage.Class(limit),
+			Class: dnsmessage.Class(uint16(limit)), //nolint:gosec // limit is capped at the UDP maximum
 		},
 		Body: &dnsmessage.OPTResource{},
 	}}

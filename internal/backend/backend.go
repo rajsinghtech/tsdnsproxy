@@ -357,13 +357,14 @@ func (b *UDPBackend) queryTCP(ctx context.Context, d DNSDialer, query []byte) ([
 	defer func() {
 		_ = conn.Close()
 	}()
-	if err := applyDeadline(conn, ctx); err != nil {
+	if err := applyDeadline(ctx, conn); err != nil {
 		return nil, err
 	}
 
 	tcpQuery := make([]byte, 2+len(query))
-	tcpQuery[0] = byte(len(query) >> 8)
-	tcpQuery[1] = byte(len(query))
+	// len(query) is capped at 65535 above, so it fits in two bytes.
+	tcpQuery[0] = byte(uint16(len(query)) >> 8) //nolint:gosec // bounded above
+	tcpQuery[1] = byte(uint16(len(query)))      //nolint:gosec // bounded above
 	copy(tcpQuery[2:], query)
 	if _, err := conn.Write(tcpQuery); err != nil {
 		return nil, fmt.Errorf("write query: %w", err)
@@ -397,7 +398,7 @@ func (b *UDPBackend) queryUDP(ctx context.Context, d DNSDialer, query []byte) ([
 	defer func() {
 		_ = conn.Close()
 	}()
-	if err := applyDeadline(conn, ctx); err != nil {
+	if err := applyDeadline(ctx, conn); err != nil {
 		return nil, err
 	}
 	if _, err := conn.Write(query); err != nil {
@@ -464,7 +465,7 @@ func dialContext(ctx context.Context, d DNSDialer, network, address string) (net
 	}
 }
 
-func applyDeadline(conn net.Conn, ctx context.Context) error {
+func applyDeadline(ctx context.Context, conn net.Conn) error {
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		return nil
