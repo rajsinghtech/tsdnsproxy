@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"runtime/debug"
@@ -19,6 +20,8 @@ import (
 	"github.com/rajsinghtech/tsdnsproxy/internal/cache"
 	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
+	"github.com/rajsinghtech/tsdnsproxy/internal/health"
+	"github.com/rajsinghtech/tsdnsproxy/internal/metrics"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
@@ -51,6 +54,12 @@ type Server struct {
 	GrantParser *grants.Parser
 	BackendMgr  BackendManager
 	Logf        func(format string, args ...any)
+	Logger      *slog.Logger
+
+	// Metrics receives query, latency, and translation counts. It may be nil.
+	Metrics *metrics.Metrics
+	// Ready tracks bound listeners for /ready.
+	Ready *health.State
 
 	// Rules, when loaded, apply to every client.
 	// RulesOnly ignores ACL grants and uses the file alone.
@@ -311,6 +320,8 @@ func (s *Server) runUDP(ctx context.Context, listenAddr string) error {
 	}()
 
 	s.Logf("listening on %s (UDP)", listenAddr)
+	s.trackListener()
+	defer s.untrackListener()
 	return s.serveUDP(ctx, pc)
 }
 
@@ -352,25 +363,21 @@ func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn) error {
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
 
-		// Try to acquire a worker slot
-		select {
-		case s.workerPool <- struct{}{}:
-			// Got a worker slot, handle query
-			s.handlerWg.Add(1)
-			go func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						s.Logf("panic in udp listener: %v\n%s", rec, debug.Stack())
-					}
-					<-s.workerPool // Release worker slot
-					s.handlerWg.Done()
-				}()
-				s.handleQuery(ctx, pc, addr, packet, "udp")
-			}()
-		default:
-			// Worker pool is full, drop the query
+		if !s.acquire() {
 			s.Logf("dropping UDP query from %s: worker pool full", addr)
+			continue
 		}
+		s.handlerWg.Add(1)
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					s.Logf("panic in udp listener: %v\n%s", rec, debug.Stack())
+				}
+				s.release()
+				s.handlerWg.Done()
+			}()
+			s.handleQuery(ctx, pc, addr, packet, "udp")
+		}()
 	}
 }
 
@@ -414,6 +421,8 @@ func (s *Server) runTCP(ctx context.Context, listenAddr string) error {
 	}()
 
 	s.Logf("listening on %s (TCP)", listenAddr)
+	s.trackListener()
+	defer s.untrackListener()
 	return s.serveTCP(ctx, listener)
 }
 
@@ -439,25 +448,24 @@ func (s *Server) serveAccept(ctx context.Context, label, via string, listener ne
 			continue
 		}
 
-		select {
-		case s.workerPool <- struct{}{}:
-			s.handlerWg.Add(1)
-			go func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						s.Logf("panic in %s listener: %v\n%s", label, rec, debug.Stack())
-					}
-					<-s.workerPool
-					s.handlerWg.Done()
-				}()
-				s.handleTCPConnection(ctx, conn, via)
-			}()
-		default:
+		if !s.acquire() {
 			s.Logf("dropping %s connection from %s: worker pool full", label, conn.RemoteAddr())
 			if err := conn.Close(); err != nil {
 				s.Logf("failed to close connection: %v", err)
 			}
+			continue
 		}
+		s.handlerWg.Add(1)
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					s.Logf("panic in %s listener: %v\n%s", label, rec, debug.Stack())
+				}
+				s.release()
+				s.handlerWg.Done()
+			}()
+			s.handleTCPConnection(ctx, conn, via)
+		}()
 	}
 }
 
@@ -484,6 +492,8 @@ func (s *Server) runService(ctx context.Context, svc serviceConfig) error {
 
 	s.Logf("listening on service %s (TCP port %d, FQDN: %s)", svc.name, svc.port, ln.FQDN)
 	s.Logf("note: UDP DNS is not available via Tailscale Service %s (TCP-only by design)", svc.name)
+	s.trackListener()
+	defer s.untrackListener()
 
 	// Wrap the listener to parse PROXY protocol headers and recover the
 	// real peer tailnet IP for whois-based identity routing.
@@ -531,6 +541,34 @@ func (s *Server) tcpLifetime() time.Duration {
 	return timeout
 }
 
+func (s *Server) trackListener() {
+	if s.Ready != nil {
+		s.Ready.AddListener()
+	}
+}
+
+func (s *Server) untrackListener() {
+	if s.Ready != nil {
+		s.Ready.RemoveListener()
+	}
+}
+
+func (s *Server) acquire() bool {
+	select {
+	case s.workerPool <- struct{}{}:
+		s.Metrics.Inflight(1)
+		return true
+	default:
+		s.Metrics.Dropped()
+		return false
+	}
+}
+
+func (s *Server) release() {
+	<-s.workerPool
+	s.Metrics.Inflight(-1)
+}
+
 func (s *Server) queryTimeout() time.Duration {
 	if s != nil && s.QueryTimeout > 0 {
 		return s.QueryTimeout
@@ -539,6 +577,17 @@ func (s *Server) queryTimeout() time.Duration {
 }
 
 func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Addr, packet []byte, via string) {
+	start := time.Now()
+	var qname, qtype, rcode string
+	var qerr error
+	defer func() {
+		remote := ""
+		if addr != nil {
+			remote = addr.String()
+		}
+		s.recordQuery(via, remote, qname, qtype, rcode, time.Since(start), qerr)
+	}()
+
 	// Create request-scoped context with timeout
 	queryCtx, cancel := context.WithTimeout(ctx, s.queryTimeout())
 	defer cancel()
@@ -554,6 +603,10 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 			return
 		}
 		s.Logf("panic handling %s query from %v: %v\n%s", via, addr, rec, debug.Stack())
+		if rcode == "" {
+			rcode = "SERVFAIL"
+		}
+		qerr = fmt.Errorf("panic: %v", rec)
 		if responded || pc == nil || addr == nil || len(msg.Questions) == 0 {
 			return
 		}
@@ -561,6 +614,8 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 	}()
 
 	if err := msg.Unpack(packet); err != nil {
+		rcode = "PARSE"
+		qerr = err
 		s.Logf("[v] failed to parse DNS message from %s: %v", addr, err)
 		return
 	}
@@ -570,15 +625,22 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 		return
 	}
 	if len(msg.Questions) != 1 {
+		rcode = "FORMERR"
 		s.sendError(pc, addr, &msg, dnsmessage.RCodeFormatError)
 		return
 	}
+	qname = msg.Questions[0].Name.String()
+	qtype = msg.Questions[0].Type.String()
 	if err := validateQueryName(msg.Questions[0].Name); err != nil {
+		rcode = "FORMERR"
+		qerr = err
 		s.Logf("[v] rejected name from %s: %v", addr, err)
 		s.sendError(pc, addr, &msg, dnsmessage.RCodeFormatError)
 		return
 	}
 	if !s.limiter.allow(addr.String()) {
+		rcode = "REFUSED"
+		s.Metrics.Refused()
 		s.Logf("refusing %s: rate limit", addr)
 		s.sendError(pc, addr, &msg, dnsmessage.RCodeRefused)
 		return
@@ -591,12 +653,16 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 
 	grants, err := s.getGrantsForSource(queryCtx, addr.String())
 	if err != nil {
+		rcode = "SERVFAIL"
+		qerr = err
 		s.Logf("failed to get grants for %s: %v", addr, err)
 		s.sendError(pc, addr, &msg, dnsmessage.RCodeServerFailure)
 		return
 	}
 	response, err := s.processQuery(queryCtx, &msg, grants, sourceAddr(addr))
 	if err != nil {
+		rcode = "SERVFAIL"
+		qerr = err
 		if queryCtx.Err() != nil {
 			s.Logf("query timeout from %s: %v", addr, queryCtx.Err())
 		} else {
@@ -616,11 +682,62 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 		response = fitted
 	}
 
+	rcode = rcodeOf(response)
 	// Send response
 	if _, err := pc.WriteTo(response, addr); err != nil {
+		qerr = err
 		s.Logf("failed to send response to %s: %v", addr, err)
 	} else {
 		responded = true
+	}
+}
+
+func (s *Server) recordQuery(proto, remote, name, qtype, rcode string, d time.Duration, err error) {
+	if rcode == "" {
+		rcode = "NONE"
+	}
+	s.Metrics.Query(proto, qtype, rcode, d)
+	logger := s.Logger
+	if logger == nil {
+		return
+	}
+	level := slog.LevelDebug
+	if err != nil || rcode == "SERVFAIL" || rcode == "REFUSED" {
+		level = slog.LevelWarn
+	}
+	attrs := []any{
+		slog.String("proto", proto),
+		slog.String("remote", remote),
+		slog.String("name", name),
+		slog.String("type", qtype),
+		slog.String("rcode", rcode),
+		slog.Duration("duration", d),
+	}
+	if err != nil {
+		attrs = append(attrs, slog.String("err", err.Error()))
+	}
+	logger.Log(context.Background(), level, "query", attrs...)
+}
+
+func rcodeOf(raw []byte) string {
+	if len(raw) < 4 {
+		return "UNKNOWN"
+	}
+	switch raw[3] & 0x0f {
+	case 0:
+		return "NOERROR"
+	case 1:
+		return "FORMERR"
+	case 2:
+		return "SERVFAIL"
+	case 3:
+		return "NXDOMAIN"
+	case 4:
+		return "NOTIMP"
+	case 5:
+		return "REFUSED"
+	default:
+		return fmt.Sprintf("RCODE%d", raw[3]&0x0f)
 	}
 }
 
@@ -1051,6 +1168,7 @@ func (s *Server) mapVia6(ipv4 netip.Addr, siteID uint32) (netip.Addr, error) {
 		return netip.Addr{}, err
 	}
 	s.Logf("[v] mapped %s site %d -> %s", ipv4, siteID, via)
+	s.Metrics.Translation()
 	return via, nil
 }
 

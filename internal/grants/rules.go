@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"sort"
 	"strings"
@@ -156,14 +156,14 @@ func (r *RulesFile) Watch(ctx context.Context, interval time.Duration) {
 			if err != nil {
 				msg := err.Error()
 				if msg != lastErr {
-					log.Printf("rules reload failed: %v", err)
+					slog.Error("rules reload failed", "err", err.Error())
 					lastErr = msg
 				}
 				continue
 			}
 			lastErr = ""
 			if changed {
-				log.Printf("reloaded rules from %s", r.path)
+				slog.Info("reloaded rules", "path", r.path)
 			}
 		}
 	}

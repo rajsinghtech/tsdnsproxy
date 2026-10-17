@@ -82,6 +82,7 @@ func (s *Server) handleIPNames(query *dnsmessage.Message, zone string, grant *gr
 			if verr != nil {
 				return nil, verr
 			}
+			s.Metrics.Translation()
 			return ipNamesStatus(query, dnsmessage.RCodeSuccess, []dnsmessage.Resource{{
 				Header: dnsmessage.ResourceHeader{
 					Name: question.Name, Type: dnsmessage.TypeAAAA, Class: question.Class, TTL: cfg.AnswerTTL(),

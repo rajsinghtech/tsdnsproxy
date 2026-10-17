@@ -51,6 +51,12 @@ type Manager struct {
 	tailnetRoutes   DNSDialer
 	defaultMode     DialMode
 	logf            func(format string, args ...any)
+	recorder        Recorder
+}
+
+// Recorder receives upstream failure counts. It may be nil.
+type Recorder interface {
+	UpstreamError(upstream string)
 }
 
 // NewManager creates a new backend manager.
@@ -114,6 +120,9 @@ func (m *Manager) Query(ctx context.Context, backends []Backend, query []byte) (
 
 		m.logf("[v] backend %s failed: %v", backend.String(), err)
 		lastErr = err
+		if m.recorder != nil {
+			m.recorder.UpstreamError(backend.String())
+		}
 		m.markUnhealthy(backend.String())
 	}
 
@@ -232,6 +241,13 @@ func (m *Manager) cleanupUnhealthy() {
 		case <-m.done:
 			return
 		}
+	}
+}
+
+// SetRecorder installs an optional upstream error recorder.
+func (m *Manager) SetRecorder(r Recorder) {
+	if m != nil {
+		m.recorder = r
 	}
 }
 

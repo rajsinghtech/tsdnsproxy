@@ -3,11 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -22,6 +21,9 @@ import (
 	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
 	"github.com/rajsinghtech/tsdnsproxy/internal/dns"
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
+	"github.com/rajsinghtech/tsdnsproxy/internal/health"
+	"github.com/rajsinghtech/tsdnsproxy/internal/logging"
+	"github.com/rajsinghtech/tsdnsproxy/internal/metrics"
 	"tailscale.com/client/local"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -126,15 +128,22 @@ func retry(ctx context.Context, maxRetries int, delay time.Duration, backoffFunc
 }
 
 func main() {
-	log.SetPrefix("tsdnsproxy: ")
 	hostinfo.SetApp("tsdnsproxy")
-	log.Printf("version %s", version)
 
 	cfg, err := config.Parse(os.Args[1:], os.Getenv)
 	if err != nil {
 		log.Fatal(err)
 	}
-	verbose := strings.EqualFold(cfg.LogLevel, "debug")
+	logLevel, err := config.ParseLogLevel(cfg.LogLevel)
+	if err != nil {
+		log.Fatal(err)
+	}
+	slog.SetDefault(slog.New(logging.NewHandler(os.Stderr, logLevel)))
+	log.SetFlags(0)
+	log.SetPrefix("")
+	log.SetOutput(logging.Writer(slog.LevelInfo))
+	verbose := logLevel <= slog.LevelDebug
+	slog.Info("starting", "version", version, "log_level", cfg.LogLevel)
 
 	grantParser, err := grants.NewParserWithName(cfg.CapName)
 	if err != nil {
@@ -177,6 +186,9 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ready := &health.State{}
+	proxyMetrics := metrics.New()
+	httpServer := health.Start(ctx, cfg.HTTPAddr, ready, proxyMetrics.Handler())
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -200,7 +212,8 @@ func main() {
 				log.Print("SIGHUP: rules file unchanged")
 				continue
 			}
-			log.Println("shutting down...")
+			slog.Info("shutting down", "signal", sig.String())
+			ready.ShuttingDown()
 			cancel()
 			return
 		}
@@ -363,6 +376,9 @@ func main() {
 		GrantParser:  grantParser,
 		BackendMgr:   backendMgr,
 		Logf:         logf(verbose),
+		Logger:       slog.Default(),
+		Metrics:      proxyMetrics,
+		Ready:        ready,
 		Rules:        rules,
 		RulesOnly:    cfg.RulesOnly,
 		Service:      cfg.Service,
@@ -373,19 +389,29 @@ func main() {
 		RatePerSec:   cfg.RateLimit,
 		RateBurst:    cfg.RateBurst,
 	}
+	backendMgr.SetRecorder(proxyMetrics)
+	ready.Tailnet = func(ctx context.Context) (bool, string) {
+		client, err := s.LocalClient()
+		if err != nil {
+			return false, s.Hostname
+		}
+		st, err := client.Status(ctx)
+		if err != nil || st == nil || st.BackendState != "Running" {
+			return false, s.Hostname
+		}
+		return true, s.Hostname
+	}
 
-	healthServer := startHealthServer(ctx, cfg.HTTPAddr, s)
-
-	// Start DNS server (handles both UDP and TCP)
-	log.Printf("starting DNS server: %v", cfg.ListenAddrs)
-	if err := dnsServer.RunWithAddrs(ctx, cfg.ListenAddrs, status); err != nil {
-		log.Printf("DNS server error: %v", err)
+	slog.Info("starting DNS server", "listen", cfg.ListenAddrs, "service", cfg.Service)
+	if err := dnsServer.RunWithAddrs(ctx, cfg.ListenAddrs, status); err != nil && ctx.Err() == nil {
+		ready.Fail()
+		slog.Error("DNS server stopped", "err", err.Error())
 	}
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), constants.HealthShutdownTimeout)
 	defer cancel2()
-	if err := healthServer.Shutdown(ctx2); err != nil {
-		log.Printf("health shutdown: %v", err)
+	if err := httpServer.Shutdown(ctx2); err != nil {
+		slog.Error("http shutdown", "err", err.Error())
 	}
 }
 
@@ -520,108 +546,15 @@ func hasAdvertiseTag(raw string) bool {
 	return false
 }
 
-func logf(verbose bool) func(format string, args ...any) {
+func logf(debug bool) func(format string, args ...any) {
 	return func(format string, args ...any) {
-		if verbose || !strings.Contains(format, "[v]") {
-			log.Printf(format, args...)
-		}
-	}
-}
-
-type healthServer struct {
-	ts     *tsnet.Server
-	server *http.Server
-}
-
-func startHealthServer(ctx context.Context, addr string, ts *tsnet.Server) *healthServer {
-	h := &healthServer{ts: ts}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", h.handleHealth)
-	mux.HandleFunc("/ready", h.handleReady)
-
-	h.server = &http.Server{
-		Addr:    addr,
-		Handler: mux,
-	}
-
-	go func() {
-		if err := h.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("health server error: %v", err)
-		}
-	}()
-
-	go func() {
-		<-ctx.Done()
-		if err := h.server.Close(); err != nil {
-			log.Printf("health server close error: %v", err)
-		}
-	}()
-
-	return h
-}
-
-func (h *healthServer) Shutdown(ctx context.Context) error {
-	if h.server != nil {
-		return h.server.Shutdown(ctx)
-	}
-	return nil
-}
-
-func (h *healthServer) handleHealth(w http.ResponseWriter, r *http.Request) {
-	status := struct {
-		Status    string    `json:"status"`
-		Timestamp time.Time `json:"timestamp"`
-		Tailscale struct {
-			Connected bool   `json:"connected"`
-			Hostname  string `json:"hostname"`
-		} `json:"tailscale"`
-	}{
-		Status:    "ok",
-		Timestamp: time.Now().UTC(),
-	}
-
-	if h.ts != nil {
-		lc, err := h.ts.LocalClient()
-		if err == nil {
-			st, err := lc.Status(r.Context())
-			if err == nil && st.BackendState == "Running" {
-				status.Tailscale.Connected = true
-				status.Tailscale.Hostname = h.ts.Hostname
+		msg := fmt.Sprintf(format, args...)
+		if strings.Contains(format, "[v]") || strings.Contains(format, "[DEBUG]") {
+			if debug {
+				slog.Debug(msg)
 			}
+			return
 		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(status); err != nil {
-		log.Printf("health status encoding error: %v", err)
-	}
-}
-
-func (h *healthServer) handleReady(w http.ResponseWriter, r *http.Request) {
-	ready := true
-
-	if h.ts != nil {
-		lc, err := h.ts.LocalClient()
-		if err != nil {
-			ready = false
-		} else {
-			st, err := lc.Status(r.Context())
-			if err != nil || st.BackendState != "Running" {
-				ready = false
-			}
-		}
-	}
-
-	if ready {
-		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte("ready\n")); err != nil {
-			log.Printf("write error: %v", err)
-		}
-	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		if _, err := w.Write([]byte("not ready\n")); err != nil {
-			log.Printf("write error: %v", err)
-		}
+		slog.Info(msg)
 	}
 }

@@ -2,7 +2,7 @@ package grants
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/netip"
 	"sort"
 	"strings"
@@ -233,7 +233,7 @@ func resolveIPNamesConflicts(configs []GrantConfig) []GrantConfig {
 			}
 		}
 		if !same {
-			log.Printf("warning: dropping ipnames zone %s: conflicting settings", zone)
+			slog.Warn("dropping ipnames zone with conflicting settings", "zone", zone)
 			drop[zone] = true
 			continue
 		}
@@ -252,7 +252,7 @@ func resolveIPNamesConflicts(configs []GrantConfig) []GrantConfig {
 	for i := 0; i < len(zones); i++ {
 		for j := i + 1; j < len(zones); j++ {
 			if ipNamesNested(zones[i], zones[j]) {
-				log.Printf("warning: dropping nested ipnames zones %s and %s", zones[i], zones[j])
+				slog.Warn("dropping nested ipnames zones", "a", zones[i], "b", zones[j])
 				drop[zones[i]] = true
 				drop[zones[j]] = true
 			}
