@@ -36,11 +36,22 @@ rules:
   - tsdnsproxy-state-tsdnsproxy-1
   verbs: ["get", "update", "patch"]
 - apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["create"]
-- apiGroups: [""]
   resources: ["events"]
   verbs: ["create"]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tsdnsproxy-state-tsdnsproxy-0
+  namespace: tsdnsproxy
+type: Opaque
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tsdnsproxy-state-tsdnsproxy-1
+  namespace: tsdnsproxy
+type: Opaque
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -89,10 +100,18 @@ spec:
         app: tsdnsproxy
     spec:
       serviceAccountName: tsdnsproxy
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: tsdnsproxy
         image: ghcr.io/rajsinghtech/tsdnsproxy:1.1.5
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 53
           protocol: UDP
@@ -118,8 +137,14 @@ spec:
           value: $(POD_NAME)
         - name: TSDNSPROXY_STATE
           value: kube:tsdnsproxy-state-$(POD_NAME)
-        - name: TSDNSPROXY_VERBOSE
-          value: "true"
+        - name: TSDNSPROXY_LOG_LEVEL
+          value: info
+        - name: TSDNSPROXY_HTTP_ADDR
+          value: ":8080"
+        - name: TSDNSPROXY_STATE_DIR
+          value: /tmp/tsdnsproxy
+        - name: TSDNSPROXY_CAP_NAME
+          value: example.com/cap/dns
         - name: TS_AUTHKEY
           valueFrom:
             secretKeyRef:
@@ -145,12 +170,16 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 5
         securityContext:
-          runAsNonRoot: true
-          runAsUser: 1000
-          runAsGroup: 1000
           allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}

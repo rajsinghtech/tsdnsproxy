@@ -17,11 +17,3 @@ secretGenerator:
   - TS_AUTHKEY_EPHEMERAL=tskey-auth-REPLACE-ME
   options:
     disableNameSuffixHash: true
-
-configMapGenerator:
-- name: tsdnsproxy-config
-  namespace: tsdnsproxy
-  literals:
-  - TSDNSPROXY_VERBOSE=true
-  options:
-    disableNameSuffixHash: true

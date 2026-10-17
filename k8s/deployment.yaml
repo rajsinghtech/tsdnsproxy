@@ -20,13 +20,16 @@ rules:
   resources: ["secrets"]
   resourceNames: ["tsdnsproxy-state"]
   verbs: ["get", "update", "patch"]
-# create is not limited to a name; the store creates the Secret when it is missing.
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["create"]
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["create"]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tsdnsproxy-state
+  namespace: tsdnsproxy
+type: Opaque
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -77,10 +80,18 @@ spec:
         app: tsdnsproxy
     spec:
       serviceAccountName: tsdnsproxy
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: tsdnsproxy
         image: ghcr.io/rajsinghtech/tsdnsproxy:1.1.5
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 53
           protocol: UDP
@@ -100,16 +111,21 @@ spec:
           value: "kube:tsdnsproxy-state"
         - name: TSDNSPROXY_HOSTNAME
           value: "$(POD_NAME)"
-        - name: TSDNSPROXY_VERBOSE
-          value: "true"
+        - name: TSDNSPROXY_LOG_LEVEL
+          value: info
+        - name: TSDNSPROXY_HTTP_ADDR
+          value: ":8080"
+        - name: TSDNSPROXY_STATE_DIR
+          value: /tmp/tsdnsproxy
         - name: TSDNSPROXY_LISTEN_ADDRS
-          value: "tailscale,svc:tsdnsproxy"
+          value: tailscale
+        - name: TSDNSPROXY_SERVICE
+          value: svc:dns
         - name: TSDNSPROXY_ADVERTISE_TAGS
-          value: "tag:k8s"
-        # Capability name (-cap-name). Use a domain and path such as example.com/cap/dns
-        # when the ACL grant key is not the default.
+          value: tag:tsdnsproxy
+        # Set this to the capability name in your ACL grants.
         - name: TSDNSPROXY_CAP_NAME
-          value: "rajsingh.info/cap/tsdnsproxy"
+          value: example.com/cap/dns
         - name: TSDNSPROXY_RULES_FILE
           value: /etc/tsdnsproxy/rules.json
         - name: TS_AUTHKEY
@@ -137,11 +153,8 @@ spec:
           initialDelaySeconds: 5
           periodSeconds: 5
         securityContext:
-          runAsNonRoot: true
-          runAsUser: 1000
-          runAsGroup: 1000
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           capabilities:
             drop:
             - ALL
@@ -151,7 +164,11 @@ spec:
         - name: rules
           mountPath: /etc/tsdnsproxy
           readOnly: true
+        - name: tmp
+          mountPath: /tmp
       volumes:
       - name: rules
         configMap:
           name: tsdnsproxy-rules
+      - name: tmp
+        emptyDir: {}
