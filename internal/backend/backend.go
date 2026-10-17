@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -42,32 +43,46 @@ type Manager struct {
 	mu              sync.RWMutex
 	unhealthy       map[string]*backendHealth
 	done            chan struct{}
-	dnsDialer       DNSDialer
+	direct          DNSDialer
+	tailnet         DNSDialer
+	tailnetRoutes   DNSDialer
+	defaultMode     DialMode
 	logf            func(format string, args ...any)
 }
 
-// NewManager creates a new backend manager
-func NewManager(defaultServers []string, dnsDialer DNSDialer, logf func(format string, args ...any)) *Manager {
+// NewManager creates a new backend manager.
+// A bare address in defaultServers uses dialers.Default. An invalid address is an error.
+func NewManager(defaultServers []string, dialers Dialers, logf func(format string, args ...any)) (*Manager, error) {
 	if logf == nil {
 		logf = func(format string, args ...any) {}
 	}
-	m := &Manager{
-		unhealthy: make(map[string]*backendHealth),
-		done:      make(chan struct{}),
-		dnsDialer: dnsDialer,
-		logf:      logf,
+	if dialers.Default == "" {
+		dialers.Default = DialDirect
 	}
-
+	m := &Manager{
+		unhealthy:     make(map[string]*backendHealth),
+		done:          make(chan struct{}),
+		direct:        dialers.Direct,
+		tailnet:       dialers.Tailnet,
+		tailnetRoutes: dialers.TailnetRoutes,
+		defaultMode:   dialers.Default,
+		logf:          logf,
+	}
 	for _, server := range defaultServers {
-		if server != "" {
-			m.defaultBackends = append(m.defaultBackends, NewUDPBackend(server, dnsDialer, logf))
+		if strings.TrimSpace(server) == "" {
+			continue
 		}
+		backend, err := m.newBackend(server)
+		if err != nil {
+			return nil, err
+		}
+		m.defaultBackends = append(m.defaultBackends, backend)
 	}
 
 	// Start cleanup goroutine for unhealthy backends
 	go m.cleanupUnhealthy()
 
-	return m
+	return m, nil
 }
 
 // Query attempts to query backends in order until one succeeds
@@ -85,7 +100,7 @@ func (m *Manager) Query(ctx context.Context, backends []Backend, query []byte) (
 			continue
 		}
 
-		m.logf("[v] trying backend: %s (dialer=%T)", backend.String(), m.dnsDialer)
+		m.logf("[v] trying backend: %s", backend.String())
 		resp, err := backend.Query(ctx, query)
 		if err == nil {
 			// Mark backend as healthy on success
@@ -105,15 +120,47 @@ func (m *Manager) Query(ctx context.Context, backends []Backend, query []byte) (
 	return nil, fmt.Errorf("no backends available")
 }
 
-// CreateBackends creates backend instances from server addresses
-func (m *Manager) CreateBackends(servers []string) []Backend {
+// CreateBackends creates backend instances from server addresses.
+// An empty entry is skipped. A bad address returns an error.
+func (m *Manager) CreateBackends(servers []string) ([]Backend, error) {
 	var backends []Backend
 	for _, server := range servers {
-		if server != "" {
-			backends = append(backends, NewUDPBackend(server, m.dnsDialer, m.logf))
+		if strings.TrimSpace(server) == "" {
+			continue
 		}
+		backend, err := m.newBackend(server)
+		if err != nil {
+			return nil, err
+		}
+		backends = append(backends, backend)
 	}
-	return backends
+	return backends, nil
+}
+
+func (m *Manager) newBackend(raw string) (Backend, error) {
+	ep, err := ParseEndpoint(raw, m.defaultMode)
+	if err != nil {
+		return nil, err
+	}
+	var dialer DNSDialer
+	if ep.Mode == DialTailnet {
+		dialer = m.tailnet
+		// Only an explicit tailnet:// address accepts subnet routes.
+		// A bare address keeps the default tailnet dial without that.
+		if ep.Explicit && m.tailnetRoutes != nil {
+			dialer = m.tailnetRoutes
+		}
+		if dialer == nil {
+			return nil, fmt.Errorf("tailnet dialer is not configured")
+		}
+	} else {
+		dialer = m.direct
+	}
+	backend := NewUDPBackend(ep.Addr, dialer, m.logf)
+	if ep.Explicit && ep.Mode == DialTailnet {
+		backend.label = "tailnet://" + ep.Addr
+	}
+	return backend, nil
 }
 
 func (m *Manager) isUnhealthy(backend string) bool {
@@ -188,6 +235,7 @@ func (m *Manager) Close() {
 // UDPBackend implements a DNS backend that tries TCP first, then UDP
 type UDPBackend struct {
 	server    string
+	label     string
 	timeout   time.Duration
 	dnsDialer DNSDialer
 	logf      func(format string, args ...any)
@@ -206,6 +254,7 @@ func NewUDPBackend(server string, dnsDialer DNSDialer, logf func(format string, 
 
 	return &UDPBackend{
 		server:    server,
+		label:     server,
 		timeout:   10 * time.Second,
 		dnsDialer: dnsDialer,
 		logf:      logf,
@@ -319,5 +368,8 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 }
 
 func (b *UDPBackend) String() string {
+	if b.label != "" {
+		return b.label
+	}
 	return b.server
 }

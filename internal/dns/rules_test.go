@@ -204,11 +204,11 @@ func (m *captureBackend) Query(ctx context.Context, backends []backend.Backend, 
 	return backends[0].Query(ctx, query)
 }
 
-func (m *captureBackend) CreateBackends(servers []string) []backend.Backend {
+func (m *captureBackend) CreateBackends(servers []string) ([]backend.Backend, error) {
 	m.mu.Lock()
 	m.servers = append(m.servers, servers...)
 	m.mu.Unlock()
-	return []backend.Backend{m.inner}
+	return []backend.Backend{m.inner}, nil
 }
 
 func (m *captureBackend) addrs() []string {

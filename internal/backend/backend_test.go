@@ -331,11 +331,14 @@ func TestUDPBackend(t *testing.T) {
 }
 
 func TestCreateBackends(t *testing.T) {
-	m := NewManager(nil, nil, nil)
+	m := newTestManager(t, nil)
 	defer m.Close()
 
 	servers := []string{"8.8.8.8", "1.1.1.1:53", "", "8.8.4.4"}
-	backends := m.CreateBackends(servers)
+	backends, err := m.CreateBackends(servers)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Empty strings should be filtered out
 	if len(backends) != 3 {
@@ -352,7 +355,7 @@ func TestCreateBackends(t *testing.T) {
 
 func TestManagerWithDefaults(t *testing.T) {
 	defaultServers := []string{"8.8.8.8", "1.1.1.1"}
-	m := NewManager(defaultServers, nil, nil)
+	m := newTestManager(t, defaultServers)
 	defer m.Close()
 
 	if len(m.defaultBackends) != 2 {
@@ -368,6 +371,15 @@ func TestManagerWithDefaults(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error when querying real DNS servers in test")
 	}
+}
+
+func newTestManager(t *testing.T, servers []string) *Manager {
+	t.Helper()
+	m, err := NewManager(servers, Dialers{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
 }
 
 func TestBackendFailoverWithUnhealthy(t *testing.T) {

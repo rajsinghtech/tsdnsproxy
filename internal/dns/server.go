@@ -39,7 +39,7 @@ type LocalClient interface {
 
 type BackendManager interface {
 	Query(ctx context.Context, backends []backend.Backend, query []byte) ([]byte, error)
-	CreateBackends(servers []string) []backend.Backend
+	CreateBackends(servers []string) ([]backend.Backend, error)
 }
 
 // Server implements the DNS proxy server
@@ -787,7 +787,10 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 	}
 
 	// Forward to configured backends
-	backends := s.BackendMgr.CreateBackends(grant.DNS)
+	backends, err := s.BackendMgr.CreateBackends(grant.DNS)
+	if err != nil {
+		return nil, err
+	}
 	s.Logf("[v] forwarding %s to backends: %v (rewrite=%q)", queryName, grant.DNS, grant.Rewrite)
 	response, err := s.forwardQuery(ctx, rewrittenQuery, backends, &grant, originalName, grantConfigs)
 	if err != nil {
@@ -1093,7 +1096,10 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 	}
 
 	// Try each DNS server until we get a response
-	backends := s.BackendMgr.CreateBackends(dnsServers)
+	backends, err := s.BackendMgr.CreateBackends(dnsServers)
+	if err != nil {
+		return netip.Addr{}, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -1166,7 +1172,10 @@ func (s *Server) resolveToIPv6(domain string, dnsServers []string) (netip.Addr, 
 	}
 
 	// Try each DNS server until we get a response
-	backends := s.BackendMgr.CreateBackends(dnsServers)
+	backends, err := s.BackendMgr.CreateBackends(dnsServers)
+	if err != nil {
+		return netip.Addr{}, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
