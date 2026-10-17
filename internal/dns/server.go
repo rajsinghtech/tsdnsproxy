@@ -561,23 +561,33 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 	}
 	s.Logf("[v] client capabilities: %+v", whois.CapMap)
 
-	cachedGrants, cached := s.GrantCache.Get(identity)
+	cacheKey := s.grantCacheKey(identity)
+	cachedGrants, cached := s.GrantCache.Get(cacheKey)
 	if cached {
 		s.Logf("[v] using cached grants for %s: %d configs", identity, len(cachedGrants))
 		return cachedGrants, nil
 	}
 
-	// Parse grants from capabilities
+	// Parse grants from the configured capability on the whois CapMap.
 	parsedGrants, err := s.GrantParser.ParseGrants(whois.CapMap)
 	if err != nil {
 		return nil, fmt.Errorf("parse grants: %w", err)
 	}
-	s.Logf("[v] parsed %d grant configs for client %s", len(parsedGrants), identity)
+	s.Logf("[v] parsed %d grant configs for client %s from %s", len(parsedGrants), identity, cacheKey.CapName)
 
-	// Cache grants
-	s.GrantCache.Set(identity, parsedGrants)
+	// Cache grants under the capability that produced them.
+	s.GrantCache.Set(cacheKey, parsedGrants)
 
 	return parsedGrants, nil
+}
+
+// grantCacheKey scopes cached grants to the capability the parser reads.
+func (s *Server) grantCacheKey(identity string) cache.GrantCacheKey {
+	capName := grants.DefaultCapName
+	if s.GrantParser != nil {
+		capName = s.GrantParser.CapName()
+	}
+	return cache.GrantCacheKey{Identity: identity, CapName: capName}
 }
 
 func (s *Server) getIdentity(whois *apitype.WhoIsResponse) string {

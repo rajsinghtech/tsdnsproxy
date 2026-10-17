@@ -9,6 +9,7 @@ import (
 
 	"github.com/rajsinghtech/tsdnsproxy/internal/cidr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/peercap"
 )
 
 // NormalizeDomain converts a domain to lowercase and removes trailing dot
@@ -80,21 +81,42 @@ func (g DNSGrant) Authoritative() bool {
 // GrantConfig maps domains to their DNS grants
 type GrantConfig map[string]DNSGrant
 
-// Parser handles parsing of grants from capabilities
+// Parser handles parsing of grants from one peer capability.
 type Parser struct {
+	capName string
 }
 
-// NewParser creates a new grant parser
+// NewParser creates a parser that reads DefaultCapName.
 func NewParser() *Parser {
-	return &Parser{}
+	return &Parser{capName: DefaultCapName}
 }
 
-// ParseGrants extracts DNS grants from capability map
+// NewParserWithName returns a parser that reads name.
+// Surrounding whitespace is removed before validation.
+func NewParserWithName(name string) (*Parser, error) {
+	name = strings.TrimSpace(name)
+	if err := ValidateCapName(name); err != nil {
+		return nil, err
+	}
+	return &Parser{capName: name}, nil
+}
+
+// CapName returns the capability this parser reads.
+// A zero parser reads DefaultCapName.
+func (p *Parser) CapName() string {
+	if p == nil || p.capName == "" {
+		return DefaultCapName
+	}
+	return p.capName
+}
+
+// ParseGrants extracts DNS grants for this parser's capability from capMap.
+// Entries under any other capability name are ignored.
 func (p *Parser) ParseGrants(capMap tailcfg.PeerCapMap) ([]GrantConfig, error) {
 
 	var grantConfigs []GrantConfig
 
-	rawMessages, exists := capMap["rajsingh.info/cap/tsdnsproxy"]
+	rawMessages, exists := capMap[peercap.Cap(p.CapName())]
 	if !exists {
 		return nil, nil
 	}

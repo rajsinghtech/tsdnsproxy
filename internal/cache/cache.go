@@ -131,10 +131,17 @@ func NewWhoisCache(ttl time.Duration) *WhoisCache {
 	return New[string, *apitype.WhoIsResponse](ttl)
 }
 
-// GrantCache caches parsed grants by source identity
-type GrantCache = Cache[string, []grants.GrantConfig]
+// GrantCacheKey identifies cached grants for one source and capability.
+// CapName keeps grants parsed from one capability separate from another.
+type GrantCacheKey struct {
+	Identity string
+	CapName  string
+}
 
-// NewGrantCache creates a new grant cache with the specified TTL
+// GrantCache caches parsed grants by source identity and capability name.
+type GrantCache = Cache[GrantCacheKey, []grants.GrantConfig]
+
+// NewGrantCache creates a new grant cache with the specified TTL.
 func NewGrantCache(ttl time.Duration) *GrantCache {
-	return New[string, []grants.GrantConfig](ttl)
+	return New[GrantCacheKey, []grants.GrantConfig](ttl)
 }

@@ -303,6 +303,28 @@ func TestWhoisCache(t *testing.T) {
 	}
 }
 
+func TestGrantCacheSeparatesCapNames(t *testing.T) {
+	gc := NewGrantCache(time.Minute)
+	defer gc.Close()
+
+	const custom = "example.com/cap/dns"
+	customKey := GrantCacheKey{Identity: "node.example.com", CapName: custom}
+	defaultKey := GrantCacheKey{Identity: "node.example.com", CapName: grants.DefaultCapName}
+	if customKey == defaultKey {
+		t.Fatal("capability names must not share a grant cache key")
+	}
+
+	gc.Set(customKey, []grants.GrantConfig{
+		{"custom.example": grants.DNSGrant{DNS: []string{"10.9.0.1:53"}}},
+	})
+	if _, found := gc.Get(defaultKey); found {
+		t.Fatal("default capability name must not see grants cached for a custom name")
+	}
+	if _, found := gc.Get(customKey); !found {
+		t.Fatal("custom capability grants were not cached")
+	}
+}
+
 func TestGrantCache(t *testing.T) {
 	gc := NewGrantCache(time.Minute)
 	defer gc.Close()
@@ -323,9 +345,10 @@ func TestGrantCache(t *testing.T) {
 		},
 	}
 
-	gc.Set("user@example.com", grants1)
+	key := GrantCacheKey{Identity: "user@example.com", CapName: grants.DefaultCapName}
+	gc.Set(key, grants1)
 
-	cached, found := gc.Get("user@example.com")
+	cached, found := gc.Get(key)
 	if !found {
 		t.Error("expected to find cached grants")
 	}
