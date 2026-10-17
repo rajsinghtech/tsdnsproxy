@@ -191,12 +191,14 @@ tsdnsproxy \
 
 ### Tailscale Service
 
-`-service svc:dns` (or `TSDNSPROXY_SERVICE`) hosts DNS as a Tailscale Service.
-Clients reach a stable virtual IP and the MagicDNS name `dns.example.ts.net`
-on a tailnet whose suffix is `example.ts.net`. That name stays put when this
-node is replaced. `tsnet.ListenService` advertises the node as a host of
-`svc:dns` and accepts TCP port 53. PROXY protocol v2 is on, so whois still
-sees the client address.
+`-service svc:dns` (or `TSDNSPROXY_SERVICE`) hosts DNS over TCP on the
+service VIP. UDP 53 stays on the node's own Tailscale address
+(`-listen-addrs tailscale`, which is the default). Clients that use the VIP,
+or the MagicDNS name `dns.example.ts.net` on a tailnet whose suffix is
+`example.ts.net`, must send DNS over TCP to port 53. The service does not
+answer UDP. The name stays put when this node is replaced.
+`tsnet.ListenService` advertises the node as a host of `svc:dns` and accepts
+TCP port 53. PROXY protocol v2 is on, so whois still sees the client address.
 
 `svc:<name>@<port>` changes the TCP port. `service:dns` is accepted and
 treated as `svc:dns`. The same token can also be added to `-listen-addrs`.
@@ -231,14 +233,17 @@ approves this tag as a host:
 }
 ```
 
-UDP 53 is not available on the Service. In tailscale.com v1.104.1,
+Clients using the VIP need TCP DNS. In tailscale.com v1.104.1,
 `ListenService` only has TCP and HTTP modes. Both open a local TCP socket,
-and the serve config advertises TCP ports. UDP on a Service VIP exists only
-in Tun mode, which this API does not enable. Keep `-listen-addrs tailscale`
-so the node still answers UDP 53 on its own address. Point resolvers that
-can use TCP at `dns.example.ts.net`. A resolver that only sends UDP can keep
-using the node address, or a forwarder on the client can accept UDP and
-send TCP to that name.
+and the serve config advertises TCP ports. UDP on a service VIP exists only
+in Tun mode, which this API does not enable.
+
+MagicDNS and split DNS do not always fall back to TCP when the nameserver is that VIP.
+
+- If the operating system applies the split itself, it sends UDP straight to the VIP. That happens when every split domain uses the same IP resolvers and the OS can split. `Manager.compileConfig` then sets `OSConfig.Nameservers` to those IPs and returns. Windows and sandboxed Apple are not on that path. A missing UDP answer is a timeout. The OS retries over TCP only after a truncated UDP response, and this service never sends one.
+- If the query goes through Tailscale's resolver at `100.100.100.100`, `forwarder.send` tries the upstream over UDP and starts TCP when that UDP attempt returns an error, or after 2 seconds if UDP is still waiting (`udpRaceTimeout`). A silent UDP VIP can then succeed over TCP, two seconds slower, unless `TS_DNS_FORWARD_SKIP_TCP_RETRY` or the control knob `DisableDNSForwarderTCPRetries` is set. A UDP answer that does arrive, including a truncated one, is returned as it is when the client asked over UDP.
+
+Point split DNS at the node address when clients only send UDP. Point TCP clients at `dns.example.ts.net`.
 
 ## Domain Matching
 
