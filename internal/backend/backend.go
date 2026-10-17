@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
 	"golang.org/x/net/dns/dnsmessage"
 )
 
@@ -206,8 +207,8 @@ func (m *Manager) markUnhealthy(backend string) {
 		shift = 9
 	}
 	backoffSeconds := 1 << shift
-	if backoffSeconds > 300 {
-		backoffSeconds = 300
+	if backoffSeconds > constants.BackendMaxBackoffSeconds {
+		backoffSeconds = constants.BackendMaxBackoffSeconds
 	}
 
 	health.unhealthyUntil = time.Now().Add(time.Duration(backoffSeconds) * time.Second)
@@ -223,7 +224,7 @@ func (m *Manager) markHealthy(backend string) {
 
 // cleanupUnhealthy periodically removes expired unhealthy entries
 func (m *Manager) cleanupUnhealthy() {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(constants.BackendCleanupInterval)
 	defer ticker.Stop()
 
 	for {

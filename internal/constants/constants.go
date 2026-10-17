@@ -29,8 +29,6 @@ const (
 
 // Backend configuration
 const (
-	BackendDefaultTimeout    = 2 * time.Second
-	BackendMaxTimeout        = 30 * time.Second
 	BackendMaxBackoffSeconds = 300
 	BackendCleanupInterval   = 10 * time.Second
 )
