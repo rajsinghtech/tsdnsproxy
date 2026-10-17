@@ -180,8 +180,8 @@ func validateIPNamesZone(zone string) error {
 		return fmt.Errorf("invalid ipnames zone %q", zone)
 	}
 	labels := strings.Split(zone, ".")
-	if len(labels) < 2 {
-		return fmt.Errorf("ipnames zone %q needs at least two labels", zone)
+	if len(labels) < 1 {
+		return fmt.Errorf("invalid ipnames zone %q", zone)
 	}
 	for _, label := range labels {
 		if label == "" || len(label) > 63 {

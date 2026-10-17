@@ -84,6 +84,22 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY -rules-file /etc/tsdnsproxy/rules.json
 
 With that rule, an address `10.0.0.1` is translated with site id 1. An A query returns no A record. The AAAA answer is `fd7a:115c:a1e0:b1a:0:1:a00:1`.
 
+An encoded-name zone in the same file needs no backend. The site id is `ipnames.siteid`. Do not also set `translateid` on that object. A one-label zone such as `ip` answers `10-1-2-3.ip`.
+
+```json
+{
+  "ip": {
+    "ipnames": {
+      "siteid": 1,
+      "a": "never",
+      "allowips": ["10.0.0.0/8"]
+    }
+  }
+}
+```
+
+`10-1-2-3.ip` AAAA is the 4via6 address for `10.1.2.3` at site id 1, `fd7a:115c:a1e0:b1a:0:1:a01:203`. An address outside `allowips`, or a malformed label, is NXDOMAIN. With `a` set to `never`, an A query is NODATA. `always` returns the IPv4 address. `direct` returns it only when the client is inside `directsrc`.
+
 Whois still runs, and the caller is logged when verbose logging is on. Whois is not required to authorize the query. If it fails, the file rules are used anyway.
 
 When the client also has ACL grants, the grant wins for any domain or CIDR it defines. The file still answers names the grant does not mention. `-rules-only` (`TSDNSPROXY_RULES_ONLY=true`) ignores ACL grants and uses the file alone. `-rules-only` requires a rules file.
@@ -349,7 +365,7 @@ A zone can answer `10-0-0-1.site-a.example` with no per-host records. The single
 - `allowips` limits which addresses a label may encode. The same built-in ranges used by translation filters are rejected unless `allowips` covers them. A rejected or malformed name is NXDOMAIN.
 - `allowsrc`, when set, refuses clients outside those prefixes.
 - Other query types, and A when A is off, are NODATA. The zone apex answers SOA and is NODATA for everything else.
-- Two labels are required. The same zone with different settings in two grants is dropped, and so are nested encoded-name zones. A normal rule may still be more specific than an encoded-name zone.
+- A zone is one or more labels. `ip` answers `10-1-2-3.ip`. `site-a.example` answers `10-1-2-3.site-a.example`. The same zone with different settings in two grants is dropped, and so are nested encoded-name zones. A normal rule may still be more specific than an encoded-name zone.
 
 Publish one split-DNS suffix per zone, aimed at this proxy. The suffix covers every name under the zone. The split applies to the whole network; per-user control is the grant. Clients must accept the network's DNS. AAAA answers are only useful when a router advertises the translated prefix and clients accept those routes. Do not add these zones as search domains. `a` set to `always` can stall address selection, which is why `direct` exists. A shared resolver caches one client's answer for others, so keep `ttl` low when using `direct`.
 

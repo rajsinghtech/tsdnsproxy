@@ -66,6 +66,49 @@ func TestRulesFileAppliesWithNoGrant(t *testing.T) {
 	}
 }
 
+func TestRulesFileIPSuffix(t *testing.T) {
+	body := `{
+	  "ip": {
+	    "ipnames": {"siteid": 1, "a": "never", "allowips": ["10.0.0.0/8"]}
+	  }
+	}`
+	path := writeExampleRules(t, body)
+	server, _ := newRulesServer(t, path, func(ctx context.Context, addr string) (*apitype.WhoIsResponse, error) {
+		return &apitype.WhoIsResponse{Node: &tailcfg.Node{Name: "client.example.ts.net"}}, nil
+	}, true)
+
+	aaaa := queryRules(t, server, "10-1-2-3.ip.", dnsmessage.TypeAAAA)
+	if got := mustAAAA(t, aaaa); got != netip.MustParseAddr("fd7a:115c:a1e0:b1a:0:1:a01:203") {
+		t.Fatalf("AAAA = %s", got)
+	}
+	a := queryRules(t, server, "10-1-2-3.ip.", dnsmessage.TypeA)
+	if a.RCode != dnsmessage.RCodeSuccess || len(a.Answers) != 0 {
+		t.Fatalf("A rcode=%v answers=%d, want NODATA", a.RCode, len(a.Answers))
+	}
+	outside := queryRules(t, server, "11-0-0-1.ip.", dnsmessage.TypeAAAA)
+	if outside.RCode != dnsmessage.RCodeNameError {
+		t.Fatalf("outside allowips rcode=%v, want NXDOMAIN", outside.RCode)
+	}
+	if serverHasBackend(t, server, "10.0.0.53:53") || len(rulesBackends(server)) != 0 {
+		t.Fatalf("encoded name used a backend: %v", rulesBackends(server))
+	}
+
+	alwaysPath := writeExampleRules(t, `{
+	  "ip": {"ipnames": {"siteid": 1, "a": "always", "allowips": ["10.0.0.0/8"]}}
+	}`)
+	always, _ := newRulesServer(t, alwaysPath, func(ctx context.Context, addr string) (*apitype.WhoIsResponse, error) {
+		return &apitype.WhoIsResponse{Node: &tailcfg.Node{Name: "client.example.ts.net"}}, nil
+	}, true)
+	a = queryRules(t, always, "10-1-2-3.ip.", dnsmessage.TypeA)
+	if a.RCode != dnsmessage.RCodeSuccess || len(a.Answers) != 1 {
+		t.Fatalf("always A rcode=%v answers=%d", a.RCode, len(a.Answers))
+	}
+	arec, ok := a.Answers[0].Body.(*dnsmessage.AResource)
+	if !ok || netip.AddrFrom4(arec.A) != netip.MustParseAddr("10.1.2.3") {
+		t.Fatalf("A = %#v", a.Answers)
+	}
+}
+
 func TestRulesFileAppliesWhenWhoisHasNoGrant(t *testing.T) {
 	path := writeExampleRules(t, exampleRules)
 	server, logs := newRulesServer(t, path, func(ctx context.Context, addr string) (*apitype.WhoIsResponse, error) {
