@@ -29,10 +29,10 @@ func TestResolveRejectsOverlongName(t *testing.T) {
 		t.Fatalf("fixture length = %d, want > 255", len(name))
 	}
 
-	if _, err := server.resolveToIPv4(name, []string{"10.0.0.1:53"}); err == nil {
+	if _, err := server.resolveToIPv4(context.Background(), name, []string{"10.0.0.1:53"}); err == nil {
 		t.Fatal("resolveToIPv4 returned nil error for an overlong name")
 	}
-	if _, err := server.resolveToIPv6(name, []string{"10.0.0.1:53"}); err == nil {
+	if _, err := server.resolveToIPv6(context.Background(), name, []string{"10.0.0.1:53"}); err == nil {
 		t.Fatal("resolveToIPv6 returned nil error for an overlong name")
 	}
 }

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 type DNSDialer interface {
@@ -43,6 +45,7 @@ type Manager struct {
 	mu              sync.RWMutex
 	unhealthy       map[string]*backendHealth
 	done            chan struct{}
+	closeOnce       sync.Once
 	direct          DNSDialer
 	tailnet         DNSDialer
 	tailnetRoutes   DNSDialer
@@ -186,9 +189,14 @@ func (m *Manager) markUnhealthy(backend string) {
 		m.unhealthy[backend] = health
 	}
 
-	// Exponential backoff: 2^failureCount seconds, max 5 minutes
+	// Exponential backoff: 2^(n-1) seconds, capped at 5 minutes.
+	// The shift is capped so a long outage cannot overflow the shift.
 	health.failureCount++
-	backoffSeconds := 1 << uint(health.failureCount-1)
+	shift := health.failureCount - 1
+	if shift > 9 {
+		shift = 9
+	}
+	backoffSeconds := 1 << shift
 	if backoffSeconds > 300 {
 		backoffSeconds = 300
 	}
@@ -227,12 +235,15 @@ func (m *Manager) cleanupUnhealthy() {
 	}
 }
 
-// Close stops the cleanup goroutine
+// Close stops the cleanup goroutine. It is safe to call more than once.
 func (m *Manager) Close() {
-	close(m.done)
+	m.closeOnce.Do(func() { close(m.done) })
 }
 
-// UDPBackend implements a DNS backend that tries TCP first, then UDP
+// upstreamUDPSize is the EDNS buffer advertised to an upstream server.
+const upstreamUDPSize = 1232
+
+// UDPBackend queries one DNS server over UDP and falls back to TCP.
 type UDPBackend struct {
 	server    string
 	label     string
@@ -262,96 +273,242 @@ func NewUDPBackend(server string, dnsDialer DNSDialer, logf func(format string, 
 }
 
 func (b *UDPBackend) Query(ctx context.Context, query []byte) ([]byte, error) {
-	deadline := time.Now().Add(b.timeout)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
+	if len(query) < 12 {
+		return nil, fmt.Errorf("query is %d bytes", len(query))
+	}
+	timeout := b.timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	d := b.dialer()
+	udpBudget := timeout / 3
+	if udpBudget < 250*time.Millisecond {
+		udpBudget = 250 * time.Millisecond
+	}
+	if remain, ok := ctx.Deadline(); ok {
+		if left := time.Until(remain); left < udpBudget {
+			udpBudget = left
+		}
+	}
+	if udpBudget < 0 {
+		udpBudget = 0
 	}
 
-	var dnsDialer DNSDialer = netDialer{net.Dialer{}}
-	if b.dnsDialer != nil {
-		dnsDialer = b.dnsDialer
-	}
-
-	// Try TCP first - it properly waits for connection establishment with tsnet/netstack
-	// UDP dial returns immediately even if WireGuard tunnel isn't ready
-	b.logf("[v] dialing %s with TCP (dialer=%T)", b.server, dnsDialer)
-	resp, err := b.queryTCP(ctx, dnsDialer, query, deadline)
-	if err == nil {
+	udpQuery := withUpstreamEDNS(query, upstreamUDPSize)
+	udpCtx, udpCancel := context.WithTimeout(ctx, udpBudget)
+	resp, err := b.queryUDP(udpCtx, d, udpQuery)
+	udpCancel()
+	if err == nil && !udpTruncated(resp) {
 		return resp, nil
 	}
-	b.logf("[v] TCP query failed: %v, falling back to UDP", err)
-
-	// Fallback to UDP
-	return b.queryUDP(ctx, dnsDialer, query, deadline)
+	if err != nil {
+		b.logf("[v] UDP query %s failed: %v, trying TCP", b.server, err)
+	} else {
+		b.logf("[v] UDP response from %s is truncated, trying TCP", b.server)
+	}
+	tcpResp, tcpErr := b.queryTCP(ctx, d, query)
+	if tcpErr != nil {
+		if err == nil && udpTruncated(resp) {
+			return resp, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("udp: %w", err)
+		}
+		return nil, tcpErr
+	}
+	return tcpResp, nil
 }
 
-func (b *UDPBackend) queryTCP(ctx context.Context, d DNSDialer, query []byte, deadline time.Time) ([]byte, error) {
-	conn, err := d.Dial(ctx, "tcp", b.server)
+func (b *UDPBackend) dialer() DNSDialer {
+	if b.dnsDialer != nil {
+		return b.dnsDialer
+	}
+	return netDialer{}
+}
+
+func (b *UDPBackend) queryTCP(ctx context.Context, d DNSDialer, query []byte) ([]byte, error) {
+	if len(query) > 65535 {
+		return nil, fmt.Errorf("tcp query is %d bytes", len(query))
+	}
+	conn, err := dialContext(ctx, d, "tcp", b.server)
 	if err != nil {
-		return nil, fmt.Errorf("tcp dial %s: %w", b.server, err)
+		return nil, err
 	}
 	b.logf("[v] TCP dial succeeded, conn_type=%T local=%s remote=%s", conn, conn.LocalAddr(), conn.RemoteAddr())
 	defer func() {
 		_ = conn.Close()
 	}()
-
-	if err := conn.SetDeadline(deadline); err != nil {
-		return nil, fmt.Errorf("set deadline: %w", err)
+	if err := applyDeadline(conn, ctx); err != nil {
+		return nil, err
 	}
 
-	// DNS over TCP requires 2-byte length prefix
 	tcpQuery := make([]byte, 2+len(query))
 	tcpQuery[0] = byte(len(query) >> 8)
 	tcpQuery[1] = byte(len(query))
 	copy(tcpQuery[2:], query)
-
 	if _, err := conn.Write(tcpQuery); err != nil {
 		return nil, fmt.Errorf("write query: %w", err)
 	}
 
-	// Read length prefix
 	lenBuf := make([]byte, 2)
 	if _, err := readFull(conn, lenBuf); err != nil {
 		return nil, fmt.Errorf("read length: %w", err)
 	}
 	respLen := int(lenBuf[0])<<8 | int(lenBuf[1])
-
-	// Read response
+	if respLen < 12 || respLen > 65535 {
+		return nil, fmt.Errorf("tcp response length %d", respLen)
+	}
 	resp := make([]byte, respLen)
 	if _, err := readFull(conn, resp); err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
-
+	if !validDNSResponse(query, resp) {
+		return nil, fmt.Errorf("tcp response from %s does not match the query", b.server)
+	}
 	return resp, nil
 }
 
-func (b *UDPBackend) queryUDP(ctx context.Context, d DNSDialer, query []byte, deadline time.Time) ([]byte, error) {
+func (b *UDPBackend) queryUDP(ctx context.Context, d DNSDialer, query []byte) ([]byte, error) {
 	b.logf("[v] dialing %s with UDP (dialer=%T)", b.server, d)
-	conn, err := d.Dial(ctx, "udp", b.server)
+	conn, err := dialContext(ctx, d, "udp", b.server)
 	if err != nil {
-		return nil, fmt.Errorf("udp dial %s: %w", b.server, err)
+		return nil, err
 	}
 	b.logf("[v] UDP dial succeeded, conn_type=%T local=%s remote=%s", conn, conn.LocalAddr(), conn.RemoteAddr())
 	defer func() {
 		_ = conn.Close()
 	}()
-
-	if err := conn.SetDeadline(deadline); err != nil {
-		return nil, fmt.Errorf("set deadline: %w", err)
+	if err := applyDeadline(conn, ctx); err != nil {
+		return nil, err
 	}
-
 	if _, err := conn.Write(query); err != nil {
 		return nil, fmt.Errorf("write query: %w", err)
 	}
-
-	// Use larger buffer to support EDNS0 (up to 4096 bytes typical, 65KB max)
-	resp := make([]byte, 65535)
-	n, err := conn.Read(resp)
+	bufp := udpBufPool.Get().(*[]byte)
+	buf := *bufp
+	defer udpBufPool.Put(bufp)
+	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
+	if n < 12 {
+		return nil, fmt.Errorf("udp response is %d bytes", n)
+	}
+	out := make([]byte, n)
+	copy(out, buf[:n])
+	if !validDNSResponse(query, out) {
+		return nil, fmt.Errorf("udp response from %s does not match the query", b.server)
+	}
+	return out, nil
+}
 
-	return resp[:n], nil
+var udpBufPool = sync.Pool{New: func() any {
+	buf := make([]byte, 65535)
+	return &buf
+}}
+
+// dialContext dials with ctx. A dialer that ignores cancellation is abandoned
+// when ctx ends, and the connection is closed if it appears later.
+func dialContext(ctx context.Context, d DNSDialer, network, address string) (net.Conn, error) {
+	if d == nil {
+		d = netDialer{}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("dial %s %s: %w", network, address, err)
+	}
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := d.Dial(ctx, network, address)
+		ch <- result{conn, err}
+	}()
+	select {
+	case <-ctx.Done():
+		go func() {
+			res := <-ch
+			if res.conn != nil {
+				_ = res.conn.Close()
+			}
+		}()
+		return nil, fmt.Errorf("dial %s %s: %w", network, address, ctx.Err())
+	case res := <-ch:
+		if res.err != nil {
+			return nil, fmt.Errorf("dial %s %s: %w", network, address, res.err)
+		}
+		if res.conn == nil {
+			return nil, fmt.Errorf("dial %s %s: nil connection", network, address)
+		}
+		return res.conn, nil
+	}
+}
+
+func applyDeadline(conn net.Conn, ctx context.Context) error {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("set deadline: %w", err)
+	}
+	return nil
+}
+
+func udpTruncated(raw []byte) bool {
+	return len(raw) >= 12 && raw[2]&0x02 != 0
+}
+
+func validDNSResponse(query, resp []byte) bool {
+	if len(query) < 12 || len(resp) < 12 {
+		return false
+	}
+	if query[0] != resp[0] || query[1] != resp[1] {
+		return false
+	}
+	// QR must be set on a response.
+	return resp[2]&0x80 != 0
+}
+
+// withUpstreamEDNS returns query with an OPT record advertising udpSize.
+// The original bytes are returned when the message cannot be rebuilt.
+func withUpstreamEDNS(query []byte, udpSize int) []byte {
+	if udpSize < 512 {
+		udpSize = 512
+	}
+	var msg dnsmessage.Message
+	if err := msg.Unpack(query); err != nil {
+		return query
+	}
+	updated := false
+	for i, extra := range msg.Additionals {
+		if extra.Header.Type != dnsmessage.TypeOPT {
+			continue
+		}
+		if int(extra.Header.Class) < udpSize {
+			msg.Additionals[i].Header.Class = dnsmessage.Class(udpSize)
+		}
+		updated = true
+	}
+	if !updated {
+		msg.Additionals = append(msg.Additionals, dnsmessage.Resource{
+			Header: dnsmessage.ResourceHeader{
+				Name:  dnsmessage.MustNewName("."),
+				Type:  dnsmessage.TypeOPT,
+				Class: dnsmessage.Class(udpSize),
+			},
+			Body: &dnsmessage.OPTResource{},
+		})
+	}
+	packed, err := msg.Pack()
+	if err != nil {
+		return query
+	}
+	return packed
 }
 
 // readFull reads exactly len(buf) bytes from conn

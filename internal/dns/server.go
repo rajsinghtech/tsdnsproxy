@@ -57,6 +57,13 @@ type Server struct {
 	Rules     *grants.RulesFile
 	RulesOnly bool
 
+	// QueryTimeout bounds one client query, including upstream dials.
+	// Zero means 10 seconds.
+	QueryTimeout time.Duration
+	// MaxUDP is the largest UDP response written to a client.
+	// Zero means 1232 bytes. Clients that send no EDNS OPT still get 512.
+	MaxUDP int
+
 	// Service hosts DNS as a Tailscale Service when set, for example "svc:dns".
 	// The listener is TCP. Port 53 is used unless the value ends in @port.
 	Service string
@@ -529,9 +536,16 @@ func (s *Server) waitForHandlers(protocol string) {
 	}
 }
 
+func (s *Server) queryTimeout() time.Duration {
+	if s != nil && s.QueryTimeout > 0 {
+		return s.QueryTimeout
+	}
+	return 10 * time.Second
+}
+
 func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Addr, packet []byte, via string) {
 	// Create request-scoped context with timeout
-	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	queryCtx, cancel := context.WithTimeout(ctx, s.queryTimeout())
 	defer cancel()
 
 	var msg dnsmessage.Message
@@ -581,6 +595,16 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 		}
 		s.sendError(pc, addr, &msg, dnsmessage.RCodeServerFailure)
 		return
+	}
+
+	if via == "udp" {
+		fitted, ferr := fitUDP(&msg, response, s.MaxUDP)
+		if ferr != nil {
+			s.Logf("failed to fit udp response: %v", ferr)
+			s.sendError(pc, addr, &msg, dnsmessage.RCodeServerFailure)
+			return
+		}
+		response = fitted
 	}
 
 	// Send response
@@ -771,7 +795,7 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 		} else {
 			s.Logf("[v] authoritative domain: %s (translateID=%d)", domain, *grant.TranslateID)
 		}
-		return s.handleAuthoritative4via6(query, &grant, domain, grantConfigs)
+		return s.handleAuthoritative4via6(ctx, query, &grant, domain, grantConfigs)
 	}
 
 	var rewrittenQuery *dnsmessage.Message
@@ -804,7 +828,7 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 // errSkipTranslate means the address must be returned unchanged.
 var errSkipTranslate = errors.New("skip translation")
 
-func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *grants.DNSGrant, domain string, configs []grants.GrantConfig) ([]byte, error) {
+func (s *Server) handleAuthoritative4via6(ctx context.Context, query *dnsmessage.Message, grant *grants.DNSGrant, domain string, configs []grants.GrantConfig) ([]byte, error) {
 	if len(query.Questions) == 0 {
 		return nil, fmt.Errorf("no questions in query")
 	}
@@ -838,7 +862,7 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 		switch question.Type {
 		case dnsmessage.TypeA:
 			// Resolve backend and return IPv4 directly
-			ipv4, err := s.resolveBackendIPv4(question.Name.String(), domain, grant)
+			ipv4, err := s.resolveBackendIPv4(ctx, question.Name.String(), domain, grant)
 			if err != nil {
 				s.Logf("failed to resolve IPv4 for %s: %v", question.Name.String(), err)
 				response.RCode = dnsmessage.RCodeServerFailure
@@ -861,7 +885,7 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 			}
 		case dnsmessage.TypeAAAA:
 			// Resolve backend and return IPv6 directly (no 4via6 translation)
-			ipv6, err := s.resolveBackendIPv6(question.Name.String(), domain, grant)
+			ipv6, err := s.resolveBackendIPv6(ctx, question.Name.String(), domain, grant)
 			if err != nil {
 				s.Logf("failed to resolve IPv6 for %s: %v", question.Name.String(), err)
 				response.RCode = dnsmessage.RCodeServerFailure
@@ -889,7 +913,7 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 		// Translation mode. Addresses outside the grant's ranges are served unchanged.
 		switch question.Type {
 		case dnsmessage.TypeA:
-			ipv4, err := s.resolveBackendIPv4(question.Name.String(), domain, grant)
+			ipv4, err := s.resolveBackendIPv4(ctx, question.Name.String(), domain, grant)
 			if err != nil {
 				s.Logf("failed to resolve IPv4 for %s: %v", question.Name.String(), err)
 				response.RCode = dnsmessage.RCodeServerFailure
@@ -900,7 +924,7 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 				s.Logf("[v] passthrough A for %s: %s", question.Name.String(), ipv4)
 			}
 		case dnsmessage.TypeAAAA:
-			via6Addr, err := s.createSynthetic4via6Address(question.Name.String(), domain, grant, configs)
+			via6Addr, err := s.createSynthetic4via6Address(ctx, question.Name.String(), domain, grant, configs)
 			if errors.Is(err, errSkipTranslate) {
 				s.Logf("[v] passthrough AAAA for %s: address excluded from translation", question.Name.String())
 			} else if err != nil {
@@ -931,7 +955,7 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 }
 
 // resolveBackendIPv4 resolves a query domain to its backend IPv4 address
-func (s *Server) resolveBackendIPv4(queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
+func (s *Server) resolveBackendIPv4(ctx context.Context, queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
 	// Determine what to resolve - use rewrite if available, otherwise resolve directly via backends
 	var targetDomain string
 	if grant.Rewrite != "" {
@@ -949,7 +973,7 @@ func (s *Server) resolveBackendIPv4(queryDomain, grantDomain string, grant *gran
 	s.Logf("[v] resolving backend domain: %s via DNS servers: %v", targetDomain, grant.DNS)
 
 	// Resolve the target domain to get IPv4 address
-	ipv4, err := s.resolveToIPv4(targetDomain, grant.DNS)
+	ipv4, err := s.resolveToIPv4(ctx, targetDomain, grant.DNS)
 	if err != nil {
 		s.Logf("failed to resolve %s via %v: %v", targetDomain, grant.DNS, err)
 		return netip.Addr{}, fmt.Errorf("failed to resolve %s: %w", targetDomain, err)
@@ -960,8 +984,8 @@ func (s *Server) resolveBackendIPv4(queryDomain, grantDomain string, grant *gran
 }
 
 // createSynthetic4via6Address creates a synthetic 4via6 IPv6 address by resolving the backend service
-func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, grant *grants.DNSGrant, configs []grants.GrantConfig) (netip.Addr, error) {
-	ipv4, err := s.resolveBackendIPv4(queryDomain, grantDomain, grant)
+func (s *Server) createSynthetic4via6Address(ctx context.Context, queryDomain, grantDomain string, grant *grants.DNSGrant, configs []grants.GrantConfig) (netip.Addr, error) {
+	ipv4, err := s.resolveBackendIPv4(ctx, queryDomain, grantDomain, grant)
 	if err != nil {
 		return netip.Addr{}, err
 	}
@@ -1030,7 +1054,7 @@ func aRecord(question dnsmessage.Question, ipv4 netip.Addr) dnsmessage.Resource 
 }
 
 // resolveBackendIPv6 resolves a query domain to its backend IPv6 address
-func (s *Server) resolveBackendIPv6(queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
+func (s *Server) resolveBackendIPv6(ctx context.Context, queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
 	// Determine what to resolve - use rewrite if available, otherwise resolve directly via backends
 	var targetDomain string
 	if grant.Rewrite != "" {
@@ -1048,7 +1072,7 @@ func (s *Server) resolveBackendIPv6(queryDomain, grantDomain string, grant *gran
 	s.Logf("[v] resolving backend domain: %s via DNS servers: %v", targetDomain, grant.DNS)
 
 	// Resolve the target domain to get IPv6 address
-	ipv6, err := s.resolveToIPv6(targetDomain, grant.DNS)
+	ipv6, err := s.resolveToIPv6(ctx, targetDomain, grant.DNS)
 	if err != nil {
 		s.Logf("failed to resolve %s via %v: %v", targetDomain, grant.DNS, err)
 		return netip.Addr{}, fmt.Errorf("failed to resolve %s: %w", targetDomain, err)
@@ -1059,7 +1083,7 @@ func (s *Server) resolveBackendIPv6(queryDomain, grantDomain string, grant *gran
 }
 
 // resolveToIPv4 resolves a domain to an IPv4 address using the specified DNS servers
-func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, error) {
+func (s *Server) resolveToIPv4(ctx context.Context, domain string, dnsServers []string) (netip.Addr, error) {
 	s.Logf("[v] resolveToIPv4: creating A query for %s", domain)
 
 	qname, err := newDNSName(domain)
@@ -1100,7 +1124,7 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 	if err != nil {
 		return netip.Addr{}, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	responseBytes, err := s.BackendMgr.Query(ctx, backends, queryBytes)
@@ -1135,7 +1159,7 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 }
 
 // resolveToIPv6 resolves a domain to an IPv6 address using the specified DNS servers
-func (s *Server) resolveToIPv6(domain string, dnsServers []string) (netip.Addr, error) {
+func (s *Server) resolveToIPv6(ctx context.Context, domain string, dnsServers []string) (netip.Addr, error) {
 	s.Logf("[v] resolveToIPv6: creating AAAA query for %s", domain)
 
 	qname, err := newDNSName(domain)
@@ -1176,7 +1200,7 @@ func (s *Server) resolveToIPv6(domain string, dnsServers []string) (netip.Addr, 
 	if err != nil {
 		return netip.Addr{}, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	responseBytes, err := s.BackendMgr.Query(ctx, backends, queryBytes)

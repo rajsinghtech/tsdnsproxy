@@ -143,20 +143,21 @@ func TestDialSelectionUsesTCPAndUDP(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if _, err := backends[0].Query(ctx, []byte{0}); err == nil {
+	q := make([]byte, 12)
+	if _, err := backends[0].Query(ctx, q); err == nil {
 		t.Fatal("expected dial error")
 	}
-	if _, err := backends[1].Query(ctx, []byte{0}); err == nil {
+	if _, err := backends[1].Query(ctx, q); err == nil {
 		t.Fatal("expected dial error")
 	}
-	if _, err := backends[2].Query(ctx, []byte{0}); err == nil {
+	if _, err := backends[2].Query(ctx, q); err == nil {
 		t.Fatal("expected dial error")
 	}
 
-	if got := direct.calls(); !sameCalls(got, []string{"tcp 10.0.0.53:53", "udp 10.0.0.53:53", "tcp 10.0.0.54:53", "udp 10.0.0.54:53"}) {
+	if got := direct.calls(); !sameCalls(got, []string{"udp 10.0.0.53:53", "tcp 10.0.0.53:53", "udp 10.0.0.54:53", "tcp 10.0.0.54:53"}) {
 		t.Fatalf("direct calls = %v", got)
 	}
-	if got := tailnet.calls(); !sameCalls(got, []string{"tcp 10.0.0.53:53", "udp 10.0.0.53:53"}) {
+	if got := tailnet.calls(); !sameCalls(got, []string{"udp 10.0.0.53:53", "tcp 10.0.0.53:53"}) {
 		t.Fatalf("tailnet calls = %v", got)
 	}
 }
@@ -172,13 +173,13 @@ func TestDefaultTailnetDialSelection(t *testing.T) {
 	if len(m.defaultBackends) != 1 || m.defaultBackends[0].String() != "10.0.0.53:53" {
 		t.Fatalf("default backend = %v", m.defaultBackends)
 	}
-	if _, err := m.Query(context.Background(), nil, []byte{0}); err == nil {
+	if _, err := m.Query(context.Background(), nil, make([]byte, 12)); err == nil {
 		t.Fatal("expected dial error")
 	}
 	if len(direct.calls()) != 0 {
 		t.Fatalf("direct was used: %v", direct.calls())
 	}
-	if got := tailnet.calls(); !sameCalls(got, []string{"tcp 10.0.0.53:53", "udp 10.0.0.53:53"}) {
+	if got := tailnet.calls(); !sameCalls(got, []string{"udp 10.0.0.53:53", "tcp 10.0.0.53:53"}) {
 		t.Fatalf("tailnet calls = %v", got)
 	}
 }
@@ -239,16 +240,17 @@ func TestExplicitTailnetUsesRouteDialer(t *testing.T) {
 		t.Fatalf("labels = %s %s", backends[0].String(), backends[1].String())
 	}
 	ctx := context.Background()
-	if _, err := backends[0].Query(ctx, []byte{0}); err == nil {
+	q := make([]byte, 12)
+	if _, err := backends[0].Query(ctx, q); err == nil {
 		t.Fatal("expected dial error")
 	}
-	if _, err := backends[1].Query(ctx, []byte{0}); err == nil {
+	if _, err := backends[1].Query(ctx, q); err == nil {
 		t.Fatal("expected dial error")
 	}
-	if got := plain.calls(); !sameCalls(got, []string{"tcp 10.0.0.53:53", "udp 10.0.0.53:53"}) {
+	if got := plain.calls(); !sameCalls(got, []string{"udp 10.0.0.53:53", "tcp 10.0.0.53:53"}) {
 		t.Fatalf("plain tailnet calls = %v", got)
 	}
-	if got := routes.calls(); !sameCalls(got, []string{"tcp 10.0.0.53:53", "udp 10.0.0.53:53"}) {
+	if got := routes.calls(); !sameCalls(got, []string{"udp 10.0.0.53:53", "tcp 10.0.0.53:53"}) {
 		t.Fatalf("route dialer calls = %v", got)
 	}
 }

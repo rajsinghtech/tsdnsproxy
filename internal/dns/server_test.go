@@ -1308,7 +1308,7 @@ func TestServer_handleAuthoritative4via6(t *testing.T) {
 				},
 			}
 
-			response, err := server.handleAuthoritative4via6(tt.query, tt.grant, tt.domain, nil)
+			response, err := server.handleAuthoritative4via6(context.Background(), tt.query, tt.grant, tt.domain, nil)
 			tt.validate(t, response, err)
 		})
 	}
