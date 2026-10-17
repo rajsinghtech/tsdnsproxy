@@ -117,6 +117,8 @@ Release images are tagged with the version and no leading `v` (`1.1.5`), and tha
 kubectl apply -k k8s/
 ```
 
+`TSDNSPROXY_STATE=kube:tsdnsproxy-state` stores state in the Secret named `tsdnsproxy-state`. The Role grants get, update, and patch on that named Secret, and create on Secrets so the store can create it when it is missing.
+
 `k8s/deployment.yaml` includes a ConfigMap mounted at `/etc/tsdnsproxy/rules.json`. Edit that ConfigMap to change the rules. The proxy reloads the file when it changes.
 
 Or with kustomize:
@@ -140,7 +142,7 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TS_CONTROLURL`: Custom control server URL (optional)
 - `TSDNSPROXY_HOSTNAME`: Hostname on tailnet (default: `tsdnsproxy`)
 - `TSDNSPROXY_STATE_DIR`: State directory (default: `/var/lib/tsdnsproxy`)
-- `TSDNSPROXY_STATE`: State storage backend (e.g., `kube:secret-name` or `arn:aws:ssm:...`)
+- `TSDNSPROXY_STATE`: State storage backend. `kube:secret-name` stores state in that Kubernetes Secret. The ServiceAccount needs a Role with get, update, and patch on that named Secret, plus create on Secrets. An `arn:` value selects AWS SSM.
 - `TSDNSPROXY_OVERRIDE_DNS`: Override host DNS servers (comma-separated, defaults to host's resolvers)
 - `TSDNSPROXY_LISTEN_ADDRS`: Listen addresses (default: `tailscale`) - see Network Configuration
 - `TSDNSPROXY_HEALTH_ADDR`: Health check endpoint address (default: `:8080`)
