@@ -31,6 +31,9 @@ import (
 	"tailscale.com/tsnet"
 )
 
+// version is set with -ldflags "-X main.version=..." at release build time.
+var version = "dev"
+
 func envOr(key, defaultVal string) string {
 	if v, ok := os.LookupEnv(key); ok {
 		return v
@@ -53,11 +56,7 @@ func getHostDNSServers() []string {
 			line := strings.TrimSpace(scanner.Text())
 			if strings.HasPrefix(line, "nameserver ") {
 				server := strings.TrimSpace(strings.TrimPrefix(line, "nameserver"))
-				// Add port if not specified
-				if !strings.Contains(server, ":") {
-					server += ":53"
-				}
-				servers = append(servers, server)
+				servers = appendDNSServer(servers, server)
 			}
 		}
 		if len(servers) > 0 {
@@ -66,14 +65,13 @@ func getHostDNSServers() []string {
 	}
 
 	// Fallback to system DNS resolution
-	config, err := net.DefaultResolver.LookupNS(context.Background(), ".")
+	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer lookupCancel()
+	config, err := net.DefaultResolver.LookupNS(lookupCtx, ".")
 	if err == nil && len(config) > 0 {
 		for _, ns := range config {
-			if !strings.Contains(ns.Host, ":") {
-				servers = append(servers, ns.Host+":53")
-			} else {
-				servers = append(servers, ns.Host)
-			}
+			host := strings.TrimSuffix(ns.Host, ".")
+			servers = appendDNSServer(servers, host)
 		}
 		if len(servers) > 0 {
 			return servers
@@ -83,6 +81,17 @@ func getHostDNSServers() []string {
 	// Final fallback to common public DNS
 	log.Println("warning: could not determine host DNS servers, falling back to 8.8.8.8:53")
 	return []string{"8.8.8.8:53"}
+}
+
+func appendDNSServer(servers []string, host string) []string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return servers
+	}
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		host = net.JoinHostPort(host, "53")
+	}
+	return append(servers, host)
 }
 
 func retryWithBackoff(ctx context.Context, maxRetries int, fn func() error) error {
@@ -111,7 +120,13 @@ func retry(ctx context.Context, maxRetries int, delay time.Duration, backoffFunc
 				backoff = backoffFunc(i)
 			}
 			log.Printf("attempt %d/%d failed, retrying in %v: %v", i+1, maxRetries, backoff, err)
-			time.Sleep(backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("context cancelled: %w", ctx.Err())
+			case <-timer.C:
+			}
 		}
 	}
 	return fmt.Errorf("failed after %d attempts: %w", maxRetries, err)
@@ -120,6 +135,7 @@ func retry(ctx context.Context, maxRetries int, delay time.Duration, backoffFunc
 func main() {
 	log.SetPrefix("tsdnsproxy: ")
 	hostinfo.SetApp("tsdnsproxy")
+	log.Printf("version %s", version)
 
 	var (
 		authKey       = flag.String("authkey", os.Getenv("TS_AUTHKEY"), "tailscale auth key")
@@ -186,6 +202,7 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
 	go func() {
 		for sig := range sigCh {
 			if sig == syscall.SIGHUP {
@@ -216,6 +233,9 @@ func main() {
 
 	*hostname = expandEnvRefs(*hostname)
 	*state = expandEnvRefs(*state)
+	if err := os.MkdirAll(*stateDir, 0o700); err != nil {
+		log.Printf("state dir %s: %v", *stateDir, err)
+	}
 
 	defaultServers := hostOrOverrideDNS(*overrideDNS)
 	needRoutes, err := needsTailnetRoutes(*acceptRoutes, explicitDialTailnet(dialMode), defaultServers, rules)
@@ -289,6 +309,8 @@ func main() {
 
 	whoisCache := cache.NewWhoisCache(*cacheExpiry)
 	grantCache := cache.NewGrantCache(*cacheExpiry)
+	defer whoisCache.Close()
+	defer grantCache.Close()
 
 	// Bare addresses use the default dialer. An explicit tailnet:// address
 	// uses the same tsnet dialer and also accepts subnet routes.

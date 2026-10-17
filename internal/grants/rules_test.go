@@ -304,6 +304,27 @@ func writeRules(t *testing.T, path, body string) {
 	}
 }
 
+func TestCurrentReturnsACopy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.json")
+	body := `{"example.internal":{"dns":["10.0.0.53:53"],"translateid":1,"allowips":["10.0.0.0/8"]}}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rf, err := OpenRulesFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := rf.Current()
+	if !ok {
+		t.Fatal("missing rules")
+	}
+	got["example.internal"] = DNSGrant{DNS: []string{"10.9.9.9:53"}}
+	again, _ := rf.Current()
+	if again["example.internal"].DNS[0] != "10.0.0.53:53" {
+		t.Fatalf("stored rules changed: %+v", again["example.internal"])
+	}
+}
+
 func currentTranslateID(t *testing.T, rf *RulesFile) int {
 	t.Helper()
 	cfg, ok := rf.Current()

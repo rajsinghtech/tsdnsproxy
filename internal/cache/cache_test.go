@@ -201,15 +201,9 @@ func TestGetOrSetConcurrency(t *testing.T) {
 
 	wg.Wait()
 
-	// Note: GetOrSet doesn't prevent multiple loaders from running concurrently
-	// if they all arrive before the first one completes. This is expected behavior
-	// for this simple cache implementation.
-	finalCount := loadCount.Load()
-	if finalCount == 0 {
-		t.Error("loader was never called")
+	if got := loadCount.Load(); got != 1 {
+		t.Fatalf("loader called %d times, want 1", got)
 	}
-	// Multiple loads are acceptable for this implementation
-	t.Logf("loader called %d times for %d goroutines", finalCount, numGoroutines)
 }
 
 func TestCleanup(t *testing.T) {
@@ -449,6 +443,16 @@ func BenchmarkCacheSet(b *testing.B) {
 			i++
 		}
 	})
+}
+
+func TestZeroTTLAndDoubleClose(t *testing.T) {
+	c := New[string, string](0)
+	c.Set("k", "v")
+	if _, ok := c.Get("k"); ok {
+		t.Fatal("zero ttl should not return a live entry")
+	}
+	c.Close()
+	c.Close()
 }
 
 func BenchmarkCacheGetOrSet(b *testing.B) {

@@ -83,7 +83,30 @@ func (r *RulesFile) Current() (GrantConfig, bool) {
 	if !r.loaded {
 		return nil, false
 	}
-	return r.rules, true
+	return cloneGrantConfig(r.rules), true
+}
+
+// cloneGrantConfig copies the map and its slices so a caller cannot
+// mutate the rules that are being served.
+func cloneGrantConfig(in GrantConfig) GrantConfig {
+	if in == nil {
+		return nil
+	}
+	out := make(GrantConfig, len(in))
+	for key, grant := range in {
+		grant.DNS = append([]string(nil), grant.DNS...)
+		grant.AllowIPs = append([]string(nil), grant.AllowIPs...)
+		grant.DenyIPs = append([]string(nil), grant.DenyIPs...)
+		if grant.IPNames != nil {
+			cp := *grant.IPNames
+			cp.AllowSrc = append([]string(nil), grant.IPNames.AllowSrc...)
+			cp.DirectSrc = append([]string(nil), grant.IPNames.DirectSrc...)
+			cp.AllowIPs = append([]string(nil), grant.IPNames.AllowIPs...)
+			grant.IPNames = &cp
+		}
+		out[key] = grant
+	}
+	return out
 }
 
 // Reload reads the file again. changed is false when the bytes are unchanged.

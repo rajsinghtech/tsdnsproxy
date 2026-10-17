@@ -77,6 +77,8 @@ type Server struct {
 	// Server's own grants loaded at startup
 	grantsMu     sync.RWMutex
 	serverGrants []grants.GrantConfig
+	grantsLoaded time.Time
+	selfIP       string
 }
 
 // Run starts both UDP and TCP DNS servers on the default Tailscale address
@@ -395,52 +397,48 @@ func (s *Server) runTCP(ctx context.Context, listenAddr string) error {
 	}()
 
 	s.Logf("listening on %s (TCP)", listenAddr)
-	go func() {
-		<-ctx.Done()
-		_ = listener.Close()
-	}()
 	return s.serveTCP(ctx, listener)
 }
 
 // serveTCP accepts connections until ctx is canceled.
 func (s *Server) serveTCP(ctx context.Context, listener net.Listener) error {
-	for {
-		select {
-		case <-ctx.Done():
-			s.waitForHandlers("TCP")
-			return ctx.Err()
-		default:
-		}
+	return s.serveAccept(ctx, "TCP", "tcp", listener)
+}
 
+// serveAccept accepts DNS connections until ctx is canceled.
+// Closing the listener on cancellation unblocks Accept.
+func (s *Server) serveAccept(ctx context.Context, label, via string, listener net.Listener) error {
+	stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
+	defer stop()
+
+	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
+				s.waitForHandlers(label)
 				return ctx.Err()
 			}
-			s.Logf("accept: %v", err)
+			s.Logf("%s accept: %v", label, err)
 			continue
 		}
 
-		// Try to acquire a worker slot
 		select {
 		case s.workerPool <- struct{}{}:
-			// Got a worker slot, handle connection
 			s.handlerWg.Add(1)
 			go func() {
 				defer func() {
 					if rec := recover(); rec != nil {
-						s.Logf("panic in tcp listener: %v\n%s", rec, debug.Stack())
+						s.Logf("panic in %s listener: %v\n%s", label, rec, debug.Stack())
 					}
-					<-s.workerPool // Release worker slot
+					<-s.workerPool
 					s.handlerWg.Done()
 				}()
-				s.handleTCPConnection(ctx, conn, "tcp")
+				s.handleTCPConnection(ctx, conn, via)
 			}()
 		default:
-			// Worker pool is full, close the connection
-			s.Logf("dropping TCP connection from %s: worker pool full", conn.RemoteAddr())
+			s.Logf("dropping %s connection from %s: worker pool full", label, conn.RemoteAddr())
 			if err := conn.Close(); err != nil {
-				s.Logf("failed to close TCP connection: %v", err)
+				s.Logf("failed to close connection: %v", err)
 			}
 		}
 	}
@@ -473,50 +471,7 @@ func (s *Server) runService(ctx context.Context, svc serviceConfig) error {
 	// Wrap the listener to parse PROXY protocol headers and recover the
 	// real peer tailnet IP for whois-based identity routing.
 	proxyLn := &proxyproto.Listener{Listener: ln.Listener}
-	defer func() {
-		if err := proxyLn.Close(); err != nil {
-			s.Logf("failed to close PROXY listener for %s: %v", svc.name, err)
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			s.waitForHandlers("service:" + svc.name)
-			return ctx.Err()
-		default:
-		}
-
-		conn, err := proxyLn.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			s.Logf("service %s accept: %v", svc.name, err)
-			continue
-		}
-
-		// Try to acquire a worker slot
-		select {
-		case s.workerPool <- struct{}{}:
-			s.handlerWg.Add(1)
-			go func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						s.Logf("panic in service listener: %v\n%s", rec, debug.Stack())
-					}
-					<-s.workerPool
-					s.handlerWg.Done()
-				}()
-				s.handleTCPConnection(ctx, conn, "service")
-			}()
-		default:
-			s.Logf("dropping service connection from %s: worker pool full", conn.RemoteAddr())
-			if err := conn.Close(); err != nil {
-				s.Logf("failed to close service connection: %v", err)
-			}
-		}
-	}
+	return s.serveAccept(ctx, "service:"+svc.name, "service", proxyLn)
 }
 
 // waitForHandlers waits for active handlers to complete
@@ -639,10 +594,7 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 		}
 		// For non-Tailscale clients, fall back to server's own grants
 		s.Logf("[v] whois failed for %s (%v), using server grants", host, err)
-		s.grantsMu.RLock()
-		serverGrants := s.serverGrants
-		s.grantsMu.RUnlock()
-		return serverGrants, nil
+		return s.serverGrantSnapshot(ctx), nil
 	}
 
 	identity := s.getIdentity(whois)
@@ -738,6 +690,8 @@ func (s *Server) loadServerGrants(ctx context.Context, status *ipnstate.Status) 
 
 	s.grantsMu.Lock()
 	s.serverGrants = grants
+	s.grantsLoaded = time.Now()
+	s.selfIP = selfIP
 	s.grantsMu.Unlock()
 	s.Logf("loaded %d grant configs from server capabilities", len(grants))
 	for _, gc := range grants {
@@ -747,6 +701,46 @@ func (s *Server) loadServerGrants(ctx context.Context, status *ipnstate.Status) 
 	}
 
 	return nil
+}
+
+func (s *Server) serverGrantSnapshot(ctx context.Context) []grants.GrantConfig {
+	s.maybeRefreshServerGrants(ctx)
+	s.grantsMu.RLock()
+	defer s.grantsMu.RUnlock()
+	return s.serverGrants
+}
+
+func (s *Server) maybeRefreshServerGrants(ctx context.Context) {
+	if s == nil || s.LocalClient == nil || s.GrantParser == nil {
+		return
+	}
+	ttl := 5 * time.Minute
+	if s.WhoisCache != nil && s.WhoisCache.TTL() > 0 {
+		ttl = s.WhoisCache.TTL()
+	}
+	s.grantsMu.Lock()
+	if s.selfIP == "" || time.Since(s.grantsLoaded) < ttl {
+		s.grantsMu.Unlock()
+		return
+	}
+	ip := s.selfIP
+	s.grantsLoaded = time.Now()
+	s.grantsMu.Unlock()
+
+	whois, err := s.LocalClient.WhoIs(ctx, ip)
+	if err != nil {
+		s.Logf("refresh server grants: %v", err)
+		return
+	}
+	parsed, err := s.GrantParser.ParseGrants(whois.CapMap)
+	if err != nil {
+		s.Logf("refresh server grants: %v", err)
+		return
+	}
+	s.grantsMu.Lock()
+	s.serverGrants = parsed
+	s.grantsMu.Unlock()
+	s.Logf("refreshed %d server grant configs", len(parsed))
 }
 
 func sourceAddr(addr net.Addr) netip.Addr {

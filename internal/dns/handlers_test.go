@@ -17,6 +17,24 @@ import (
 	"tailscale.com/tailcfg"
 )
 
+func TestServeAcceptStopsWhenCanceled(t *testing.T) {
+	server := &Server{workerPool: make(chan struct{}, 1), Logf: t.Logf}
+	ln := newFakeListener()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.serveAccept(ctx, "TCP", "tcp", ln) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("serveAccept: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("serveAccept did not return")
+	}
+}
+
 func TestServeUDPWithFakeConn(t *testing.T) {
 	server := serverWithGrants(t, []grants.GrantConfig{{
 		"test.local": {DNS: []string{"10.0.0.1:53"}, TranslateID: translateID(-1)},

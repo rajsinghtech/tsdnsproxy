@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -10,10 +11,18 @@ import (
 
 // Cache is a generic time-based cache with automatic cleanup
 type Cache[K comparable, V any] struct {
-	mu      sync.RWMutex
-	entries map[K]*entry[V]
-	ttl     time.Duration
-	done    chan struct{}
+	mu        sync.RWMutex
+	entries   map[K]*entry[V]
+	inflight  map[K]*flight[V]
+	ttl       time.Duration
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+type flight[V any] struct {
+	done chan struct{}
+	val  V
+	err  error
 }
 
 type entry[V any] struct {
@@ -24,12 +33,23 @@ type entry[V any] struct {
 // New creates a new cache with the specified TTL
 func New[K comparable, V any](ttl time.Duration) *Cache[K, V] {
 	c := &Cache[K, V]{
-		entries: make(map[K]*entry[V]),
-		ttl:     ttl,
-		done:    make(chan struct{}),
+		entries:  make(map[K]*entry[V]),
+		inflight: make(map[K]*flight[V]),
+		ttl:      ttl,
+		done:     make(chan struct{}),
 	}
-	go c.cleanup()
+	if ttl > 0 {
+		go c.cleanup()
+	}
 	return c
+}
+
+// TTL returns the lifetime of a cached value.
+func (c *Cache[K, V]) TTL() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return c.ttl
 }
 
 // Get retrieves a value from cache
@@ -39,7 +59,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 
 	var zero V
 	e, exists := c.entries[key]
-	if !exists || time.Now().After(e.expiry) {
+	if !exists || !time.Now().Before(e.expiry) {
 		return zero, false
 	}
 	return e.value, true
@@ -56,45 +76,55 @@ func (c *Cache[K, V]) Set(key K, value V) {
 	}
 }
 
-// GetOrSet atomically gets from cache or sets if not present
+// GetOrSet atomically gets from cache or sets if not present.
+// Concurrent callers for the same key share one loader call.
 func (c *Cache[K, V]) GetOrSet(key K, loader func() (V, error)) (V, error) {
-	// Fast path with read lock
-	c.mu.RLock()
-	if e, exists := c.entries[key]; exists && time.Now().Before(e.expiry) {
-		value := e.value
-		c.mu.RUnlock()
-		return value, nil
-	}
-	c.mu.RUnlock()
-
-	// Need to load - acquire write lock
 	c.mu.Lock()
-	// Double-check in case another goroutine loaded it
 	if e, exists := c.entries[key]; exists && time.Now().Before(e.expiry) {
 		value := e.value
 		c.mu.Unlock()
 		return value, nil
 	}
-
-	// Release lock while loading to avoid blocking other operations
+	if f, ok := c.inflight[key]; ok {
+		c.mu.Unlock()
+		<-f.done
+		return f.val, f.err
+	}
+	f := &flight[V]{done: make(chan struct{})}
+	c.inflight[key] = f
 	c.mu.Unlock()
 
-	// Load the value without holding the lock
-	value, err := loader()
-	if err != nil {
+	// A panicking loader must still release waiters, then panic again so the
+	// caller can answer the query.
+	panicked := true
+	defer func() {
+		if !panicked {
+			return
+		}
+		rec := recover()
 		var zero V
-		return zero, err
-	}
+		c.completeFlight(key, f, zero, fmt.Errorf("loader panic: %v", rec))
+		panic(rec)
+	}()
+	value, err := loader()
+	panicked = false
+	c.completeFlight(key, f, value, err)
+	return value, err
+}
 
-	// Re-acquire lock to cache the result
+func (c *Cache[K, V]) completeFlight(key K, f *flight[V], value V, err error) {
 	c.mu.Lock()
-	c.entries[key] = &entry[V]{
-		value:  value,
-		expiry: time.Now().Add(c.ttl),
+	if err == nil {
+		c.entries[key] = &entry[V]{
+			value:  value,
+			expiry: time.Now().Add(c.ttl),
+		}
 	}
+	delete(c.inflight, key)
 	c.mu.Unlock()
-
-	return value, nil
+	f.val = value
+	f.err = err
+	close(f.done)
 }
 
 func (c *Cache[K, V]) cleanup() {
@@ -118,9 +148,12 @@ func (c *Cache[K, V]) cleanup() {
 	}
 }
 
-// Close stops the cleanup goroutine
+// Close stops the cleanup goroutine. It is safe to call more than once.
 func (c *Cache[K, V]) Close() {
-	close(c.done)
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() { close(c.done) })
 }
 
 // WhoisCache caches whois lookups to reduce LocalAPI calls
