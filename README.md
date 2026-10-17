@@ -245,6 +245,32 @@ MagicDNS and split DNS do not always fall back to TCP when the nameserver is tha
 
 Point split DNS at the node address when clients only send UDP. Point TCP clients at `dns.example.ts.net`.
 
+### Several replicas, one service
+
+More than one pod can host `svc:dns`. Each one advertises the same service, so clients keep the VIP and `dns.example.ts.net` while a pod is replaced. Each pod still needs its own node identity. Share the service name, and do not share the hostname or the state Secret.
+
+`k8s/service-ha.yaml` is a StatefulSet. `POD_NAME` comes from the downward API (`metadata.name`). Kubernetes replaces `$(POD_NAME)` in later env vars. The process also expands `$POD_NAME`, `${POD_NAME}`, and `$(POD_NAME)` if that text is still present when it starts.
+
+Service mode uses these variables:
+
+```text
+POD_NAME=metadata.name
+TSDNSPROXY_SERVICE=svc:dns
+TSDNSPROXY_ADVERTISE_TAGS=tag:tsdnsproxy
+TSDNSPROXY_LISTEN_ADDRS=tailscale
+TSDNSPROXY_HOSTNAME=$(POD_NAME)
+TSDNSPROXY_STATE=kube:tsdnsproxy-state-$(POD_NAME)
+TS_AUTHKEY=<reusable tagged key>
+```
+
+`TSDNSPROXY_LISTEN_ADDRS=tailscale` keeps UDP 53 on that pod's own Tailscale address. `TSDNSPROXY_SERVICE` is the shared TCP listener. The hostname has to differ per pod, or the nodes collide. The auth key has to be reusable and tagged `tag:tsdnsproxy`, because every replica logs in. A one-time ephemeral key cannot start the second pod.
+
+The policy is the same one in the example above: `tagOwners` owns `tag:tsdnsproxy`, `autoApprovers.services` lets that tag host `svc:dns`, and clients have a grant to `svc:dns` port 53. In the admin console, define the service as name `svc:dns` with endpoint `tcp:53`. Every replica must advertise that port. There is no UDP endpoint on the service.
+
+A StatefulSet pod is named `tsdnsproxy-0`, `tsdnsproxy-1`, and so on. The state Secrets are `tsdnsproxy-state-tsdnsproxy-0` and `tsdnsproxy-state-tsdnsproxy-1`. The Role lists those names for get, update, and patch. Create stays open because the Secret is created on first write. Add a name to the Role when you add a replica.
+
+A Deployment pod name is assigned at schedule time (`tsdnsproxy-xxxxx-yyyyy`), so the Secret name is not known when you write the Role. `resourceNames` cannot list it. Granting get, update, and patch on every Secret in the namespace lets the pods store state, and it also lets them read Secrets that are not theirs. Use the StatefulSet when you want the Role limited to the state Secrets.
+
 ## Domain Matching
 
 Domains in grants act as wildcards:

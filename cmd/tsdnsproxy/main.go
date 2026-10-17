@@ -208,6 +208,9 @@ func main() {
 		go rules.Watch(ctx, grants.RulesPollInterval)
 	}
 
+	*hostname = expandEnvRefs(*hostname)
+	*state = expandEnvRefs(*state)
+
 	s := &tsnet.Server{
 		Dir:      *stateDir,
 		Hostname: *hostname,
