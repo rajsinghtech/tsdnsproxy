@@ -76,11 +76,11 @@ func (m *mockBackendManager) Query(ctx context.Context, backends []backend.Backe
 
 func translateID(v int) *int { return &v }
 
-func (m *mockBackendManager) CreateBackends(servers []string) []backend.Backend {
+func (m *mockBackendManager) CreateBackends(servers []string) ([]backend.Backend, error) {
 	if m.backend != nil {
-		return []backend.Backend{m.backend}
+		return []backend.Backend{m.backend}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 func TestServer_unrewriteResponse(t *testing.T) {

@@ -37,6 +37,7 @@ jobs:
       - name: Fuzz
         run: |
           go test -fuzz=FuzzParseDashedIPv4 -fuzztime=10s ./internal/ipnames/
+          go test -fuzz=FuzzParseEndpoint -fuzztime=10s ./internal/backend/
           go test -fuzz=FuzzProcessQuery -fuzztime=10s ./internal/dns/
       - name: Run linter
         uses: golangci/golangci-lint-action@v9

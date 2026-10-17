@@ -159,11 +159,12 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TSDNSPROXY_HOSTNAME`: Hostname on tailnet (default: `tsdnsproxy`)
 - `TSDNSPROXY_STATE_DIR`: State directory (default: `/var/lib/tsdnsproxy`)
 - `TSDNSPROXY_STATE`: State storage backend. `kube:secret-name` stores state in that Kubernetes Secret. The ServiceAccount needs a Role with get, update, and patch on that named Secret, plus create on Secrets. An `arn:` value selects AWS SSM.
-- `TSDNSPROXY_OVERRIDE_DNS`: Override host DNS servers (comma-separated, defaults to host's resolvers)
+- `TSDNSPROXY_OVERRIDE_DNS`: Override host DNS servers (comma-separated, defaults to host's resolvers). Each entry may be `10.0.0.53:53`, `tailnet://10.0.0.53:53`, or `direct://10.0.0.53:53`
+- `TSDNSPROXY_DIAL`: Default dial mode for a bare backend address: `tailnet` or `direct` (default: `tailnet`)
 - `TSDNSPROXY_LISTEN_ADDRS`: Listen addresses (default: `tailscale`) - see Network Configuration
 - `TSDNSPROXY_SERVICE`: Tailscale Service to host (`-service`), for example `svc:dns`. This is TCP port 53 unless the value ends in `@port`
 - `TSDNSPROXY_HEALTH_ADDR`: Health check endpoint address (default: `:8080`)
-- `TSDNSPROXY_ACCEPT_ROUTES`: Accept subnet routes and query DNS over tailnet (default: `false`)
+- `TSDNSPROXY_ACCEPT_ROUTES`: Accept subnet routes (default: `false`). Also turned on by an explicit `-dial tailnet` or a `tailnet://` backend
 - `TSDNSPROXY_ADVERTISE_TAGS`: ACL tags to advertise (comma-separated, default: none)
 - `TSDNSPROXY_CAP_NAME`: Capability name for DNS grants (`-cap-name`, default: `rajsingh.info/cap/tsdnsproxy`). Set this to a domain and path such as `example.com/cap/dns` to match a different ACL grant key. Other capability names are ignored. An `http://` or `https://` prefix is also accepted.
 - `TSDNSPROXY_VERBOSE`: Enable verbose logging (default: `false`)
@@ -181,7 +182,8 @@ tsdnsproxy \
   -listen-addrs tailscale \
   -statedir /var/lib/tsdnsproxy \
   -state kube:tsdnsproxy-state \
-  -override-dns 8.8.8.8:53,8.8.4.4:53 \
+  -override-dns 10.0.0.53:53,direct://10.0.0.53:53 \
+  -dial tailnet \
   -rules-file /etc/tsdnsproxy/rules.json \
   -cache-expiry 5m \
   -health-addr :8080 \
@@ -189,7 +191,32 @@ tsdnsproxy \
   -verbose
 ```
 
+### Backend dialing
+
+A bare backend address uses `-dial` (`TSDNSPROXY_DIAL`). The default is `tailnet`, which dials with `tsnet.Server.Dial`, the same as earlier builds. `direct` dials on the host network. The prefix on one address wins over the default. Both TCP and UDP use the selected dialer. The query tries TCP first, then UDP.
+
+```bash
+-dial tailnet \
+-override-dns 10.0.0.53:53,direct://10.0.0.53:53
+```
+
+The same strings go in a rules file or an ACL grant:
+
+```json
+{
+  "example.internal": {
+    "dns": ["10.0.0.53:53", "tailnet://10.0.0.53:53", "direct://10.0.0.53:53"],
+    "translateid": 1
+  }
+}
+```
+
+`tailnet://10.0.0.53` is port 53. `ftp://10.0.0.53:53` is rejected.
+
+A bare address under the default `tailnet` dial does not accept subnet routes. tsdnsproxy sets `RouteAll` with LocalAPI `EditPrefs` only in three cases: `-accept-routes` is set, `-dial tailnet` or `TSDNSPROXY_DIAL=tailnet` is set explicitly, or a backend uses the `tailnet://` prefix. Writing the flag counts as explicit. Leaving it off keeps the tailnet dial and leaves routes alone. A rules file or grant that adds `tailnet://` accepts routes on the first dial of that backend. When routes are required at startup, they are requested before the node comes up and again after it is up. Startup exits if that second attempt fails.
+
 ### Tailscale Service
+
 
 `-service svc:dns` (or `TSDNSPROXY_SERVICE`) hosts DNS over TCP on the
 service VIP. UDP 53 stays on the node's own Tailscale address
@@ -468,16 +495,16 @@ Different teams see different DNS results:
 
 ### Split-Horizon DNS over 4via6
 
-Forwarding DNS queries over 4via6 allows DNS servers to run on overlapping IP or CIDR ranges. Enable `TSDNSPROXY_ACCEPT_ROUTES` to accept the 4via6 subnets (this also enables the TS dialer).
+Forwarding DNS queries over 4via6 allows DNS servers to run on overlapping IP or CIDR ranges. Mark those backends `tailnet://`, or set `-dial tailnet`. Either one accepts subnet routes. A bare address with the default dial does not.
 
 ```json
 {
   "site1.vpc": {
-    "dns": ["[fd7a:115c:a1e0:b1a:0:1:a0f:2]:53"],
+    "dns": ["tailnet://[fd7a:115c:a1e0:b1a:0:1:a0f:2]:53"],
     "translateid": 1
   },
   "site2.vpc": {
-    "dns": ["[fd7a:115c:a1e0:b1a:0:2:a0f:2]:53"],
+    "dns": ["tailnet://[fd7a:115c:a1e0:b1a:0:2:a0f:2]:53"],
     "translateid": 2
   }
 }

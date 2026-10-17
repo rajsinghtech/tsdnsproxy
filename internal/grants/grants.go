@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 
+	"github.com/rajsinghtech/tsdnsproxy/internal/backend"
 	"github.com/rajsinghtech/tsdnsproxy/internal/cidr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tailcfg/peercap"
@@ -252,10 +253,13 @@ func (p *Parser) validateGrant(grant GrantConfig) error {
 			grant[domain] = dnsGrant
 		}
 
-		// Validate DNS server addresses
+		// Validate DNS server addresses. bare, direct://, and tailnet:// are allowed.
 		for _, server := range dnsGrant.DNS {
 			if server == "" {
 				return fmt.Errorf("empty DNS server in grant for %s", domain)
+			}
+			if _, err := backend.ParseEndpoint(server, backend.DialDirect); err != nil {
+				return fmt.Errorf("dns server %q for %s: %w", server, domain, err)
 			}
 		}
 

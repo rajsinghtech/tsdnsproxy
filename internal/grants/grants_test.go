@@ -3,6 +3,7 @@ package grants
 import (
 	"encoding/json"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"tailscale.com/tailcfg"
@@ -622,6 +623,25 @@ func TestPrefixRulesAndFilters(t *testing.T) {
 	}
 	if _, _, ok := p.MatchPrefix(netip.MustParseAddr("192.0.2.1"), []GrantConfig{cfg}); ok {
 		t.Fatal("unexpected prefix match")
+	}
+}
+
+func TestValidateGrantBackendDial(t *testing.T) {
+	p := NewParser()
+	err := p.validateGrant(GrantConfig{
+		"example.internal": {
+			DNS:         []string{"tailnet://10.0.0.53:53", "direct://10.0.0.53", "10.0.0.53:53"},
+			TranslateID: tid(1),
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = p.validateGrant(GrantConfig{
+		"example.internal": {DNS: []string{"ftp://10.0.0.53:53"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "scheme") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -132,7 +133,8 @@ func main() {
 		healthAddr    = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
 		listenAddrs   = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
 		service       = flag.String("service", envOr("TSDNSPROXY_SERVICE", ""), "Tailscale Service to host, for example svc:dns (TCP 53)")
-		acceptRoutes  = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes and use TS dialer")
+		acceptRoutes  = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes (also implied by an explicit tailnet dial)")
+		dialModeFlag  = flag.String("dial", envOr("TSDNSPROXY_DIAL", "tailnet"), "default backend dial mode: tailnet or direct (host network)")
 		verbose       = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
 		capName       = flag.String("cap-name", envOr("TSDNSPROXY_CAP_NAME", grants.DefaultCapName), "capability name for DNS grants (domain/path)")
 		rulesFile     = flag.String("rules-file", os.Getenv("TSDNSPROXY_RULES_FILE"), "JSON or HuJSON rules file applied to every client")
@@ -144,6 +146,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid cap-name: %v", err)
 	}
+	dialMode, err := backend.ParseDialMode(*dialModeFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Log configuration for debugging
 	hostedService, err := dns.ParseHostedService(*service)
@@ -154,8 +160,8 @@ func main() {
 		log.Fatal("advertise-tags is required to host a Tailscale Service (set -advertise-tags or TSDNSPROXY_ADVERTISE_TAGS)")
 	}
 
-	log.Printf("configuration: accept-routes=%v (env=%q), verbose=%v, listen-addrs=%q, service=%q, cap-name=%q, rules-file=%q, rules-only=%v",
-		*acceptRoutes, os.Getenv("TSDNSPROXY_ACCEPT_ROUTES"),
+	log.Printf("configuration: accept-routes=%v (env=%q), dial=%s, verbose=%v, listen-addrs=%q, service=%q, cap-name=%q, rules-file=%q, rules-only=%v",
+		*acceptRoutes, os.Getenv("TSDNSPROXY_ACCEPT_ROUTES"), dialMode,
 		*verbose, *listenAddrs, hostedService.Name, grantParser.CapName(), *rulesFile, *rulesOnly)
 
 	if *authKey == "" {
@@ -211,6 +217,13 @@ func main() {
 	*hostname = expandEnvRefs(*hostname)
 	*state = expandEnvRefs(*state)
 
+	defaultServers := hostOrOverrideDNS(*overrideDNS)
+	needRoutes, err := needsTailnetRoutes(*acceptRoutes, explicitDialTailnet(dialMode), defaultServers, rules)
+	if err != nil {
+		log.Fatalf("backend dial: %v", err)
+	}
+	log.Printf("using DNS servers: %v (dial=%s, tailnet-routes=%v)", defaultServers, dialMode, needRoutes)
+
 	s := &tsnet.Server{
 		Dir:      *stateDir,
 		Hostname: *hostname,
@@ -261,40 +274,33 @@ func main() {
 		// LocalClient might become available later, but we'll continue
 	}
 
+	routes := &routeGate{}
+	if lc != nil {
+		routes.SetClient(lc)
+	}
 	// Enable RouteAll BEFORE calling Up() so subnet routes are accepted
-	// in the initial WireGuard configuration
-	if *acceptRoutes && lc != nil {
+	// in the initial WireGuard configuration. A failure here is retried after Up.
+	if needRoutes && lc != nil {
 		log.Print("enabling accept-routes before tailnet up...")
 		if err := enableAcceptRoutes(ctx, lc); err != nil {
 			log.Printf("warning: failed to enable routes early: %v", err)
-			// Continue anyway, we'll try again after Up()
 		}
 	}
 
 	whoisCache := cache.NewWhoisCache(*cacheExpiry)
 	grantCache := cache.NewGrantCache(*cacheExpiry)
 
-	var defaultServers []string
-	if *overrideDNS != "" {
-		// Use override DNS servers if specified
-		defaultServers = strings.Split(*overrideDNS, ",")
-		for i := range defaultServers {
-			defaultServers[i] = strings.TrimSpace(defaultServers[i])
-		}
-		log.Printf("using override DNS servers: %v", defaultServers)
-	} else {
-		// Default to host's DNS resolvers
-		defaultServers = getHostDNSServers()
-		log.Printf("using host DNS servers: %v", defaultServers)
+	// Bare addresses use the default dialer. An explicit tailnet:// address
+	// uses the same tsnet dialer and also accepts subnet routes.
+	backendMgr, err := backend.NewManager(defaultServers, backend.Dialers{
+		Direct:        backend.HostDialer(),
+		Tailnet:       s,
+		TailnetRoutes: backend.NewEnsuringDialer(s, routes.Ensure),
+		Default:       dialMode,
+	}, logf(*verbose))
+	if err != nil {
+		log.Fatalf("backend dial: %v", err)
 	}
-
-	// tsnet.Server.Dial natively resolves MagicDNS hostnames via its
-	// internal resolver (resolveMemory) before dialing through the
-	// tailnet. No custom resolution wrapper is needed.
-	log.Printf("using ts dialer to query DNS over tailnet")
-	var dnsDialer backend.DNSDialer = s
-
-	backendMgr := backend.NewManager(defaultServers, dnsDialer, logf(*verbose))
 	defer backendMgr.Close()
 
 	log.Printf("waiting for tailnet...")
@@ -324,14 +330,13 @@ func main() {
 			log.Fatalf("LocalClient still not available after Up: %v", err)
 		}
 	}
+	routes.SetClient(lc)
 
-	if *acceptRoutes {
+	if needRoutes {
 		log.Print("accepting subnet routes...")
-
-		if err := enableAcceptRoutes(ctx, lc); err != nil {
+		if err := routes.Ensure(ctx); err != nil {
 			log.Fatalf("failed to enable accepting routes: %v", err)
 		}
-
 	}
 
 	// Log peer status to help diagnose subnet route issues
@@ -376,6 +381,90 @@ func main() {
 	if err := healthServer.Shutdown(ctx2); err != nil {
 		log.Printf("health shutdown: %v", err)
 	}
+}
+
+func hostOrOverrideDNS(override string) []string {
+	if override == "" {
+		servers := getHostDNSServers()
+		log.Printf("using host DNS servers: %v", servers)
+		return servers
+	}
+	var servers []string
+	for _, server := range strings.Split(override, ",") {
+		server = strings.TrimSpace(server)
+		if server != "" {
+			servers = append(servers, server)
+		}
+	}
+	log.Printf("using override DNS servers: %v", servers)
+	return servers
+}
+
+// explicitDialTailnet reports whether the operator set -dial or
+// TSDNSPROXY_DIAL to tailnet. The built-in default does not count.
+func explicitDialTailnet(mode backend.DialMode) bool {
+	if mode != backend.DialTailnet {
+		return false
+	}
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "dial" {
+			set = true
+		}
+	})
+	if set {
+		return true
+	}
+	_, ok := os.LookupEnv("TSDNSPROXY_DIAL")
+	return ok
+}
+
+func needsTailnetRoutes(accept, explicitDial bool, defaults []string, rules *grants.RulesFile) (bool, error) {
+	if accept || explicitDial {
+		return true, nil
+	}
+	need, err := backend.ExplicitTailnet(defaults)
+	if err != nil || need || rules == nil {
+		return need, err
+	}
+	cfg, ok := rules.Current()
+	if !ok {
+		return false, nil
+	}
+	var dns []string
+	for _, grant := range cfg {
+		dns = append(dns, grant.DNS...)
+	}
+	return backend.ExplicitTailnet(dns)
+}
+
+// routeGate turns on subnet routes once, and retries when a previous attempt failed.
+type routeGate struct {
+	mu sync.Mutex
+	lc *local.Client
+	on bool
+}
+
+func (g *routeGate) SetClient(lc *local.Client) {
+	g.mu.Lock()
+	g.lc = lc
+	g.mu.Unlock()
+}
+
+func (g *routeGate) Ensure(ctx context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.on {
+		return nil
+	}
+	if g.lc == nil {
+		return fmt.Errorf("tailnet local client is not available")
+	}
+	if err := enableAcceptRoutes(ctx, g.lc); err != nil {
+		return err
+	}
+	g.on = true
+	return nil
 }
 
 // Enable --accept-routes to be able to route DNS traffic via subnet routes in tailnet
