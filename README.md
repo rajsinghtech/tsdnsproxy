@@ -10,14 +10,15 @@ A DNS proxy server for Tailscale networks that enables per-identity DNS routing,
 - **Backend failover**: Automatic failover between multiple DNS backends with health checking
 - **Kubernetes support**: Native state storage in Kubernetes Secrets
 - **Grant-based configuration**: Configure behavior through Tailscale ACL grants
+- **Rules file**: Apply the same DNS rules to every client from a JSON or HuJSON file, without ACL grants
 
 ## How It Works
 
 tsdnsproxy runs as a tsnet application on your tailnet, listening on configurable addresses (default: Tailscale IP port 53). When it receives DNS requests:
 
-1. Identifies the requesting node using LocalAPI whois
-2. Retrieves DNS grants from the configured capability on the node
-3. Matches the query domain against grant rules
+1. Identifies the requesting node using LocalAPI whois and logs the caller
+2. Loads rules from the rules file, when one is configured, and DNS grants from the configured capability on the node
+3. Matches the query domain against those rules. An ACL grant wins for a domain it defines unless rules-only is set
 4. Applies configured transformations (rewrite, backend selection)
 5. Forwards the query to the appropriate backend
 6. Optionally translates IPv4 responses to 4via6 IPv6 addresses
@@ -61,6 +62,36 @@ Configure DNS behavior through Tailscale ACL grants. The capability name default
 }
 ```
 
+## Rules file
+
+ACL grants are per identity. A rules file applies one set of rules to every client, so the proxy can run without grant capabilities.
+
+`-rules-file` (`TSDNSPROXY_RULES_FILE`) points at a JSON or HuJSON file. HuJSON is JSON with comments and trailing commas. The file has the same shape as one grant value: a map of domain to `dns`, `rewrite`, `translateid`, `allowips`, `denyips`, and `ipnames`.
+
+```bash
+tsdnsproxy -authkey tskey-auth-YOUR-KEY -rules-file /etc/tsdnsproxy/rules.json
+```
+
+```json
+{
+  "example.internal": {
+    "dns": ["10.0.0.53:53"],
+    "translateid": 1,
+    "allowips": ["10.0.0.0/8"]
+  }
+}
+```
+
+With that rule, an address `10.0.0.1` is translated with site id 1. An A query returns no A record. The AAAA answer is `fd7a:115c:a1e0:b1a:0:1:a00:1`.
+
+Whois still runs, and the caller is logged when verbose logging is on. Whois is not required to authorize the query. If it fails, the file rules are used anyway.
+
+When the client also has ACL grants, the grant wins for any domain or CIDR it defines. The file still answers names the grant does not mention. `-rules-only` (`TSDNSPROXY_RULES_ONLY=true`) ignores ACL grants and uses the file alone. `-rules-only` requires a rules file.
+
+The file is validated at startup. The process exits if it is missing, unreadable, or contains a rule that would be rejected as a grant. Send `SIGHUP`, or replace the file, to reload it. A bad reload keeps the previous rules and logs the error. Write the file by renaming it into place so a reader never sees a partial document.
+
+The Kubernetes manifest mounts a ConfigMap at `/etc/tsdnsproxy/rules.json` and sets `TSDNSPROXY_RULES_FILE`.
+
 ## Installation
 
 ### Docker
@@ -85,6 +116,8 @@ Release images are tagged with the version and no leading `v` (`1.1.5`), and tha
 ```bash
 kubectl apply -k k8s/
 ```
+
+`k8s/deployment.yaml` includes a ConfigMap mounted at `/etc/tsdnsproxy/rules.json`. Edit that ConfigMap to change the rules. The proxy reloads the file when it changes.
 
 Or with kustomize:
 
@@ -115,6 +148,8 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TSDNSPROXY_ADVERTISE_TAGS`: ACL tags to advertise (comma-separated, default: none)
 - `TSDNSPROXY_CAP_NAME`: Capability name for DNS grants (`-cap-name`, default: `rajsingh.info/cap/tsdnsproxy`). Set this to a domain and path such as `example.com/cap/dns` to match a different ACL grant key. Other capability names are ignored. An `http://` or `https://` prefix is also accepted.
 - `TSDNSPROXY_VERBOSE`: Enable verbose logging (default: `false`)
+- `TSDNSPROXY_RULES_FILE`: Path to a JSON or HuJSON rules file applied to every client
+- `TSDNSPROXY_RULES_ONLY`: Ignore ACL grants and use only the rules file (default: `false`)
 
 ### Command Line Flags
 
@@ -126,6 +161,7 @@ tsdnsproxy \
   -statedir /var/lib/tsdnsproxy \
   -state kube:tsdnsproxy-state \
   -override-dns 8.8.8.8:53,8.8.4.4:53 \
+  -rules-file /etc/tsdnsproxy/rules.json \
   -cache-expiry 5m \
   -health-addr :8080 \
   -cap-name rajsingh.info/cap/tsdnsproxy \

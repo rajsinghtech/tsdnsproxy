@@ -36,6 +36,23 @@ subjects:
   name: tsdnsproxy
   namespace: tsdnsproxy
 ---
+# Rules applied to every client. Same shape as one grant value.
+# An ACL grant for the same domain wins unless TSDNSPROXY_RULES_ONLY=true.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tsdnsproxy-rules
+  namespace: tsdnsproxy
+data:
+  rules.json: |
+    {
+      "example.internal": {
+        "dns": ["10.0.0.53:53"],
+        "translateid": 1,
+        "allowips": ["10.0.0.0/8"]
+      }
+    }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -87,6 +104,8 @@ spec:
         # when the ACL grant key is not the default.
         - name: TSDNSPROXY_CAP_NAME
           value: "rajsingh.info/cap/tsdnsproxy"
+        - name: TSDNSPROXY_RULES_FILE
+          value: /etc/tsdnsproxy/rules.json
         - name: TS_AUTHKEY
           valueFrom:
             secretKeyRef:
@@ -122,3 +141,11 @@ spec:
             - ALL
             add:
             - NET_BIND_SERVICE
+        volumeMounts:
+        - name: rules
+          mountPath: /etc/tsdnsproxy
+          readOnly: true
+      volumes:
+      - name: rules
+        configMap:
+          name: tsdnsproxy-rules

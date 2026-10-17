@@ -51,6 +51,11 @@ type Server struct {
 	BackendMgr  BackendManager
 	Logf        func(format string, args ...any)
 
+	// Rules, when loaded, apply to every client.
+	// RulesOnly ignores ACL grants and uses the file alone.
+	Rules     *grants.RulesFile
+	RulesOnly bool
+
 	// Worker pool for handling queries
 	workerPool chan struct{}
 
@@ -535,7 +540,10 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 		return nil, fmt.Errorf("parse address: %w", err)
 	}
 
-	// Get whois info atomically to prevent duplicate lookups
+	fileRules, hasRules := s.fileRules()
+
+	// Get whois info atomically to prevent duplicate lookups.
+	// A rules file does not need whois to authorize the query, but the caller is still logged.
 	whois, err := s.WhoisCache.GetOrSet(host, func() (*apitype.WhoIsResponse, error) {
 		// Perform whois lookup with timeout
 		whoisCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -543,6 +551,10 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 		return s.LocalClient.WhoIs(whoisCtx, host)
 	})
 	if err != nil {
+		if hasRules {
+			s.Logf("[v] whois failed for %s (%v), using rules file", host, err)
+			return grants.ApplyRules(fileRules, nil, s.RulesOnly), nil
+		}
 		// For non-Tailscale clients, fall back to server's own grants
 		s.Logf("[v] whois failed for %s (%v), using server grants", host, err)
 		s.grantsMu.RLock()
@@ -561,24 +573,41 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 	}
 	s.Logf("[v] client capabilities: %+v", whois.CapMap)
 
+	if hasRules && s.RulesOnly {
+		s.Logf("[v] rules-only: using rules file for %s", identity)
+		return grants.ApplyRules(fileRules, nil, true), nil
+	}
+
+	// Cache ACL grants under the capability that produced them.
+	// The rules file is merged after the lookup so a reload applies on the next query.
 	cacheKey := s.grantCacheKey(identity)
 	cachedGrants, cached := s.GrantCache.Get(cacheKey)
+	var parsed []grants.GrantConfig
 	if cached {
 		s.Logf("[v] using cached grants for %s: %d configs", identity, len(cachedGrants))
-		return cachedGrants, nil
+		parsed = cachedGrants
+	} else {
+		var parseErr error
+		parsed, parseErr = s.GrantParser.ParseGrants(whois.CapMap)
+		if parseErr != nil {
+			return nil, fmt.Errorf("parse grants: %w", parseErr)
+		}
+		s.Logf("[v] parsed %d grant configs for client %s from %s", len(parsed), identity, cacheKey.CapName)
+		s.GrantCache.Set(cacheKey, parsed)
 	}
 
-	// Parse grants from the configured capability on the whois CapMap.
-	parsedGrants, err := s.GrantParser.ParseGrants(whois.CapMap)
-	if err != nil {
-		return nil, fmt.Errorf("parse grants: %w", err)
+	if !hasRules {
+		return parsed, nil
 	}
-	s.Logf("[v] parsed %d grant configs for client %s from %s", len(parsedGrants), identity, cacheKey.CapName)
+	s.Logf("[v] merging rules file with %d grant configs for %s", len(parsed), identity)
+	return grants.ApplyRules(fileRules, parsed, false), nil
+}
 
-	// Cache grants under the capability that produced them.
-	s.GrantCache.Set(cacheKey, parsedGrants)
-
-	return parsedGrants, nil
+func (s *Server) fileRules() (grants.GrantConfig, bool) {
+	if s.Rules == nil {
+		return nil, false
+	}
+	return s.Rules.Current()
 }
 
 // grantCacheKey scopes cached grants to the capability the parser reads.
