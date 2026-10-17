@@ -131,13 +131,19 @@ func main() {
 		listenAddrs   = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
 		acceptRoutes  = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes and use TS dialer")
 		verbose       = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
+		capName       = flag.String("cap-name", envOr("TSDNSPROXY_CAP_NAME", grants.DefaultCapName), "capability name for DNS grants (domain/path)")
 	)
 	flag.Parse()
 
+	grantParser, err := grants.NewParserWithName(*capName)
+	if err != nil {
+		log.Fatalf("invalid cap-name: %v", err)
+	}
+
 	// Log configuration for debugging
-	log.Printf("configuration: accept-routes=%v (env=%q), verbose=%v, listen-addrs=%q",
+	log.Printf("configuration: accept-routes=%v (env=%q), verbose=%v, listen-addrs=%q, cap-name=%q",
 		*acceptRoutes, os.Getenv("TSDNSPROXY_ACCEPT_ROUTES"),
-		*verbose, *listenAddrs)
+		*verbose, *listenAddrs, grantParser.CapName())
 
 	if *authKey == "" {
 		log.Fatal("authkey is required (set TS_AUTHKEY or use -authkey)")
@@ -236,8 +242,6 @@ func main() {
 
 	backendMgr := backend.NewManager(defaultServers, dnsDialer, logf(*verbose))
 	defer backendMgr.Close()
-
-	grantParser := grants.NewParser()
 
 	log.Printf("waiting for tailnet...")
 

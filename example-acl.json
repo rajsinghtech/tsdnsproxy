@@ -1,3 +1,6 @@
+// DNS grants use this capability name. The default is
+// rajsingh.info/cap/tsdnsproxy. Set -cap-name or TSDNSPROXY_CAP_NAME
+// to a domain and path such as example.com/cap/dns to read another key.
 {
   "acls": [
     {

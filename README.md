@@ -16,7 +16,7 @@ A DNS proxy server for Tailscale networks that enables per-identity DNS routing,
 tsdnsproxy runs as a tsnet application on your tailnet, listening on configurable addresses (default: Tailscale IP port 53). When it receives DNS requests:
 
 1. Identifies the requesting node using LocalAPI whois
-2. Retrieves DNS grants from the node's capabilities
+2. Retrieves DNS grants from the configured capability on the node
 3. Matches the query domain against grant rules
 4. Applies configured transformations (rewrite, backend selection)
 5. Forwards the query to the appropriate backend
@@ -25,7 +25,7 @@ tsdnsproxy runs as a tsnet application on your tailnet, listening on configurabl
 
 ## ACL Grant Configuration
 
-Configure DNS behavior through Tailscale ACL grants:
+Configure DNS behavior through Tailscale ACL grants. The capability name defaults to `rajsingh.info/cap/tsdnsproxy`. Set `-cap-name` or `TSDNSPROXY_CAP_NAME` to read a different name, for example `example.com/cap/dns`. Grants under any other name are ignored.
 
 - **dns**: Backend DNS servers to forward queries to (with failover)
 - **rewrite**: optional - Rewrite domain before forwarding (e.g., `api.cluster1.local` → `api.cluster.local`)
@@ -113,6 +113,7 @@ tsdnsproxy -authkey tskey-auth-YOUR-KEY
 - `TSDNSPROXY_HEALTH_ADDR`: Health check endpoint address (default: `:8080`)
 - `TSDNSPROXY_ACCEPT_ROUTES`: Accept subnet routes and query DNS over tailnet (default: `false`)
 - `TSDNSPROXY_ADVERTISE_TAGS`: ACL tags to advertise (comma-separated, default: none)
+- `TSDNSPROXY_CAP_NAME`: Capability name for DNS grants (`-cap-name`, default: `rajsingh.info/cap/tsdnsproxy`). Set this to a domain and path such as `example.com/cap/dns` to match a different ACL grant key. Other capability names are ignored. An `http://` or `https://` prefix is also accepted.
 - `TSDNSPROXY_VERBOSE`: Enable verbose logging (default: `false`)
 
 ### Command Line Flags
@@ -127,6 +128,7 @@ tsdnsproxy \
   -override-dns 8.8.8.8:53,8.8.4.4:53 \
   -cache-expiry 5m \
   -health-addr :8080 \
+  -cap-name rajsingh.info/cap/tsdnsproxy \
   -verbose
 ```
 

@@ -83,6 +83,10 @@ spec:
           value: "tailscale,svc:tsdnsproxy"
         - name: TSDNSPROXY_ADVERTISE_TAGS
           value: "tag:k8s"
+        # Capability name (-cap-name). Use a domain and path such as example.com/cap/dns
+        # when the ACL grant key is not the default.
+        - name: TSDNSPROXY_CAP_NAME
+          value: "rajsingh.info/cap/tsdnsproxy"
         - name: TS_AUTHKEY
           valueFrom:
             secretKeyRef:

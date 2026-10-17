@@ -817,6 +817,74 @@ func TestServer_getGrantsForSource(t *testing.T) {
 	if len(grants2) != 1 {
 		t.Errorf("expected 1 grant from cache, got %d", len(grants2))
 	}
+	if _, found := server.GrantCache.Get(cache.GrantCacheKey{
+		Identity: "test-node.example.com",
+		CapName:  grants.DefaultCapName,
+	}); !found {
+		t.Fatal("grants were not cached under the default capability name")
+	}
+}
+
+func TestServer_GrantCacheScopedToCapName(t *testing.T) {
+	const custom = "example.com/cap/dns"
+	customParser, err := grants.NewParserWithName(custom)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := &Server{
+		LocalClient: &mockLocalClient{
+			whoisFunc: func(ctx context.Context, addr string) (*apitype.WhoIsResponse, error) {
+				return &apitype.WhoIsResponse{
+					Node: &tailcfg.Node{Name: "test-node.example.com"},
+					CapMap: tailcfg.PeerCapMap{
+						grants.DefaultCapName: {`{"old.example":{"dns":["10.0.0.1:53"]}}`},
+						custom:                {`{"custom.example":{"dns":["10.9.0.1:53"]}}`},
+					},
+				}, nil
+			},
+		},
+		WhoisCache:  cache.NewWhoisCache(time.Minute),
+		GrantCache:  cache.NewGrantCache(time.Minute),
+		GrantParser: customParser,
+		Logf:        t.Logf,
+	}
+	defer server.WhoisCache.Close()
+	defer server.GrantCache.Close()
+
+	got, err := server.getGrantsForSource(context.Background(), "10.0.0.1:12345")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if domain := onlyGrantDomain(t, got); domain != "custom.example" {
+		t.Fatalf("custom parser domain = %q", domain)
+	}
+	if _, found := server.GrantCache.Get(cache.GrantCacheKey{
+		Identity: "test-node.example.com",
+		CapName:  grants.DefaultCapName,
+	}); found {
+		t.Fatal("default capability was cached for a custom parser")
+	}
+
+	server.GrantParser = grants.NewParser()
+	got, err = server.getGrantsForSource(context.Background(), "10.0.0.1:12345")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if domain := onlyGrantDomain(t, got); domain != "old.example" {
+		t.Fatalf("default parser domain = %q", domain)
+	}
+}
+
+func onlyGrantDomain(t *testing.T, cfgs []grants.GrantConfig) string {
+	t.Helper()
+	if len(cfgs) != 1 || len(cfgs[0]) != 1 {
+		t.Fatalf("grants = %#v, want one domain", cfgs)
+	}
+	for domain := range cfgs[0] {
+		return domain
+	}
+	return ""
 }
 
 func TestServer_sendError(t *testing.T) {
