@@ -30,6 +30,7 @@
 
 ### Fixed
 
+- Split DNS pointed at this node's tailnet address is answered by tsdnsproxy. MagicDNS sends those queries to PeerAPI `/dns-query`, which tsnet previously resolved itself. They now use the same handler, rules, and source-address identity as port 53.
 - Upstream dials use the query context. A dial that ignores cancellation is abandoned when the deadline passes, and a late connection is closed.
 - Authoritative lookups use the query context instead of `context.Background`.
 - IPv6 nameservers in `/etc/resolv.conf` are joined with a port correctly.

@@ -322,6 +322,42 @@ func main() {
 		log.Fatalf("backend dial: %v", err)
 	}
 	defer backendMgr.Close()
+	backendMgr.SetRecorder(proxyMetrics)
+
+	// Publish the DNS server before Up. Start may already be serving PeerAPI,
+	// and MagicDNS sends split-DNS for this node's tailnet address to
+	// /dns-query instead of port 53. The prefix is installed at init; until
+	// this publish, those queries are refused rather than answered by tsnet.
+	var localClient dns.LocalClient
+	if lc != nil {
+		localClient = lc
+	}
+	dnsServer := &dns.Server{
+		TSServer:     s,
+		LocalClient:  localClient,
+		WhoisCache:   whoisCache,
+		GrantCache:   grantCache,
+		GrantParser:  grantParser,
+		BackendMgr:   backendMgr,
+		Logf:         logf(verbose),
+		Logger:       slog.Default(),
+		Metrics:      proxyMetrics,
+		Ready:        ready,
+		Rules:        rules,
+		RulesOnly:    cfg.RulesOnly,
+		Service:      cfg.Service,
+		QueryTimeout: cfg.QueryTimeout,
+		MaxUDP:       cfg.MaxUDPBytes,
+		MaxInflight:  cfg.MaxInflight,
+		MaxMessage:   cfg.MaxMessageBytes,
+		RatePerSec:   cfg.RateLimit,
+		RateBurst:    cfg.RateBurst,
+	}
+	if lc != nil {
+		dnsServer.SetLocalClient(lc)
+	}
+	dnsServer.UsePeerAPI()
+	slog.Info("handling peerapi dns queries")
 
 	log.Printf("waiting for tailnet...")
 
@@ -350,6 +386,7 @@ func main() {
 			log.Fatalf("LocalClient still not available after Up: %v", err)
 		}
 	}
+	dnsServer.SetLocalClient(lc)
 	routes.SetClient(lc)
 
 	if needRoutes {
@@ -375,28 +412,6 @@ func main() {
 		}
 	}
 
-	dnsServer := &dns.Server{
-		TSServer:     s,
-		LocalClient:  lc,
-		WhoisCache:   whoisCache,
-		GrantCache:   grantCache,
-		GrantParser:  grantParser,
-		BackendMgr:   backendMgr,
-		Logf:         logf(verbose),
-		Logger:       slog.Default(),
-		Metrics:      proxyMetrics,
-		Ready:        ready,
-		Rules:        rules,
-		RulesOnly:    cfg.RulesOnly,
-		Service:      cfg.Service,
-		QueryTimeout: cfg.QueryTimeout,
-		MaxUDP:       cfg.MaxUDPBytes,
-		MaxInflight:  cfg.MaxInflight,
-		MaxMessage:   cfg.MaxMessageBytes,
-		RatePerSec:   cfg.RateLimit,
-		RateBurst:    cfg.RateBurst,
-	}
-	backendMgr.SetRecorder(proxyMetrics)
 	ready.Tailnet = func(ctx context.Context) (bool, string) {
 		client, err := s.LocalClient()
 		if err != nil {

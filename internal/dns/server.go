@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -93,6 +94,10 @@ type Server struct {
 	// Track active handlers for graceful shutdown
 	handlerWg sync.WaitGroup
 
+	runtimeOnce sync.Once
+	// clients is set when the tailnet client arrives after the server is published.
+	clients atomic.Pointer[localClientBox]
+
 	// Server's own grants loaded at startup
 	grantsMu     sync.RWMutex
 	serverGrants []grants.GrantConfig
@@ -100,9 +105,38 @@ type Server struct {
 	selfIP       string
 }
 
+// localClientBox holds the tailnet client. The pointer is swapped atomically
+// so a late client does not race with PeerAPI queries.
+type localClientBox struct {
+	client LocalClient
+}
+
+// SetLocalClient records the tailnet client. It is safe to call while
+// queries are running.
+func (s *Server) SetLocalClient(c LocalClient) {
+	if s == nil || c == nil {
+		return
+	}
+	s.clients.Store(&localClientBox{client: c})
+}
+
+func (s *Server) currentClient() LocalClient {
+	if s == nil {
+		return nil
+	}
+	if box := s.clients.Load(); box != nil && box.client != nil {
+		return box.client
+	}
+	return s.LocalClient
+}
+
 // Run starts both UDP and TCP DNS servers on the default Tailscale address
 func (s *Server) Run(ctx context.Context) error {
-	status, err := s.LocalClient.Status(ctx)
+	lc := s.currentClient()
+	if lc == nil {
+		return fmt.Errorf("get status: no local client")
+	}
+	status, err := lc.Status(ctx)
 	if err != nil {
 		return fmt.Errorf("get status: %w", err)
 	}
@@ -113,15 +147,7 @@ func (s *Server) Run(ctx context.Context) error {
 // regular TCP/UDP listeners, addresses with a "svc:" or "service:" prefix
 // are hosted as named Tailscale Services via ListenService (TCP-only).
 func (s *Server) RunWithAddrs(ctx context.Context, listenAddrsStr string, status *ipnstate.Status) error {
-	inflight := s.MaxInflight
-	if inflight <= 0 {
-		inflight = constants.WorkerPoolSize
-	}
-	s.workerPool = make(chan struct{}, inflight)
-	if s.RateBurst <= 0 {
-		s.RateBurst = 1
-	}
-	s.limiter = newSourceLimiter(s.RatePerSec, s.RateBurst)
+	s.ensureRuntime()
 
 	// Load server's own grants
 	if err := s.loadServerGrants(ctx, status); err != nil {
@@ -523,6 +549,22 @@ func isTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
+// ensureRuntime creates the worker pool and rate limiter once.
+// PeerAPI queries can arrive before the UDP and TCP listeners bind.
+func (s *Server) ensureRuntime() {
+	s.runtimeOnce.Do(func() {
+		inflight := s.MaxInflight
+		if inflight <= 0 {
+			inflight = constants.WorkerPoolSize
+		}
+		s.workerPool = make(chan struct{}, inflight)
+		if s.RateBurst <= 0 {
+			s.RateBurst = 1
+		}
+		s.limiter = newSourceLimiter(s.RatePerSec, s.RateBurst)
+	})
+}
+
 func (s *Server) maxMessage() int {
 	if s != nil && s.MaxMessage > 0 {
 		return s.MaxMessage
@@ -752,11 +794,15 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 
 	// Get whois info atomically to prevent duplicate lookups.
 	// A rules file does not need whois to authorize the query, but the caller is still logged.
+	lc := s.currentClient()
+	if lc == nil {
+		return nil, fmt.Errorf("no local client")
+	}
 	whois, err := s.WhoisCache.GetOrSet(host, func() (*apitype.WhoIsResponse, error) {
 		// Perform whois lookup with timeout
 		whoisCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
-		return s.LocalClient.WhoIs(whoisCtx, host)
+		return lc.WhoIs(whoisCtx, host)
 	})
 	if err != nil {
 		if hasRules {
@@ -844,8 +890,12 @@ func (s *Server) loadServerGrants(ctx context.Context, status *ipnstate.Status) 
 
 	selfIP := status.Self.TailscaleIPs[0].String()
 
+	lc := s.currentClient()
+	if lc == nil {
+		return fmt.Errorf("whois self: no local client")
+	}
 	// Do a whois on ourselves to get our capabilities
-	whois, err := s.LocalClient.WhoIs(ctx, selfIP)
+	whois, err := lc.WhoIs(ctx, selfIP)
 	if err != nil {
 		return fmt.Errorf("whois self: %w", err)
 	}
@@ -882,7 +932,11 @@ func (s *Server) serverGrantSnapshot(ctx context.Context) []grants.GrantConfig {
 }
 
 func (s *Server) maybeRefreshServerGrants(ctx context.Context) {
-	if s == nil || s.LocalClient == nil || s.GrantParser == nil {
+	if s == nil || s.GrantParser == nil {
+		return
+	}
+	lc := s.currentClient()
+	if lc == nil {
 		return
 	}
 	ttl := 5 * time.Minute
@@ -898,7 +952,7 @@ func (s *Server) maybeRefreshServerGrants(ctx context.Context) {
 	s.grantsLoaded = time.Now()
 	s.grantsMu.Unlock()
 
-	whois, err := s.LocalClient.WhoIs(ctx, ip)
+	whois, err := lc.WhoIs(ctx, ip)
 	if err != nil {
 		s.Logf("refresh server grants: %v", err)
 		return
