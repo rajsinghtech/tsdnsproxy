@@ -25,6 +25,14 @@ const (
 	TailnetRetryDelay     = time.Second
 	DefaultCacheExpiry    = 5 * time.Minute
 	HealthShutdownTimeout = 5 * time.Second
+	// DefaultAnswerCacheSize is the number of DNS responses kept in memory.
+	DefaultAnswerCacheSize = 4096
+	// DefaultAnswerMinTTL is the shortest time a cached response is kept.
+	DefaultAnswerMinTTL = 5 * time.Second
+	// DefaultAnswerMaxTTL is the longest time a cached response is kept.
+	DefaultAnswerMaxTTL = time.Hour
+	// ServfailAnswerTTL is how long a server failure is remembered.
+	ServfailAnswerTTL = 5 * time.Second
 )
 
 // Backend configuration

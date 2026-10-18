@@ -17,6 +17,9 @@ func TestMetricsHandler(t *testing.T) {
 	m.Inflight(1)
 	m.Refused()
 	m.Dropped()
+	m.CacheHit()
+	m.CacheMiss()
+	m.CacheEviction(1)
 	rr := httptest.NewRecorder()
 	m.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	body, _ := io.ReadAll(rr.Body)
@@ -29,6 +32,9 @@ func TestMetricsHandler(t *testing.T) {
 		"tsdnsproxy_inflight",
 		"tsdnsproxy_refused_total",
 		"tsdnsproxy_dropped_total",
+		"tsdnsproxy_cache_hits_total",
+		"tsdnsproxy_cache_misses_total",
+		"tsdnsproxy_cache_evictions_total",
 		`qtype="A"`,
 	} {
 		if !strings.Contains(text, want) {
@@ -45,6 +51,9 @@ func TestNilMetrics(t *testing.T) {
 	m.Inflight(1)
 	m.Refused()
 	m.Dropped()
+	m.CacheHit()
+	m.CacheMiss()
+	m.CacheEviction(1)
 	if m.Handler() == nil {
 		t.Fatal("nil handler")
 	}

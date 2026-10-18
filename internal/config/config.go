@@ -40,6 +40,10 @@ type Config struct {
 	RateLimit       float64
 	RateBurst       int
 	QueryTimeout    time.Duration
+	DNSCache        bool
+	AnswerCacheSize int
+	AnswerMinTTL    time.Duration
+	AnswerMaxTTL    time.Duration
 }
 
 // Parse reads args as flags. Environment variables supply the defaults.
@@ -75,6 +79,10 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	fs.Float64Var(&cfg.RateLimit, "rate-limit", floatEnv(getenv, "TSDNSPROXY_RATE_LIMIT", 0), "queries per second per client, 0 disables")
 	fs.IntVar(&cfg.RateBurst, "rate-burst", intEnv(getenv, "TSDNSPROXY_RATE_BURST", 50), "per-client rate limit burst")
 	fs.DurationVar(&cfg.QueryTimeout, "query-timeout", durationEnv(getenv, "TSDNSPROXY_QUERY_TIMEOUT", constants.QueryTimeout), "timeout for one DNS query")
+	fs.BoolVar(&cfg.DNSCache, "dns-cache", envBoolDefault(getenv, "TSDNSPROXY_DNS_CACHE", true), "cache DNS answers")
+	fs.IntVar(&cfg.AnswerCacheSize, "cache-size", intEnv(getenv, "TSDNSPROXY_CACHE_SIZE", constants.DefaultAnswerCacheSize), "maximum cached DNS answers, 0 disables")
+	fs.DurationVar(&cfg.AnswerMinTTL, "cache-min-ttl", durationEnv(getenv, "TSDNSPROXY_CACHE_MIN_TTL", constants.DefaultAnswerMinTTL), "shortest time to keep a cached DNS answer")
+	fs.DurationVar(&cfg.AnswerMaxTTL, "cache-max-ttl", durationEnv(getenv, "TSDNSPROXY_CACHE_MAX_TTL", constants.DefaultAnswerMaxTTL), "longest time to keep a cached DNS answer")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
@@ -112,6 +120,18 @@ func (c Config) Validate() error {
 	}
 	if c.RateBurst < 1 {
 		return fmt.Errorf("rate-burst must be at least 1")
+	}
+	if c.AnswerCacheSize < 0 {
+		return fmt.Errorf("cache-size must be zero or positive")
+	}
+	if c.AnswerMinTTL < 0 {
+		return fmt.Errorf("cache-min-ttl must be zero or positive")
+	}
+	if c.AnswerMaxTTL <= 0 {
+		return fmt.Errorf("cache-max-ttl must be positive")
+	}
+	if c.AnswerMinTTL > c.AnswerMaxTTL {
+		return fmt.Errorf("cache-min-ttl must not exceed cache-max-ttl")
 	}
 	if _, err := ParseLogLevel(c.LogLevel); err != nil {
 		return err
@@ -151,11 +171,19 @@ func envOr(getenv func(string) string, key, fallback string) string {
 }
 
 func envBool(getenv func(string) string, key string) bool {
+	return envBoolDefault(getenv, key, false)
+}
+
+func envBoolDefault(getenv func(string) string, key string, fallback bool) bool {
 	switch strings.ToLower(strings.TrimSpace(getenv(key))) {
+	case "":
+		return fallback
 	case "1", "true", "yes", "on":
 		return true
-	default:
+	case "0", "false", "no", "off":
 		return false
+	default:
+		return fallback
 	}
 }
 
