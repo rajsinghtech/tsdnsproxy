@@ -14,7 +14,7 @@ This project is built by the Tailscale community. It is not an official Tailscal
 
 ## Query path
 
-1. Read the client address. On a tailnet listener, whois identifies the node. A rules file does not need whois to authorize the query.
+1. Read the client address. On a tailnet listener, whois identifies the node. A rules file does not need whois to authorize the query. Split DNS aimed at this node's tailnet address does not use port 53: MagicDNS sends DNS-over-HTTPS to the node's PeerAPI path `/dns-query`. That request is answered here, and the peer's tailnet address is the client address.
 2. Load the rules file, when one is set, and the grants under `-cap-name`.
 3. Use the longest matching domain. A CIDR key matches the resolved IPv4 address instead of the query name. An ACL grant replaces a file rule for the same key unless `-rules-only` is set.
 4. Forward, rewrite, translate, or synthesize the answer.
