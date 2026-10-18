@@ -18,7 +18,8 @@ This project is built by the Tailscale community. It is not an official Tailscal
 2. Load the rules file, when one is set, and the grants under `-cap-name`.
 3. Use the longest matching domain. A CIDR key matches the resolved IPv4 address instead of the query name. An ACL grant replaces a file rule for the same key unless `-rules-only` is set.
 4. Forward, rewrite, translate, or synthesize the answer.
-5. On UDP, shrink the answer to the client buffer and set `TC` when it does not fit. The client should retry over TCP.
+5. Cache that answer. The key is the question name, type, class, the DO and CD bits, and a hash of the effective rules. Peers with the same rules share an entry. A rule that reads the client address, such as `allowsrc` or `a` set to `direct`, also includes that address.
+6. On UDP, shrink the answer to the client buffer and set `TC` when it does not fit. The client should retry over TCP.
 
 ## Run
 
@@ -80,6 +81,10 @@ Flags and environment variables. Durations use Go syntax (`10s`, `5m`).
 | `-rules-file` | `TSDNSPROXY_RULES_FILE` | empty |
 | `-rules-only` | `TSDNSPROXY_RULES_ONLY` | `false` |
 | `-cache-ttl` | `TSDNSPROXY_CACHE_TTL` | `5m` |
+| `-dns-cache` | `TSDNSPROXY_DNS_CACHE` | `true` |
+| `-cache-size` | `TSDNSPROXY_CACHE_SIZE` | `4096` |
+| `-cache-min-ttl` | `TSDNSPROXY_CACHE_MIN_TTL` | `5s` |
+| `-cache-max-ttl` | `TSDNSPROXY_CACHE_MAX_TTL` | `1h` |
 | `-http-addr` | `TSDNSPROXY_HTTP_ADDR` | `:8080` |
 | `-log-level` | `TSDNSPROXY_LOG_LEVEL` | `info` |
 | `-query-timeout` | `TSDNSPROXY_QUERY_TIMEOUT` | `10s` |
@@ -98,6 +103,16 @@ Listen addresses other than wildcard and loopback are bound with tsnet.
 `$(VAR)` and `${VAR}` in `-hostname` and `-state` expand from the environment. Kubernetes expands `$(POD_NAME)` before the process starts. The process expands the same text if it is still present.
 
 See `CHANGELOG.md` for renamed flags.
+
+`-cache-ttl` is the whois and grant cache. The answer cache uses the flags below.
+
+## Answer cache
+
+DNS answers are cached by default, after rewrite and 4via6 translation. The lifetime is the smallest TTL in the answer and authority sections, clamped by `-cache-min-ttl` and `-cache-max-ttl`. NXDOMAIN and NODATA use the SOA minimum, as in RFC 2308. SERVFAIL is kept for 5 seconds and is not raised to the minimum TTL. Truncated responses are not stored. Each client receives its own message ID, and record TTLs count down from the time the answer was stored.
+
+The cache key is the question name, type, class, the DO and CD bits, and a hash of the effective rules. Peers with the same rules share an entry. A rule that reads the client address, such as `allowsrc` or `a` set to `direct`, also includes that address.
+
+`-cache-size` is the number of stored responses. `0` turns the cache off. `-dns-cache=false` or `TSDNSPROXY_DNS_CACHE=false` also turns it off. Identical questions that miss together share one upstream lookup.
 
 ## Grants and rules
 
@@ -195,7 +210,7 @@ Before the process can serve the name, define the Service with endpoint `tcp:53`
 
 - `/health`: 200 while the process should keep running, including during startup. 503 while stopping or after the DNS server fails. JSON includes `status`, `ready`, `listeners`, and tailnet state.
 - `/ready`: 200 only when a DNS listener is bound and the tailnet backend is `Running`. Otherwise 503 and the body `not ready`.
-- `/metrics`: Prometheus text. Counters cover queries, latency, upstream errors, translations, in-flight work, refusals, and drops.
+- `/metrics`: Prometheus text. Counters cover queries, latency, upstream errors, translations, in-flight work, refusals, drops, and answer-cache hits, misses, and evictions.
 
 Query logs use the fields `proto`, `remote`, `name`, `type`, `rcode`, `duration`, and `err` when there is an error. Success is `debug`. `SERVFAIL` and `REFUSED` are `warn`.
 

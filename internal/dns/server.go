@@ -82,7 +82,15 @@ type Server struct {
 	// RateBurst is the per-client burst size.
 	RateBurst int
 
+	// DNSCache stores final answers. AnswerCacheSize is the entry limit.
+	// A zero size leaves the cache off. TTLs are clamped to AnswerMinTTL and AnswerMaxTTL.
+	DNSCache        bool
+	AnswerCacheSize int
+	AnswerMinTTL    time.Duration
+	AnswerMaxTTL    time.Duration
+
 	limiter *sourceLimiter
+	answers *answerCache
 
 	// Service hosts DNS as a Tailscale Service when set, for example "svc:dns".
 	// The listener is TCP. Port 53 is used unless the value ends in @port.
@@ -562,6 +570,9 @@ func (s *Server) ensureRuntime() {
 			s.RateBurst = 1
 		}
 		s.limiter = newSourceLimiter(s.RatePerSec, s.RateBurst)
+		if s.answers == nil && s.DNSCache && s.AnswerCacheSize > 0 {
+			s.answers = newAnswerCache(s.AnswerCacheSize, s.AnswerMinTTL, s.AnswerMaxTTL, s.Metrics)
+		}
 	})
 }
 
@@ -701,7 +712,7 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 		s.sendError(pc, addr, &msg, dnsmessage.RCodeServerFailure)
 		return
 	}
-	response, err := s.processQuery(queryCtx, &msg, grants, sourceAddr(addr))
+	response, err := s.resolveCached(queryCtx, &msg, grants, sourceAddr(addr))
 	if err != nil {
 		rcode = "SERVFAIL"
 		qerr = err
@@ -981,6 +992,22 @@ func sourceAddr(addr net.Addr) netip.Addr {
 		return netip.Addr{}
 	}
 	return ip
+}
+
+// resolveCached returns a final answer, using the response cache when it is enabled.
+// The cached bytes are the message after rewrite and 4via6 synthesis, before UDP truncation.
+func (s *Server) resolveCached(ctx context.Context, query *dnsmessage.Message, grantConfigs []grants.GrantConfig, src netip.Addr) ([]byte, error) {
+	if s == nil || s.answers == nil {
+		return s.processQuery(ctx, query, grantConfigs, src)
+	}
+	key := newAnswerKey(query, grantConfigs, src)
+	raw, hit, err := s.answers.lookup(query, key, func() ([]byte, error) {
+		return s.processQuery(ctx, query, grantConfigs, src)
+	})
+	if hit && s.Logf != nil && len(query.Questions) > 0 {
+		s.Logf("[v] answer cache hit %s %s", query.Questions[0].Name, query.Questions[0].Type)
+	}
+	return raw, err
 }
 
 func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, grantConfigs []grants.GrantConfig, src netip.Addr) ([]byte, error) {

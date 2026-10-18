@@ -23,6 +23,7 @@
 
 ### Added
 
+- DNS answers are cached by default after rewrite and 4via6 translation. `-dns-cache` (`TSDNSPROXY_DNS_CACHE`, default `true`) turns the cache on. `-cache-size` (`TSDNSPROXY_CACHE_SIZE`, default 4096) is the number of entries. `0` disables the cache. `-cache-min-ttl` defaults to `5s` and `-cache-max-ttl` defaults to `1h`. The key is the question plus a hash of the effective rules, so one peer's grant is not served to a peer with different rules. SERVFAIL is kept for 5 seconds. Truncated responses are not stored. The message ID is rewritten per query and TTLs count down. Metrics `tsdnsproxy_cache_hits_total`, `tsdnsproxy_cache_misses_total`, and `tsdnsproxy_cache_evictions_total` count cache use.
 - Prometheus metrics on `/metrics`: queries, latency, upstream errors, translations, in-flight queries, refusals, and drops.
 - `-query-timeout` (`TSDNSPROXY_QUERY_TIMEOUT`, default `10s`) bounds one client query, including the upstream dial.
 - `SIGHUP` reload, listener shutdown, and cache cleanup wait on context instead of sleeping through a stop.

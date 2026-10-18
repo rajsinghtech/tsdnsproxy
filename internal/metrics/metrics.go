@@ -19,6 +19,9 @@ type Metrics struct {
 	inflight     prometheus.Gauge
 	refused      prometheus.Counter
 	dropped      prometheus.Counter
+	cacheHits    prometheus.Counter
+	cacheMisses  prometheus.Counter
+	cacheEvicts  prometheus.Counter
 }
 
 // New registers the proxy metrics.
@@ -55,8 +58,20 @@ func New() *Metrics {
 			Name: "tsdnsproxy_dropped_total",
 			Help: "Queries dropped because the worker pool was full.",
 		}),
+		cacheHits: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tsdnsproxy_cache_hits_total",
+			Help: "DNS answers served from the response cache.",
+		}),
+		cacheMisses: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tsdnsproxy_cache_misses_total",
+			Help: "DNS answers that were not in the response cache.",
+		}),
+		cacheEvicts: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tsdnsproxy_cache_evictions_total",
+			Help: "DNS answers removed to stay within the cache size.",
+		}),
 	}
-	reg.MustRegister(m.queries, m.latency, m.upstreamErrs, m.translations, m.inflight, m.refused, m.dropped)
+	reg.MustRegister(m.queries, m.latency, m.upstreamErrs, m.translations, m.inflight, m.refused, m.dropped, m.cacheHits, m.cacheMisses, m.cacheEvicts)
 	return m
 }
 
@@ -121,4 +136,28 @@ func (m *Metrics) Dropped() {
 		return
 	}
 	m.dropped.Inc()
+}
+
+// CacheHit records one answer served from the response cache.
+func (m *Metrics) CacheHit() {
+	if m == nil {
+		return
+	}
+	m.cacheHits.Inc()
+}
+
+// CacheMiss records one answer that was not already cached.
+func (m *Metrics) CacheMiss() {
+	if m == nil {
+		return
+	}
+	m.cacheMisses.Inc()
+}
+
+// CacheEviction records one answer dropped to stay within the cache size.
+func (m *Metrics) CacheEviction(n int) {
+	if m == nil || n <= 0 {
+		return
+	}
+	m.cacheEvicts.Add(float64(n))
 }
