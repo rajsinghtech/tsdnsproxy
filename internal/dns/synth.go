@@ -78,10 +78,11 @@ func (s *Server) handleIPNames(query *dnsmessage.Message, zone string, grant *gr
 			if serr != nil {
 				return nil, serr
 			}
-			via, verr := via6For(uint32(site), ip)
+			via, verr := via6For(uint32(site), ip) //nolint:gosec // site id is validated to 0..65535
 			if verr != nil {
 				return nil, verr
 			}
+			s.Metrics.Translation()
 			return ipNamesStatus(query, dnsmessage.RCodeSuccess, []dnsmessage.Resource{{
 				Header: dnsmessage.ResourceHeader{
 					Name: question.Name, Type: dnsmessage.TypeAAAA, Class: question.Class, TTL: cfg.AnswerTTL(),

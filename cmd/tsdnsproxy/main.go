@@ -3,12 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
-	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -19,9 +17,13 @@ import (
 
 	"github.com/rajsinghtech/tsdnsproxy/internal/backend"
 	"github.com/rajsinghtech/tsdnsproxy/internal/cache"
+	"github.com/rajsinghtech/tsdnsproxy/internal/config"
 	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
 	"github.com/rajsinghtech/tsdnsproxy/internal/dns"
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
+	"github.com/rajsinghtech/tsdnsproxy/internal/health"
+	"github.com/rajsinghtech/tsdnsproxy/internal/logging"
+	"github.com/rajsinghtech/tsdnsproxy/internal/metrics"
 	"tailscale.com/client/local"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -31,12 +33,8 @@ import (
 	"tailscale.com/tsnet"
 )
 
-func envOr(key, defaultVal string) string {
-	if v, ok := os.LookupEnv(key); ok {
-		return v
-	}
-	return defaultVal
-}
+// version is set with -ldflags "-X main.version=..." at release build time.
+var version = "dev"
 
 func getHostDNSServers() []string {
 	var servers []string
@@ -53,11 +51,7 @@ func getHostDNSServers() []string {
 			line := strings.TrimSpace(scanner.Text())
 			if strings.HasPrefix(line, "nameserver ") {
 				server := strings.TrimSpace(strings.TrimPrefix(line, "nameserver"))
-				// Add port if not specified
-				if !strings.Contains(server, ":") {
-					server += ":53"
-				}
-				servers = append(servers, server)
+				servers = appendDNSServer(servers, server)
 			}
 		}
 		if len(servers) > 0 {
@@ -66,14 +60,13 @@ func getHostDNSServers() []string {
 	}
 
 	// Fallback to system DNS resolution
-	config, err := net.DefaultResolver.LookupNS(context.Background(), ".")
+	lookupCtx, lookupCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer lookupCancel()
+	config, err := net.DefaultResolver.LookupNS(lookupCtx, ".")
 	if err == nil && len(config) > 0 {
 		for _, ns := range config {
-			if !strings.Contains(ns.Host, ":") {
-				servers = append(servers, ns.Host+":53")
-			} else {
-				servers = append(servers, ns.Host)
-			}
+			host := strings.TrimSuffix(ns.Host, ".")
+			servers = appendDNSServer(servers, host)
 		}
 		if len(servers) > 0 {
 			return servers
@@ -83,6 +76,17 @@ func getHostDNSServers() []string {
 	// Final fallback to common public DNS
 	log.Println("warning: could not determine host DNS servers, falling back to 8.8.8.8:53")
 	return []string{"8.8.8.8:53"}
+}
+
+func appendDNSServer(servers []string, host string) []string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return servers
+	}
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		host = net.JoinHostPort(host, "53")
+	}
+	return append(servers, host)
 }
 
 func retryWithBackoff(ctx context.Context, maxRetries int, fn func() error) error {
@@ -111,69 +115,75 @@ func retry(ctx context.Context, maxRetries int, delay time.Duration, backoffFunc
 				backoff = backoffFunc(i)
 			}
 			log.Printf("attempt %d/%d failed, retrying in %v: %v", i+1, maxRetries, backoff, err)
-			time.Sleep(backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("context cancelled: %w", ctx.Err())
+			case <-timer.C:
+			}
 		}
 	}
 	return fmt.Errorf("failed after %d attempts: %w", maxRetries, err)
 }
 
 func main() {
-	log.SetPrefix("tsdnsproxy: ")
 	hostinfo.SetApp("tsdnsproxy")
 
-	var (
-		authKey       = flag.String("authkey", os.Getenv("TS_AUTHKEY"), "tailscale auth key")
-		hostname      = flag.String("hostname", envOr("TSDNSPROXY_HOSTNAME", "tsdnsproxy"), "hostname on tailnet")
-		stateDir      = flag.String("statedir", envOr("TSDNSPROXY_STATE_DIR", "/var/lib/tsdnsproxy"), "state directory")
-		state         = flag.String("state", os.Getenv("TSDNSPROXY_STATE"), "state storage (e.g., kube:<secret-name>)")
-		controlURL    = flag.String("controlurl", os.Getenv("TS_CONTROLURL"), "optional alternate control server URL")
-		advertiseTags = flag.String("advertise-tags", os.Getenv("TSDNSPROXY_ADVERTISE_TAGS"), "ACL tags to advertise (comma-separated, default: none)")
-		overrideDNS   = flag.String("override-dns", envOr("TSDNSPROXY_OVERRIDE_DNS", ""), "override DNS servers (comma-separated, defaults to host resolvers)")
-		cacheExpiry   = flag.Duration("cache-expiry", constants.DefaultCacheExpiry, "whois cache expiry duration")
-		healthAddr    = flag.String("health-addr", envOr("TSDNSPROXY_HEALTH_ADDR", ":8080"), "health check endpoint address")
-		listenAddrs   = flag.String("listen-addrs", envOr("TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "listen addresses (comma-separated: tailscale,0.0.0.0:53,127.0.0.1:5353)")
-		service       = flag.String("service", envOr("TSDNSPROXY_SERVICE", ""), "Tailscale Service to host, for example svc:dns (TCP 53)")
-		acceptRoutes  = flag.Bool("accept-routes", envOr("TSDNSPROXY_ACCEPT_ROUTES", "false") == "true", "accept subnet routes (also implied by an explicit tailnet dial)")
-		dialModeFlag  = flag.String("dial", envOr("TSDNSPROXY_DIAL", "tailnet"), "default backend dial mode: tailnet or direct (host network)")
-		verbose       = flag.Bool("verbose", envOr("TSDNSPROXY_VERBOSE", "false") == "true", "enable verbose logging")
-		capName       = flag.String("cap-name", envOr("TSDNSPROXY_CAP_NAME", grants.DefaultCapName), "capability name for DNS grants (domain/path)")
-		rulesFile     = flag.String("rules-file", os.Getenv("TSDNSPROXY_RULES_FILE"), "JSON or HuJSON rules file applied to every client")
-		rulesOnly     = flag.Bool("rules-only", envOr("TSDNSPROXY_RULES_ONLY", "false") == "true", "ignore ACL grants and use only the rules file")
-	)
-	flag.Parse()
+	cfg, err := config.Parse(os.Args[1:], os.Getenv)
+	if err != nil {
+		log.Fatal(err)
+	}
+	logLevel, err := config.ParseLogLevel(cfg.LogLevel)
+	if err != nil {
+		log.Fatal(err)
+	}
+	slog.SetDefault(slog.New(logging.NewHandler(os.Stderr, logLevel)))
+	log.SetFlags(0)
+	log.SetPrefix("")
+	log.SetOutput(logging.Writer(slog.LevelInfo))
+	verbose := logLevel <= slog.LevelDebug
+	slog.Info("starting", "version", version, "log_level", cfg.LogLevel)
 
-	grantParser, err := grants.NewParserWithName(*capName)
+	grantParser, err := grants.NewParserWithName(cfg.CapName)
 	if err != nil {
 		log.Fatalf("invalid cap-name: %v", err)
 	}
-	dialMode, err := backend.ParseDialMode(*dialModeFlag)
+	dialMode, err := backend.ParseDialMode(cfg.Dial)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// Log configuration for debugging
-	hostedService, err := dns.ParseHostedService(*service)
+	hostedService, err := dns.ParseHostedService(cfg.Service)
 	if err != nil {
 		log.Fatalf("service: %v", err)
 	}
-	if hostedService.Name != "" && !hasAdvertiseTag(*advertiseTags) {
+	if hostedService.Name != "" && !hasAdvertiseTag(cfg.AdvertiseTags) {
 		log.Fatal("advertise-tags is required to host a Tailscale Service (set -advertise-tags or TSDNSPROXY_ADVERTISE_TAGS)")
 	}
 
-	log.Printf("configuration: accept-routes=%v (env=%q), dial=%s, verbose=%v, listen-addrs=%q, service=%q, cap-name=%q, rules-file=%q, rules-only=%v",
-		*acceptRoutes, os.Getenv("TSDNSPROXY_ACCEPT_ROUTES"), dialMode,
-		*verbose, *listenAddrs, hostedService.Name, grantParser.CapName(), *rulesFile, *rulesOnly)
+	slog.Info("configuration",
+		"accept_routes", cfg.AcceptRoutes,
+		"dial", string(dialMode),
+		"log_level", cfg.LogLevel,
+		"listen", cfg.ListenAddrs,
+		"service", hostedService.Name,
+		"cap_name", grantParser.CapName(),
+		"rules_file", cfg.RulesFile,
+		"rules_only", cfg.RulesOnly,
+	)
 
-	if *authKey == "" {
-		log.Fatal("authkey is required (set TS_AUTHKEY or use -authkey)")
+	if cfg.AuthKey == "" {
+		log.Fatal("auth key is required (set TS_AUTHKEY or use -auth-key)")
 	}
-	if *rulesOnly && *rulesFile == "" {
+	if cfg.RulesOnly && cfg.RulesFile == "" {
 		log.Fatal("-rules-only requires -rules-file")
 	}
 
 	var rules *grants.RulesFile
-	if *rulesFile != "" {
-		loaded, err := grants.OpenRulesFile(*rulesFile)
+	if cfg.RulesFile != "" {
+		loaded, err := grants.OpenRulesFile(cfg.RulesFile)
 		if err != nil {
 			log.Fatalf("rules file: %v", err)
 		}
@@ -183,9 +193,13 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	ready := &health.State{}
+	proxyMetrics := metrics.New()
+	httpServer := health.Start(ctx, cfg.HTTPAddr, ready, proxyMetrics.Handler())
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
 	go func() {
 		for sig := range sigCh {
 			if sig == syscall.SIGHUP {
@@ -205,7 +219,8 @@ func main() {
 				log.Print("SIGHUP: rules file unchanged")
 				continue
 			}
-			log.Println("shutting down...")
+			slog.Info("shutting down", "signal", sig.String())
+			ready.ShuttingDown()
 			cancel()
 			return
 		}
@@ -214,43 +229,46 @@ func main() {
 		go rules.Watch(ctx, grants.RulesPollInterval)
 	}
 
-	*hostname = expandEnvRefs(*hostname)
-	*state = expandEnvRefs(*state)
+	cfg.Hostname = expandEnvRefs(cfg.Hostname)
+	cfg.State = expandEnvRefs(cfg.State)
+	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		log.Printf("state dir %s: %v", cfg.StateDir, err)
+	}
 
-	defaultServers := hostOrOverrideDNS(*overrideDNS)
-	needRoutes, err := needsTailnetRoutes(*acceptRoutes, explicitDialTailnet(dialMode), defaultServers, rules)
+	defaultServers := hostOrOverrideDNS(cfg.OverrideDNS)
+	needRoutes, err := needsTailnetRoutes(cfg.AcceptRoutes, explicitDialTailnet(dialMode, cfg.DialSet), defaultServers, rules)
 	if err != nil {
 		log.Fatalf("backend dial: %v", err)
 	}
 	log.Printf("using DNS servers: %v (dial=%s, tailnet-routes=%v)", defaultServers, dialMode, needRoutes)
 
 	s := &tsnet.Server{
-		Dir:      *stateDir,
-		Hostname: *hostname,
-		AuthKey:  *authKey,
-		Logf:     logf(*verbose),
+		Dir:      cfg.StateDir,
+		Hostname: cfg.Hostname,
+		AuthKey:  cfg.AuthKey,
+		Logf:     logf(verbose),
 	}
 
-	if *advertiseTags != "" {
-		s.AdvertiseTags = strings.Split(*advertiseTags, ",")
+	if cfg.AdvertiseTags != "" {
+		s.AdvertiseTags = strings.Split(cfg.AdvertiseTags, ",")
 	}
 
-	if *controlURL != "" {
-		s.ControlURL = *controlURL
+	if cfg.ControlURL != "" {
+		s.ControlURL = cfg.ControlURL
 	}
 
-	if *state != "" {
+	if cfg.State != "" {
 		log.Printf("available store: awsstore: %v kube:%v", store.HasKnownProviderPrefix("arn:"), store.HasKnownProviderPrefix("kube:"))
-		if strings.HasPrefix(*state, "kube:") && !store.HasKnownProviderPrefix(*state) {
+		if strings.HasPrefix(cfg.State, "kube:") && !store.HasKnownProviderPrefix(cfg.State) {
 			log.Fatal("kube: state store provider is not registered")
 		}
 
-		stateStore, err := store.New(log.Printf, *state)
+		stateStore, err := store.New(log.Printf, cfg.State)
 		if err != nil {
 			log.Fatalf("failed to create state store: %v", err)
 		}
 		s.Store = stateStore
-		log.Printf("using state store: %s", *state)
+		log.Printf("using state store: %s", cfg.State)
 	}
 
 	defer func() {
@@ -259,7 +277,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("starting tsnet server as %q", *hostname)
+	log.Printf("starting tsnet server as %q", cfg.Hostname)
 
 	if err := retryWithBackoff(ctx, constants.StartupMaxRetries, func() error {
 		return s.Start()
@@ -287,8 +305,10 @@ func main() {
 		}
 	}
 
-	whoisCache := cache.NewWhoisCache(*cacheExpiry)
-	grantCache := cache.NewGrantCache(*cacheExpiry)
+	whoisCache := cache.NewWhoisCache(cfg.CacheTTL)
+	grantCache := cache.NewGrantCache(cfg.CacheTTL)
+	defer whoisCache.Close()
+	defer grantCache.Close()
 
 	// Bare addresses use the default dialer. An explicit tailnet:// address
 	// uses the same tsnet dialer and also accepts subnet routes.
@@ -297,7 +317,7 @@ func main() {
 		Tailnet:       s,
 		TailnetRoutes: backend.NewEnsuringDialer(s, routes.Ensure),
 		Default:       dialMode,
-	}, logf(*verbose))
+	}, logf(verbose))
 	if err != nil {
 		log.Fatalf("backend dial: %v", err)
 	}
@@ -340,7 +360,7 @@ func main() {
 	}
 
 	// Log peer status to help diagnose subnet route issues
-	if *verbose {
+	if verbose {
 		peerStatus, err := lc.Status(ctx)
 		if err != nil {
 			log.Printf("[DEBUG] failed to get peer status: %v", err)
@@ -356,30 +376,49 @@ func main() {
 	}
 
 	dnsServer := &dns.Server{
-		TSServer:    s,
-		LocalClient: lc,
-		WhoisCache:  whoisCache,
-		GrantCache:  grantCache,
-		GrantParser: grantParser,
-		BackendMgr:  backendMgr,
-		Logf:        logf(*verbose),
-		Rules:       rules,
-		RulesOnly:   *rulesOnly,
-		Service:     *service,
+		TSServer:     s,
+		LocalClient:  lc,
+		WhoisCache:   whoisCache,
+		GrantCache:   grantCache,
+		GrantParser:  grantParser,
+		BackendMgr:   backendMgr,
+		Logf:         logf(verbose),
+		Logger:       slog.Default(),
+		Metrics:      proxyMetrics,
+		Ready:        ready,
+		Rules:        rules,
+		RulesOnly:    cfg.RulesOnly,
+		Service:      cfg.Service,
+		QueryTimeout: cfg.QueryTimeout,
+		MaxUDP:       cfg.MaxUDPBytes,
+		MaxInflight:  cfg.MaxInflight,
+		MaxMessage:   cfg.MaxMessageBytes,
+		RatePerSec:   cfg.RateLimit,
+		RateBurst:    cfg.RateBurst,
+	}
+	backendMgr.SetRecorder(proxyMetrics)
+	ready.Tailnet = func(ctx context.Context) (bool, string) {
+		client, err := s.LocalClient()
+		if err != nil {
+			return false, s.Hostname
+		}
+		st, err := client.Status(ctx)
+		if err != nil || st == nil || st.BackendState != "Running" {
+			return false, s.Hostname
+		}
+		return true, s.Hostname
 	}
 
-	healthServer := startHealthServer(ctx, *healthAddr, s)
-
-	// Start DNS server (handles both UDP and TCP)
-	log.Printf("starting DNS server: %v", *listenAddrs)
-	if err := dnsServer.RunWithAddrs(ctx, *listenAddrs, status); err != nil {
-		log.Printf("DNS server error: %v", err)
+	slog.Info("starting DNS server", "listen", cfg.ListenAddrs, "service", cfg.Service)
+	if err := dnsServer.RunWithAddrs(ctx, cfg.ListenAddrs, status); err != nil && ctx.Err() == nil {
+		ready.Fail()
+		slog.Error("DNS server stopped", "err", err.Error())
 	}
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), constants.HealthShutdownTimeout)
 	defer cancel2()
-	if err := healthServer.Shutdown(ctx2); err != nil {
-		log.Printf("health shutdown: %v", err)
+	if err := httpServer.Shutdown(ctx2); err != nil {
+		slog.Error("http shutdown", "err", err.Error())
 	}
 }
 
@@ -402,17 +441,11 @@ func hostOrOverrideDNS(override string) []string {
 
 // explicitDialTailnet reports whether the operator set -dial or
 // TSDNSPROXY_DIAL to tailnet. The built-in default does not count.
-func explicitDialTailnet(mode backend.DialMode) bool {
+func explicitDialTailnet(mode backend.DialMode, flagSet bool) bool {
 	if mode != backend.DialTailnet {
 		return false
 	}
-	set := false
-	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "dial" {
-			set = true
-		}
-	})
-	if set {
+	if flagSet {
 		return true
 	}
 	_, ok := os.LookupEnv("TSDNSPROXY_DIAL")
@@ -520,108 +553,15 @@ func hasAdvertiseTag(raw string) bool {
 	return false
 }
 
-func logf(verbose bool) func(format string, args ...any) {
+func logf(debug bool) func(format string, args ...any) {
 	return func(format string, args ...any) {
-		if verbose || !strings.Contains(format, "[v]") {
-			log.Printf(format, args...)
-		}
-	}
-}
-
-type healthServer struct {
-	ts     *tsnet.Server
-	server *http.Server
-}
-
-func startHealthServer(ctx context.Context, addr string, ts *tsnet.Server) *healthServer {
-	h := &healthServer{ts: ts}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", h.handleHealth)
-	mux.HandleFunc("/ready", h.handleReady)
-
-	h.server = &http.Server{
-		Addr:    addr,
-		Handler: mux,
-	}
-
-	go func() {
-		if err := h.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("health server error: %v", err)
-		}
-	}()
-
-	go func() {
-		<-ctx.Done()
-		if err := h.server.Close(); err != nil {
-			log.Printf("health server close error: %v", err)
-		}
-	}()
-
-	return h
-}
-
-func (h *healthServer) Shutdown(ctx context.Context) error {
-	if h.server != nil {
-		return h.server.Shutdown(ctx)
-	}
-	return nil
-}
-
-func (h *healthServer) handleHealth(w http.ResponseWriter, r *http.Request) {
-	status := struct {
-		Status    string    `json:"status"`
-		Timestamp time.Time `json:"timestamp"`
-		Tailscale struct {
-			Connected bool   `json:"connected"`
-			Hostname  string `json:"hostname"`
-		} `json:"tailscale"`
-	}{
-		Status:    "ok",
-		Timestamp: time.Now().UTC(),
-	}
-
-	if h.ts != nil {
-		lc, err := h.ts.LocalClient()
-		if err == nil {
-			st, err := lc.Status(r.Context())
-			if err == nil && st.BackendState == "Running" {
-				status.Tailscale.Connected = true
-				status.Tailscale.Hostname = h.ts.Hostname
+		msg := fmt.Sprintf(format, args...)
+		if strings.Contains(format, "[v]") || strings.Contains(format, "[DEBUG]") {
+			if debug {
+				slog.Debug(msg)
 			}
+			return
 		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(status); err != nil {
-		log.Printf("health status encoding error: %v", err)
-	}
-}
-
-func (h *healthServer) handleReady(w http.ResponseWriter, r *http.Request) {
-	ready := true
-
-	if h.ts != nil {
-		lc, err := h.ts.LocalClient()
-		if err != nil {
-			ready = false
-		} else {
-			st, err := lc.Status(r.Context())
-			if err != nil || st.BackendState != "Running" {
-				ready = false
-			}
-		}
-	}
-
-	if ready {
-		w.WriteHeader(http.StatusOK)
-		if _, err := w.Write([]byte("ready\n")); err != nil {
-			log.Printf("write error: %v", err)
-		}
-	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		if _, err := w.Write([]byte("not ready\n")); err != nil {
-			log.Printf("write error: %v", err)
-		}
+		slog.Info(msg)
 	}
 }

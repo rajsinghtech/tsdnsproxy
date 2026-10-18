@@ -29,10 +29,10 @@ func TestResolveRejectsOverlongName(t *testing.T) {
 		t.Fatalf("fixture length = %d, want > 255", len(name))
 	}
 
-	if _, err := server.resolveToIPv4(name, []string{"10.0.0.1:53"}); err == nil {
+	if _, err := server.resolveToIPv4(context.Background(), name, []string{"10.0.0.1:53"}); err == nil {
 		t.Fatal("resolveToIPv4 returned nil error for an overlong name")
 	}
-	if _, err := server.resolveToIPv6(name, []string{"10.0.0.1:53"}); err == nil {
+	if _, err := server.resolveToIPv6(context.Background(), name, []string{"10.0.0.1:53"}); err == nil {
 		t.Fatal("resolveToIPv6 returned nil error for an overlong name")
 	}
 }
@@ -445,7 +445,7 @@ func mustGrant(t *testing.T, raw string) grants.GrantConfig {
 	return cfg
 }
 
-func packQuestion(t *testing.T, id uint16, name string, qtype dnsmessage.Type) []byte {
+func packQuestion(t testing.TB, id uint16, name string, qtype dnsmessage.Type) []byte {
 	t.Helper()
 	msg := dnsmessage.Message{
 		Header: dnsmessage.Header{ID: id, RecursionDesired: true},

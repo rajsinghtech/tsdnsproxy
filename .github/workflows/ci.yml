@@ -39,11 +39,17 @@ jobs:
           go test -fuzz=FuzzParseDashedIPv4 -fuzztime=10s ./internal/ipnames/
           go test -fuzz=FuzzParseEndpoint -fuzztime=10s ./internal/backend/
           go test -fuzz=FuzzProcessQuery -fuzztime=10s ./internal/dns/
+          go test -fuzz=FuzzHandleQuery -fuzztime=10s ./internal/dns/
+          go test -fuzz=FuzzParseRules -fuzztime=10s ./internal/grants/
       - name: Run linter
         uses: golangci/golangci-lint-action@v9
         with:
           version: v2.14.0
           args: --timeout=5m
+      - name: Vulnerability check
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
 
   docker:
     name: Docker Build (PR/Branch)

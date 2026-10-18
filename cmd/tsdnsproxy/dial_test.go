@@ -9,6 +9,30 @@ import (
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
 )
 
+func TestAppendDNSServer(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{in: "10.0.0.53", want: "10.0.0.53:53"},
+		{in: "10.0.0.53:5353", want: "10.0.0.53:5353"},
+		{in: "2001:db8::53", want: "[2001:db8::53]:53"},
+		{in: "[2001:db8::53]:5353", want: "[2001:db8::53]:5353"},
+		{in: "  ", want: ""},
+	}
+	for _, tc := range tests {
+		got := appendDNSServer(nil, tc.in)
+		if tc.want == "" {
+			if len(got) != 0 {
+				t.Fatalf("%q -> %v", tc.in, got)
+			}
+			continue
+		}
+		if len(got) != 1 || got[0] != tc.want {
+			t.Fatalf("%q -> %v, want %s", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestNeedsTailnetRoutes(t *testing.T) {
 	yes, err := needsTailnetRoutes(true, false, []string{"10.0.0.53:53"}, nil)
 	if err != nil || !yes {
@@ -86,19 +110,22 @@ func TestExplicitDialTailnet(t *testing.T) {
 	if err := os.Unsetenv("TSDNSPROXY_DIAL"); err != nil {
 		t.Fatal(err)
 	}
-	if explicitDialTailnet(backend.DialTailnet) {
+	if explicitDialTailnet(backend.DialTailnet, false) {
 		t.Fatal("the built-in tailnet default should not count as explicit")
 	}
 	if err := os.Setenv("TSDNSPROXY_DIAL", "tailnet"); err != nil {
 		t.Fatal(err)
 	}
-	if !explicitDialTailnet(backend.DialTailnet) {
+	if !explicitDialTailnet(backend.DialTailnet, false) {
 		t.Fatal("env tailnet should be explicit")
 	}
 	if err := os.Setenv("TSDNSPROXY_DIAL", "direct"); err != nil {
 		t.Fatal(err)
 	}
-	if explicitDialTailnet(backend.DialDirect) {
+	if explicitDialTailnet(backend.DialDirect, true) {
 		t.Fatal("direct dial should not request tailnet routes")
+	}
+	if !explicitDialTailnet(backend.DialTailnet, true) {
+		t.Fatal("an explicit tailnet flag should count")
 	}
 }

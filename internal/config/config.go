@@ -1,0 +1,196 @@
+// Package config loads tsdnsproxy settings from flags and environment variables.
+package config
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
+	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
+)
+
+// Config is the process configuration.
+type Config struct {
+	AuthKey         string
+	Hostname        string
+	StateDir        string
+	State           string
+	ControlURL      string
+	AdvertiseTags   string
+	OverrideDNS     string
+	CacheTTL        time.Duration
+	HTTPAddr        string
+	ListenAddrs     string
+	Service         string
+	AcceptRoutes    bool
+	Dial            string
+	DialSet         bool
+	LogLevel        string
+	CapName         string
+	RulesFile       string
+	RulesOnly       bool
+	MaxInflight     int
+	MaxMessageBytes int
+	MaxUDPBytes     int
+	RateLimit       float64
+	RateBurst       int
+	QueryTimeout    time.Duration
+}
+
+// Parse reads args as flags. Environment variables supply the defaults.
+// getenv may be nil, in which case every variable is unset.
+func Parse(args []string, getenv func(string) string) (Config, error) {
+	if getenv == nil {
+		getenv = func(string) string { return "" }
+	}
+	var cfg Config
+	fs := flag.NewFlagSet("tsdnsproxy", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	fs.StringVar(&cfg.AuthKey, "auth-key", getenv("TS_AUTHKEY"), "tailscale auth key (TS_AUTHKEY)")
+	fs.StringVar(&cfg.Hostname, "hostname", envOr(getenv, "TSDNSPROXY_HOSTNAME", "tsdnsproxy"), "hostname on the tailnet")
+	fs.StringVar(&cfg.StateDir, "state-dir", envOr(getenv, "TSDNSPROXY_STATE_DIR", "/var/lib/tsdnsproxy"), "state directory")
+	fs.StringVar(&cfg.State, "state", getenv("TSDNSPROXY_STATE"), "state store, for example kube:tsdnsproxy-state")
+	fs.StringVar(&cfg.ControlURL, "control-url", getenv("TS_CONTROLURL"), "alternate control server URL")
+	fs.StringVar(&cfg.AdvertiseTags, "advertise-tags", getenv("TSDNSPROXY_ADVERTISE_TAGS"), "comma-separated ACL tags")
+	fs.StringVar(&cfg.OverrideDNS, "override-dns", getenv("TSDNSPROXY_OVERRIDE_DNS"), "comma-separated default DNS servers")
+	fs.DurationVar(&cfg.CacheTTL, "cache-ttl", durationEnv(getenv, "TSDNSPROXY_CACHE_TTL", constants.DefaultCacheExpiry), "whois and grant cache TTL")
+	fs.StringVar(&cfg.HTTPAddr, "http-addr", envOr(getenv, "TSDNSPROXY_HTTP_ADDR", ":8080"), "address for /health, /ready, and /metrics")
+	fs.StringVar(&cfg.ListenAddrs, "listen-addrs", envOr(getenv, "TSDNSPROXY_LISTEN_ADDRS", "tailscale"), "comma-separated DNS listen addresses")
+	fs.StringVar(&cfg.Service, "service", getenv("TSDNSPROXY_SERVICE"), "Tailscale Service to host, for example svc:dns")
+	fs.BoolVar(&cfg.AcceptRoutes, "accept-routes", envBool(getenv, "TSDNSPROXY_ACCEPT_ROUTES"), "accept subnet routes")
+	fs.StringVar(&cfg.Dial, "dial", envOr(getenv, "TSDNSPROXY_DIAL", "tailnet"), "default backend dial mode: tailnet or direct")
+	fs.StringVar(&cfg.LogLevel, "log-level", envOr(getenv, "TSDNSPROXY_LOG_LEVEL", "info"), "log level: debug, info, warn, or error")
+	fs.StringVar(&cfg.CapName, "cap-name", envOr(getenv, "TSDNSPROXY_CAP_NAME", grants.DefaultCapName), "capability name for DNS grants")
+	fs.StringVar(&cfg.RulesFile, "rules-file", getenv("TSDNSPROXY_RULES_FILE"), "JSON or HuJSON rules file")
+	fs.BoolVar(&cfg.RulesOnly, "rules-only", envBool(getenv, "TSDNSPROXY_RULES_ONLY"), "ignore ACL grants and use only the rules file")
+	fs.IntVar(&cfg.MaxInflight, "max-inflight", intEnv(getenv, "TSDNSPROXY_MAX_INFLIGHT", constants.WorkerPoolSize), "maximum queries handled at once")
+	fs.IntVar(&cfg.MaxMessageBytes, "max-message-bytes", intEnv(getenv, "TSDNSPROXY_MAX_MESSAGE_BYTES", constants.DNSMaxMessageSize), "maximum accepted DNS message size")
+	fs.IntVar(&cfg.MaxUDPBytes, "max-udp-bytes", intEnv(getenv, "TSDNSPROXY_MAX_UDP_BYTES", 1232), "maximum UDP response size")
+	fs.Float64Var(&cfg.RateLimit, "rate-limit", floatEnv(getenv, "TSDNSPROXY_RATE_LIMIT", 0), "queries per second per client, 0 disables")
+	fs.IntVar(&cfg.RateBurst, "rate-burst", intEnv(getenv, "TSDNSPROXY_RATE_BURST", 50), "per-client rate limit burst")
+	fs.DurationVar(&cfg.QueryTimeout, "query-timeout", durationEnv(getenv, "TSDNSPROXY_QUERY_TIMEOUT", constants.QueryTimeout), "timeout for one DNS query")
+
+	if err := fs.Parse(args); err != nil {
+		return Config{}, err
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "dial" {
+			cfg.DialSet = true
+		}
+	})
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+// Validate checks the values that can be rejected before the process starts.
+func (c Config) Validate() error {
+	if c.CacheTTL <= 0 {
+		return fmt.Errorf("cache-ttl must be positive")
+	}
+	if c.QueryTimeout <= 0 {
+		return fmt.Errorf("query-timeout must be positive")
+	}
+	if c.MaxInflight < 1 {
+		return fmt.Errorf("max-inflight must be at least 1")
+	}
+	if c.MaxMessageBytes < 12 || c.MaxMessageBytes > constants.DNSMaxMessageSize {
+		return fmt.Errorf("max-message-bytes must be between 12 and %d", constants.DNSMaxMessageSize)
+	}
+	if c.MaxUDPBytes < 512 || c.MaxUDPBytes > constants.DNSMaxMessageSize {
+		return fmt.Errorf("max-udp-bytes must be between 512 and %d", constants.DNSMaxMessageSize)
+	}
+	if c.RateLimit < 0 {
+		return fmt.Errorf("rate-limit must be zero or positive")
+	}
+	if c.RateBurst < 1 {
+		return fmt.Errorf("rate-burst must be at least 1")
+	}
+	if _, err := ParseLogLevel(c.LogLevel); err != nil {
+		return err
+	}
+	if c.HTTPAddr != "" {
+		if _, err := net.ResolveTCPAddr("tcp", c.HTTPAddr); err != nil {
+			return fmt.Errorf("http-addr: %w", err)
+		}
+	}
+	if c.RulesOnly && c.RulesFile == "" {
+		return fmt.Errorf("rules-only requires rules-file")
+	}
+	return nil
+}
+
+// ParseLogLevel accepts debug, info, warn, and error.
+func ParseLogLevel(raw string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "info":
+		return slog.LevelInfo, nil
+	case "debug":
+		return slog.LevelDebug, nil
+	case "warn", "warning":
+		return slog.LevelWarn, nil
+	case "error":
+		return slog.LevelError, nil
+	default:
+		return 0, fmt.Errorf("log level %q is not debug, info, warn, or error", raw)
+	}
+}
+
+func envOr(getenv func(string) string, key, fallback string) string {
+	if v := getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envBool(getenv func(string) string, key string) bool {
+	switch strings.ToLower(strings.TrimSpace(getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func durationEnv(getenv func(string) string, key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fallback
+	}
+	return d
+}
+
+func intEnv(getenv func(string) string, key string, fallback int) int {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	var n int
+	if _, err := fmt.Sscan(raw, &n); err != nil {
+		return fallback
+	}
+	return n
+}
+
+func floatEnv(getenv func(string) string, key string, fallback float64) float64 {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	var n float64
+	if _, err := fmt.Sscan(raw, &n); err != nil {
+		return fallback
+	}
+	return n
+}

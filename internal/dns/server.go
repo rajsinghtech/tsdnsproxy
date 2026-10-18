@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/netip"
 	"runtime/debug"
@@ -19,6 +20,8 @@ import (
 	"github.com/rajsinghtech/tsdnsproxy/internal/cache"
 	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
+	"github.com/rajsinghtech/tsdnsproxy/internal/health"
+	"github.com/rajsinghtech/tsdnsproxy/internal/metrics"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
@@ -51,11 +54,34 @@ type Server struct {
 	GrantParser *grants.Parser
 	BackendMgr  BackendManager
 	Logf        func(format string, args ...any)
+	Logger      *slog.Logger
+
+	// Metrics receives query, latency, and translation counts. It may be nil.
+	Metrics *metrics.Metrics
+	// Ready tracks bound listeners for /ready.
+	Ready *health.State
 
 	// Rules, when loaded, apply to every client.
 	// RulesOnly ignores ACL grants and uses the file alone.
 	Rules     *grants.RulesFile
 	RulesOnly bool
+
+	// QueryTimeout bounds one client query, including upstream dials.
+	// Zero means 10 seconds.
+	QueryTimeout time.Duration
+	// MaxUDP is the largest UDP response written to a client.
+	// Zero means 1232 bytes. Clients that send no EDNS OPT still get 512.
+	MaxUDP int
+	// MaxInflight is the worker pool size. Zero means the built-in default.
+	MaxInflight int
+	// MaxMessage is the largest accepted query. Zero means 65535.
+	MaxMessage int
+	// RatePerSec is the per-client query rate. Zero disables the limit.
+	RatePerSec float64
+	// RateBurst is the per-client burst size.
+	RateBurst int
+
+	limiter *sourceLimiter
 
 	// Service hosts DNS as a Tailscale Service when set, for example "svc:dns".
 	// The listener is TCP. Port 53 is used unless the value ends in @port.
@@ -70,6 +96,8 @@ type Server struct {
 	// Server's own grants loaded at startup
 	grantsMu     sync.RWMutex
 	serverGrants []grants.GrantConfig
+	grantsLoaded time.Time
+	selfIP       string
 }
 
 // Run starts both UDP and TCP DNS servers on the default Tailscale address
@@ -85,7 +113,15 @@ func (s *Server) Run(ctx context.Context) error {
 // regular TCP/UDP listeners, addresses with a "svc:" or "service:" prefix
 // are hosted as named Tailscale Services via ListenService (TCP-only).
 func (s *Server) RunWithAddrs(ctx context.Context, listenAddrsStr string, status *ipnstate.Status) error {
-	s.workerPool = make(chan struct{}, constants.WorkerPoolSize)
+	inflight := s.MaxInflight
+	if inflight <= 0 {
+		inflight = constants.WorkerPoolSize
+	}
+	s.workerPool = make(chan struct{}, inflight)
+	if s.RateBurst <= 0 {
+		s.RateBurst = 1
+	}
+	s.limiter = newSourceLimiter(s.RatePerSec, s.RateBurst)
 
 	// Load server's own grants
 	if err := s.loadServerGrants(ctx, status); err != nil {
@@ -284,6 +320,8 @@ func (s *Server) runUDP(ctx context.Context, listenAddr string) error {
 	}()
 
 	s.Logf("listening on %s (UDP)", listenAddr)
+	s.trackListener()
+	defer s.untrackListener()
 	return s.serveUDP(ctx, pc)
 }
 
@@ -306,7 +344,7 @@ func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn) error {
 
 		n, addr, err := pc.ReadFrom(buf)
 		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			if isTimeout(err) {
 				continue
 			}
 			if ctx.Err() != nil {
@@ -316,8 +354,7 @@ func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn) error {
 			continue
 		}
 
-		// Validate DNS message size (minimum 12 bytes for header)
-		if n < 12 || n > 65535 {
+		if n < 12 || n > s.maxMessage() {
 			s.Logf("[v] invalid DNS message size %d from %s", n, addr)
 			continue
 		}
@@ -326,25 +363,21 @@ func (s *Server) serveUDP(ctx context.Context, pc net.PacketConn) error {
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
 
-		// Try to acquire a worker slot
-		select {
-		case s.workerPool <- struct{}{}:
-			// Got a worker slot, handle query
-			s.handlerWg.Add(1)
-			go func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						s.Logf("panic in udp listener: %v\n%s", rec, debug.Stack())
-					}
-					<-s.workerPool // Release worker slot
-					s.handlerWg.Done()
-				}()
-				s.handleQuery(ctx, pc, addr, packet, "udp")
-			}()
-		default:
-			// Worker pool is full, drop the query
+		if !s.acquire() {
 			s.Logf("dropping UDP query from %s: worker pool full", addr)
+			continue
 		}
+		s.handlerWg.Add(1)
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					s.Logf("panic in udp listener: %v\n%s", rec, debug.Stack())
+				}
+				s.release()
+				s.handlerWg.Done()
+			}()
+			s.handleQuery(ctx, pc, addr, packet, "udp")
+		}()
 	}
 }
 
@@ -388,54 +421,51 @@ func (s *Server) runTCP(ctx context.Context, listenAddr string) error {
 	}()
 
 	s.Logf("listening on %s (TCP)", listenAddr)
-	go func() {
-		<-ctx.Done()
-		_ = listener.Close()
-	}()
+	s.trackListener()
+	defer s.untrackListener()
 	return s.serveTCP(ctx, listener)
 }
 
 // serveTCP accepts connections until ctx is canceled.
 func (s *Server) serveTCP(ctx context.Context, listener net.Listener) error {
-	for {
-		select {
-		case <-ctx.Done():
-			s.waitForHandlers("TCP")
-			return ctx.Err()
-		default:
-		}
+	return s.serveAccept(ctx, "TCP", "tcp", listener)
+}
 
+// serveAccept accepts DNS connections until ctx is canceled.
+// Closing the listener on cancellation unblocks Accept.
+func (s *Server) serveAccept(ctx context.Context, label, via string, listener net.Listener) error {
+	stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
+	defer stop()
+
+	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
+				s.waitForHandlers(label)
 				return ctx.Err()
 			}
-			s.Logf("accept: %v", err)
+			s.Logf("%s accept: %v", label, err)
 			continue
 		}
 
-		// Try to acquire a worker slot
-		select {
-		case s.workerPool <- struct{}{}:
-			// Got a worker slot, handle connection
-			s.handlerWg.Add(1)
-			go func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						s.Logf("panic in tcp listener: %v\n%s", rec, debug.Stack())
-					}
-					<-s.workerPool // Release worker slot
-					s.handlerWg.Done()
-				}()
-				s.handleTCPConnection(ctx, conn, "tcp")
-			}()
-		default:
-			// Worker pool is full, close the connection
-			s.Logf("dropping TCP connection from %s: worker pool full", conn.RemoteAddr())
+		if !s.acquire() {
+			s.Logf("dropping %s connection from %s: worker pool full", label, conn.RemoteAddr())
 			if err := conn.Close(); err != nil {
-				s.Logf("failed to close TCP connection: %v", err)
+				s.Logf("failed to close connection: %v", err)
 			}
+			continue
 		}
+		s.handlerWg.Add(1)
+		go func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					s.Logf("panic in %s listener: %v\n%s", label, rec, debug.Stack())
+				}
+				s.release()
+				s.handlerWg.Done()
+			}()
+			s.handleTCPConnection(ctx, conn, via)
+		}()
 	}
 }
 
@@ -462,54 +492,13 @@ func (s *Server) runService(ctx context.Context, svc serviceConfig) error {
 
 	s.Logf("listening on service %s (TCP port %d, FQDN: %s)", svc.name, svc.port, ln.FQDN)
 	s.Logf("note: UDP DNS is not available via Tailscale Service %s (TCP-only by design)", svc.name)
+	s.trackListener()
+	defer s.untrackListener()
 
 	// Wrap the listener to parse PROXY protocol headers and recover the
 	// real peer tailnet IP for whois-based identity routing.
 	proxyLn := &proxyproto.Listener{Listener: ln.Listener}
-	defer func() {
-		if err := proxyLn.Close(); err != nil {
-			s.Logf("failed to close PROXY listener for %s: %v", svc.name, err)
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			s.waitForHandlers("service:" + svc.name)
-			return ctx.Err()
-		default:
-		}
-
-		conn, err := proxyLn.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			s.Logf("service %s accept: %v", svc.name, err)
-			continue
-		}
-
-		// Try to acquire a worker slot
-		select {
-		case s.workerPool <- struct{}{}:
-			s.handlerWg.Add(1)
-			go func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						s.Logf("panic in service listener: %v\n%s", rec, debug.Stack())
-					}
-					<-s.workerPool
-					s.handlerWg.Done()
-				}()
-				s.handleTCPConnection(ctx, conn, "service")
-			}()
-		default:
-			s.Logf("dropping service connection from %s: worker pool full", conn.RemoteAddr())
-			if err := conn.Close(); err != nil {
-				s.Logf("failed to close service connection: %v", err)
-			}
-		}
-	}
+	return s.serveAccept(ctx, "service:"+svc.name, "service", proxyLn)
 }
 
 // waitForHandlers waits for active handlers to complete
@@ -529,9 +518,78 @@ func (s *Server) waitForHandlers(protocol string) {
 	}
 }
 
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+func (s *Server) maxMessage() int {
+	if s != nil && s.MaxMessage > 0 {
+		return s.MaxMessage
+	}
+	return 65535
+}
+
+func (s *Server) tcpLifetime() time.Duration {
+	timeout := 30 * time.Second
+	if s != nil && s.QueryTimeout > 0 && s.QueryTimeout*3 < timeout {
+		timeout = s.QueryTimeout * 3
+	}
+	if timeout < time.Second {
+		timeout = time.Second
+	}
+	return timeout
+}
+
+func (s *Server) trackListener() {
+	if s.Ready != nil {
+		s.Ready.AddListener()
+	}
+}
+
+func (s *Server) untrackListener() {
+	if s.Ready != nil {
+		s.Ready.RemoveListener()
+	}
+}
+
+func (s *Server) acquire() bool {
+	select {
+	case s.workerPool <- struct{}{}:
+		s.Metrics.Inflight(1)
+		return true
+	default:
+		s.Metrics.Dropped()
+		return false
+	}
+}
+
+func (s *Server) release() {
+	<-s.workerPool
+	s.Metrics.Inflight(-1)
+}
+
+func (s *Server) queryTimeout() time.Duration {
+	if s != nil && s.QueryTimeout > 0 {
+		return s.QueryTimeout
+	}
+	return 10 * time.Second
+}
+
 func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Addr, packet []byte, via string) {
+	start := time.Now()
+	var qname, qtype, rcode string
+	var qerr error
+	defer func() {
+		remote := ""
+		if addr != nil {
+			remote = addr.String()
+		}
+		s.recordQuery(via, remote, qname, qtype, rcode, time.Since(start), qerr)
+	}()
+
 	// Create request-scoped context with timeout
-	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	queryCtx, cancel := context.WithTimeout(ctx, s.queryTimeout())
 	defer cancel()
 
 	var msg dnsmessage.Message
@@ -545,6 +603,10 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 			return
 		}
 		s.Logf("panic handling %s query from %v: %v\n%s", via, addr, rec, debug.Stack())
+		if rcode == "" {
+			rcode = "SERVFAIL"
+		}
+		qerr = fmt.Errorf("panic: %v", rec)
 		if responded || pc == nil || addr == nil || len(msg.Questions) == 0 {
 			return
 		}
@@ -552,12 +614,35 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 	}()
 
 	if err := msg.Unpack(packet); err != nil {
+		rcode = "PARSE"
+		qerr = err
 		s.Logf("[v] failed to parse DNS message from %s: %v", addr, err)
 		return
 	}
 
 	// Only handle queries
 	if msg.Response {
+		return
+	}
+	if len(msg.Questions) != 1 {
+		rcode = "FORMERR"
+		s.sendError(pc, addr, &msg, dnsmessage.RCodeFormatError)
+		return
+	}
+	qname = msg.Questions[0].Name.String()
+	qtype = msg.Questions[0].Type.String()
+	if err := validateQueryName(msg.Questions[0].Name); err != nil {
+		rcode = "FORMERR"
+		qerr = err
+		s.Logf("[v] rejected name from %s: %v", addr, err)
+		s.sendError(pc, addr, &msg, dnsmessage.RCodeFormatError)
+		return
+	}
+	if !s.limiter.allow(addr.String()) {
+		rcode = "REFUSED"
+		s.Metrics.Refused()
+		s.Logf("refusing %s: rate limit", addr)
+		s.sendError(pc, addr, &msg, dnsmessage.RCodeRefused)
 		return
 	}
 
@@ -568,12 +653,16 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 
 	grants, err := s.getGrantsForSource(queryCtx, addr.String())
 	if err != nil {
+		rcode = "SERVFAIL"
+		qerr = err
 		s.Logf("failed to get grants for %s: %v", addr, err)
 		s.sendError(pc, addr, &msg, dnsmessage.RCodeServerFailure)
 		return
 	}
 	response, err := s.processQuery(queryCtx, &msg, grants, sourceAddr(addr))
 	if err != nil {
+		rcode = "SERVFAIL"
+		qerr = err
 		if queryCtx.Err() != nil {
 			s.Logf("query timeout from %s: %v", addr, queryCtx.Err())
 		} else {
@@ -583,11 +672,72 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 		return
 	}
 
+	if via == "udp" {
+		fitted, ferr := fitUDP(&msg, response, s.MaxUDP)
+		if ferr != nil {
+			s.Logf("failed to fit udp response: %v", ferr)
+			s.sendError(pc, addr, &msg, dnsmessage.RCodeServerFailure)
+			return
+		}
+		response = fitted
+	}
+
+	rcode = rcodeOf(response)
 	// Send response
 	if _, err := pc.WriteTo(response, addr); err != nil {
+		qerr = err
 		s.Logf("failed to send response to %s: %v", addr, err)
 	} else {
 		responded = true
+	}
+}
+
+func (s *Server) recordQuery(proto, remote, name, qtype, rcode string, d time.Duration, err error) {
+	if rcode == "" {
+		rcode = "NONE"
+	}
+	s.Metrics.Query(proto, qtype, rcode, d)
+	logger := s.Logger
+	if logger == nil {
+		return
+	}
+	level := slog.LevelDebug
+	if err != nil || rcode == "SERVFAIL" || rcode == "REFUSED" {
+		level = slog.LevelWarn
+	}
+	attrs := []any{
+		slog.String("proto", proto),
+		slog.String("remote", remote),
+		slog.String("name", name),
+		slog.String("type", qtype),
+		slog.String("rcode", rcode),
+		slog.Duration("duration", d),
+	}
+	if err != nil {
+		attrs = append(attrs, slog.String("err", err.Error()))
+	}
+	logger.Log(context.Background(), level, "query", attrs...)
+}
+
+func rcodeOf(raw []byte) string {
+	if len(raw) < 4 {
+		return "UNKNOWN"
+	}
+	switch raw[3] & 0x0f {
+	case 0:
+		return "NOERROR"
+	case 1:
+		return "FORMERR"
+	case 2:
+		return "SERVFAIL"
+	case 3:
+		return "NXDOMAIN"
+	case 4:
+		return "NOTIMP"
+	case 5:
+		return "REFUSED"
+	default:
+		return fmt.Sprintf("RCODE%d", raw[3]&0x0f)
 	}
 }
 
@@ -615,10 +765,7 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 		}
 		// For non-Tailscale clients, fall back to server's own grants
 		s.Logf("[v] whois failed for %s (%v), using server grants", host, err)
-		s.grantsMu.RLock()
-		serverGrants := s.serverGrants
-		s.grantsMu.RUnlock()
-		return serverGrants, nil
+		return s.serverGrantSnapshot(ctx), nil
 	}
 
 	identity := s.getIdentity(whois)
@@ -714,6 +861,8 @@ func (s *Server) loadServerGrants(ctx context.Context, status *ipnstate.Status) 
 
 	s.grantsMu.Lock()
 	s.serverGrants = grants
+	s.grantsLoaded = time.Now()
+	s.selfIP = selfIP
 	s.grantsMu.Unlock()
 	s.Logf("loaded %d grant configs from server capabilities", len(grants))
 	for _, gc := range grants {
@@ -723,6 +872,46 @@ func (s *Server) loadServerGrants(ctx context.Context, status *ipnstate.Status) 
 	}
 
 	return nil
+}
+
+func (s *Server) serverGrantSnapshot(ctx context.Context) []grants.GrantConfig {
+	s.maybeRefreshServerGrants(ctx)
+	s.grantsMu.RLock()
+	defer s.grantsMu.RUnlock()
+	return s.serverGrants
+}
+
+func (s *Server) maybeRefreshServerGrants(ctx context.Context) {
+	if s == nil || s.LocalClient == nil || s.GrantParser == nil {
+		return
+	}
+	ttl := 5 * time.Minute
+	if s.WhoisCache != nil && s.WhoisCache.TTL() > 0 {
+		ttl = s.WhoisCache.TTL()
+	}
+	s.grantsMu.Lock()
+	if s.selfIP == "" || time.Since(s.grantsLoaded) < ttl {
+		s.grantsMu.Unlock()
+		return
+	}
+	ip := s.selfIP
+	s.grantsLoaded = time.Now()
+	s.grantsMu.Unlock()
+
+	whois, err := s.LocalClient.WhoIs(ctx, ip)
+	if err != nil {
+		s.Logf("refresh server grants: %v", err)
+		return
+	}
+	parsed, err := s.GrantParser.ParseGrants(whois.CapMap)
+	if err != nil {
+		s.Logf("refresh server grants: %v", err)
+		return
+	}
+	s.grantsMu.Lock()
+	s.serverGrants = parsed
+	s.grantsMu.Unlock()
+	s.Logf("refreshed %d server grant configs", len(parsed))
 }
 
 func sourceAddr(addr net.Addr) netip.Addr {
@@ -771,7 +960,7 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 		} else {
 			s.Logf("[v] authoritative domain: %s (translateID=%d)", domain, *grant.TranslateID)
 		}
-		return s.handleAuthoritative4via6(query, &grant, domain, grantConfigs)
+		return s.handleAuthoritative4via6(ctx, query, &grant, domain, grantConfigs)
 	}
 
 	var rewrittenQuery *dnsmessage.Message
@@ -804,7 +993,7 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 // errSkipTranslate means the address must be returned unchanged.
 var errSkipTranslate = errors.New("skip translation")
 
-func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *grants.DNSGrant, domain string, configs []grants.GrantConfig) ([]byte, error) {
+func (s *Server) handleAuthoritative4via6(ctx context.Context, query *dnsmessage.Message, grant *grants.DNSGrant, domain string, configs []grants.GrantConfig) ([]byte, error) {
 	if len(query.Questions) == 0 {
 		return nil, fmt.Errorf("no questions in query")
 	}
@@ -838,7 +1027,7 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 		switch question.Type {
 		case dnsmessage.TypeA:
 			// Resolve backend and return IPv4 directly
-			ipv4, err := s.resolveBackendIPv4(question.Name.String(), domain, grant)
+			ipv4, err := s.resolveBackendIPv4(ctx, question.Name.String(), domain, grant)
 			if err != nil {
 				s.Logf("failed to resolve IPv4 for %s: %v", question.Name.String(), err)
 				response.RCode = dnsmessage.RCodeServerFailure
@@ -861,7 +1050,7 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 			}
 		case dnsmessage.TypeAAAA:
 			// Resolve backend and return IPv6 directly (no 4via6 translation)
-			ipv6, err := s.resolveBackendIPv6(question.Name.String(), domain, grant)
+			ipv6, err := s.resolveBackendIPv6(ctx, question.Name.String(), domain, grant)
 			if err != nil {
 				s.Logf("failed to resolve IPv6 for %s: %v", question.Name.String(), err)
 				response.RCode = dnsmessage.RCodeServerFailure
@@ -889,7 +1078,7 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 		// Translation mode. Addresses outside the grant's ranges are served unchanged.
 		switch question.Type {
 		case dnsmessage.TypeA:
-			ipv4, err := s.resolveBackendIPv4(question.Name.String(), domain, grant)
+			ipv4, err := s.resolveBackendIPv4(ctx, question.Name.String(), domain, grant)
 			if err != nil {
 				s.Logf("failed to resolve IPv4 for %s: %v", question.Name.String(), err)
 				response.RCode = dnsmessage.RCodeServerFailure
@@ -900,7 +1089,7 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 				s.Logf("[v] passthrough A for %s: %s", question.Name.String(), ipv4)
 			}
 		case dnsmessage.TypeAAAA:
-			via6Addr, err := s.createSynthetic4via6Address(question.Name.String(), domain, grant, configs)
+			via6Addr, err := s.createSynthetic4via6Address(ctx, question.Name.String(), domain, grant, configs)
 			if errors.Is(err, errSkipTranslate) {
 				s.Logf("[v] passthrough AAAA for %s: address excluded from translation", question.Name.String())
 			} else if err != nil {
@@ -931,7 +1120,7 @@ func (s *Server) handleAuthoritative4via6(query *dnsmessage.Message, grant *gran
 }
 
 // resolveBackendIPv4 resolves a query domain to its backend IPv4 address
-func (s *Server) resolveBackendIPv4(queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
+func (s *Server) resolveBackendIPv4(ctx context.Context, queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
 	// Determine what to resolve - use rewrite if available, otherwise resolve directly via backends
 	var targetDomain string
 	if grant.Rewrite != "" {
@@ -949,7 +1138,7 @@ func (s *Server) resolveBackendIPv4(queryDomain, grantDomain string, grant *gran
 	s.Logf("[v] resolving backend domain: %s via DNS servers: %v", targetDomain, grant.DNS)
 
 	// Resolve the target domain to get IPv4 address
-	ipv4, err := s.resolveToIPv4(targetDomain, grant.DNS)
+	ipv4, err := s.resolveToIPv4(ctx, targetDomain, grant.DNS)
 	if err != nil {
 		s.Logf("failed to resolve %s via %v: %v", targetDomain, grant.DNS, err)
 		return netip.Addr{}, fmt.Errorf("failed to resolve %s: %w", targetDomain, err)
@@ -960,8 +1149,8 @@ func (s *Server) resolveBackendIPv4(queryDomain, grantDomain string, grant *gran
 }
 
 // createSynthetic4via6Address creates a synthetic 4via6 IPv6 address by resolving the backend service
-func (s *Server) createSynthetic4via6Address(queryDomain, grantDomain string, grant *grants.DNSGrant, configs []grants.GrantConfig) (netip.Addr, error) {
-	ipv4, err := s.resolveBackendIPv4(queryDomain, grantDomain, grant)
+func (s *Server) createSynthetic4via6Address(ctx context.Context, queryDomain, grantDomain string, grant *grants.DNSGrant, configs []grants.GrantConfig) (netip.Addr, error) {
+	ipv4, err := s.resolveBackendIPv4(ctx, queryDomain, grantDomain, grant)
 	if err != nil {
 		return netip.Addr{}, err
 	}
@@ -979,6 +1168,7 @@ func (s *Server) mapVia6(ipv4 netip.Addr, siteID uint32) (netip.Addr, error) {
 		return netip.Addr{}, err
 	}
 	s.Logf("[v] mapped %s site %d -> %s", ipv4, siteID, via)
+	s.Metrics.Translation()
 	return via, nil
 }
 
@@ -1030,7 +1220,7 @@ func aRecord(question dnsmessage.Question, ipv4 netip.Addr) dnsmessage.Resource 
 }
 
 // resolveBackendIPv6 resolves a query domain to its backend IPv6 address
-func (s *Server) resolveBackendIPv6(queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
+func (s *Server) resolveBackendIPv6(ctx context.Context, queryDomain, grantDomain string, grant *grants.DNSGrant) (netip.Addr, error) {
 	// Determine what to resolve - use rewrite if available, otherwise resolve directly via backends
 	var targetDomain string
 	if grant.Rewrite != "" {
@@ -1048,7 +1238,7 @@ func (s *Server) resolveBackendIPv6(queryDomain, grantDomain string, grant *gran
 	s.Logf("[v] resolving backend domain: %s via DNS servers: %v", targetDomain, grant.DNS)
 
 	// Resolve the target domain to get IPv6 address
-	ipv6, err := s.resolveToIPv6(targetDomain, grant.DNS)
+	ipv6, err := s.resolveToIPv6(ctx, targetDomain, grant.DNS)
 	if err != nil {
 		s.Logf("failed to resolve %s via %v: %v", targetDomain, grant.DNS, err)
 		return netip.Addr{}, fmt.Errorf("failed to resolve %s: %w", targetDomain, err)
@@ -1059,7 +1249,7 @@ func (s *Server) resolveBackendIPv6(queryDomain, grantDomain string, grant *gran
 }
 
 // resolveToIPv4 resolves a domain to an IPv4 address using the specified DNS servers
-func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, error) {
+func (s *Server) resolveToIPv4(ctx context.Context, domain string, dnsServers []string) (netip.Addr, error) {
 	s.Logf("[v] resolveToIPv4: creating A query for %s", domain)
 
 	qname, err := newDNSName(domain)
@@ -1100,7 +1290,7 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 	if err != nil {
 		return netip.Addr{}, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	responseBytes, err := s.BackendMgr.Query(ctx, backends, queryBytes)
@@ -1135,7 +1325,7 @@ func (s *Server) resolveToIPv4(domain string, dnsServers []string) (netip.Addr, 
 }
 
 // resolveToIPv6 resolves a domain to an IPv6 address using the specified DNS servers
-func (s *Server) resolveToIPv6(domain string, dnsServers []string) (netip.Addr, error) {
+func (s *Server) resolveToIPv6(ctx context.Context, domain string, dnsServers []string) (netip.Addr, error) {
 	s.Logf("[v] resolveToIPv6: creating AAAA query for %s", domain)
 
 	qname, err := newDNSName(domain)
@@ -1176,7 +1366,7 @@ func (s *Server) resolveToIPv6(domain string, dnsServers []string) (netip.Addr, 
 	if err != nil {
 		return netip.Addr{}, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	responseBytes, err := s.BackendMgr.Query(ctx, backends, queryBytes)
@@ -1365,24 +1555,29 @@ func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn, via str
 		}
 	}()
 
-	// Set connection deadline
-	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	lifetime := s.tcpLifetime()
+	deadline := time.Now().Add(lifetime)
+	if err := conn.SetDeadline(deadline); err != nil {
 		s.Logf("failed to set connection deadline for %s: %v", conn.RemoteAddr(), err)
 		return
 	}
 
-	for {
+	const maxQueriesPerConn = 128
+	for n := 0; n < maxQueriesPerConn; n++ {
+		if err := conn.SetReadDeadline(time.Now().Add(s.queryTimeout())); err != nil {
+			s.Logf("failed to set read deadline for %s: %v", conn.RemoteAddr(), err)
+			return
+		}
 		// Read DNS message length (2 bytes)
 		var length uint16
 		if err := binary.Read(conn, binary.BigEndian, &length); err != nil {
-			if err != io.EOF {
+			if !errors.Is(err, io.EOF) && !isTimeout(err) {
 				s.Logf("failed to read message length from %s: %v", conn.RemoteAddr(), err)
 			}
 			return
 		}
 
-		// Sanity check length
-		if length == 0 {
+		if length == 0 || int(length) > s.maxMessage() {
 			s.Logf("invalid message length %d from %s", length, conn.RemoteAddr())
 			return
 		}
@@ -1398,9 +1593,7 @@ func (s *Server) handleTCPConnection(ctx context.Context, conn net.Conn, via str
 		tcpWriter := &tcpResponseWriter{conn: conn}
 		s.handleQuery(ctx, tcpWriter, conn.RemoteAddr(), packet, via)
 
-		// Reset deadline for next query
-		if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-			s.Logf("failed to reset deadline for %s: %v", conn.RemoteAddr(), err)
+		if time.Now().After(deadline) {
 			return
 		}
 	}
@@ -1412,8 +1605,11 @@ type tcpResponseWriter struct {
 }
 
 func (w *tcpResponseWriter) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	// TCP DNS messages are prefixed with a 2-byte length field
-	length := uint16(len(p))
+	if len(p) > 65535 {
+		return 0, fmt.Errorf("tcp response is %d bytes", len(p))
+	}
+	// The length check above keeps this conversion inside uint16.
+	length := uint16(len(p)) //nolint:gosec // bounded by the check above
 	if err := binary.Write(w.conn, binary.BigEndian, length); err != nil {
 		return 0, err
 	}

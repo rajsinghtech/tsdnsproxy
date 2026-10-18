@@ -3,12 +3,16 @@ package dns
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/rajsinghtech/tsdnsproxy/internal/cache"
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
 	"golang.org/x/net/dns/dnsmessage"
+	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/tailcfg"
 )
 
@@ -232,6 +236,36 @@ func TestHandleIPNames(t *testing.T) {
 			}
 		})
 	}
+}
+
+func FuzzHandleQuery(f *testing.F) {
+	f.Add([]byte{0, 1, 2, 3})
+	f.Add(packQuestion(f, 1, "app.example.internal.", dnsmessage.TypeA))
+	server := &Server{
+		LocalClient: &mockLocalClient{whoisFunc: func(context.Context, string) (*apitype.WhoIsResponse, error) {
+			return nil, fmt.Errorf("no whois")
+		}},
+		WhoisCache:  cache.NewWhoisCache(time.Minute),
+		GrantCache:  cache.NewGrantCache(time.Minute),
+		GrantParser: grants.NewParser(),
+		BackendMgr: &mockBackendManager{backend: &mockBackend{queryFunc: func(ctx context.Context, query []byte) ([]byte, error) {
+			return query, nil
+		}}},
+		Logf: func(string, ...any) {},
+	}
+	f.Cleanup(func() {
+		server.WhoisCache.Close()
+		server.GrantCache.Close()
+	})
+	f.Fuzz(func(t *testing.T, packet []byte) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				t.Fatalf("panic: %v", rec)
+			}
+		}()
+		pc := &mockPacketConn{}
+		server.handleQuery(context.Background(), pc, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 1}, packet, "udp")
+	})
 }
 
 func FuzzProcessQuery(f *testing.F) {

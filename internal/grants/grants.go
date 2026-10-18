@@ -3,7 +3,7 @@ package grants
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/netip"
 	"strings"
 
@@ -123,21 +123,21 @@ func (p *Parser) ParseGrants(capMap tailcfg.PeerCapMap) ([]GrantConfig, error) {
 	}
 
 	for i, raw := range rawMessages {
-		log.Printf("[v] parsing grant %d, raw: %s", i, raw)
+		slog.Debug(fmt.Sprintf("parsing grant %d, raw: %s", i, raw))
 		var grant GrantConfig
 		if err := json.Unmarshal([]byte(raw), &grant); err != nil {
 			// Log the error to help with debugging configuration issues
-			log.Printf("warning: failed to unmarshal grant %d: %v", i, err)
-			log.Printf("warning: raw grant data: %s", raw)
+			slog.Warn("failed to unmarshal grant", "index", i, "err", err.Error())
+			slog.Debug("raw grant", "index", i, "raw", string(raw))
 			continue // Skip invalid grants
 		}
 
-		log.Printf("[v] parsed grant %d successfully: %+v", i, grant)
+		slog.Debug(fmt.Sprintf("parsed grant %d: %d domains", i, len(grant)))
 		if err := p.validateGrant(grant); err != nil {
-			log.Printf("warning: invalid grant %d: %v", i, err)
+			slog.Warn("invalid grant", "index", i, "err", err.Error())
 			continue
 		}
-		log.Printf("[v] validated grant %d successfully", i)
+		slog.Debug("validated grant", "index", i)
 		grantConfigs = append(grantConfigs, grant)
 	}
 
@@ -220,6 +220,11 @@ func (p *Parser) validateGrant(grant GrantConfig) error {
 		if isPrefix && !prefix.IsValid() {
 			return fmt.Errorf("invalid CIDR %q", domain)
 		}
+		if !isPrefix {
+			if err := validateZoneName(domain); err != nil {
+				return err
+			}
+		}
 
 		hasFilter := len(dnsGrant.AllowIPs) > 0 || len(dnsGrant.DenyIPs) > 0
 		hasTranslate := dnsGrant.TranslateID != nil
@@ -245,7 +250,7 @@ func (p *Parser) validateGrant(grant GrantConfig) error {
 				return fmt.Errorf("ipnames cannot be combined with translateid for %s", domain)
 			}
 			if len(dnsGrant.DNS) > 0 {
-				log.Printf("warning: dns on ipnames zone %s is ignored", domain)
+				slog.Warn("dns servers on an ipnames zone are ignored", "zone", domain)
 			}
 			if err := dnsGrant.IPNames.prepare(); err != nil {
 				return fmt.Errorf("ipnames %s: %w", domain, err)

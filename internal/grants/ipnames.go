@@ -2,7 +2,7 @@ package grants
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"net/netip"
 	"sort"
 	"strings"
@@ -175,17 +175,25 @@ func (c *IPNamesConfig) EncodedAllowed(ip netip.Addr) bool {
 }
 
 func validateIPNamesZone(zone string) error {
+	return validateZoneName(zone)
+}
+
+func validateZoneName(zone string) error {
 	zone = NormalizeDomain(zone)
-	if zone == "" || strings.Contains(zone, "..") {
-		return fmt.Errorf("invalid ipnames zone %q", zone)
+	if zone == "" || strings.Contains(zone, "..") || len(zone) > 253 {
+		return fmt.Errorf("invalid zone %q", zone)
 	}
-	labels := strings.Split(zone, ".")
-	if len(labels) < 1 {
-		return fmt.Errorf("invalid ipnames zone %q", zone)
-	}
-	for _, label := range labels {
+	for _, label := range strings.Split(zone, ".") {
 		if label == "" || len(label) > 63 {
-			return fmt.Errorf("invalid ipnames zone %q", zone)
+			return fmt.Errorf("invalid zone %q", zone)
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+			default:
+				return fmt.Errorf("invalid zone %q", zone)
+			}
 		}
 	}
 	return nil
@@ -225,7 +233,7 @@ func resolveIPNamesConflicts(configs []GrantConfig) []GrantConfig {
 			}
 		}
 		if !same {
-			log.Printf("warning: dropping ipnames zone %s: conflicting settings", zone)
+			slog.Warn("dropping ipnames zone with conflicting settings", "zone", zone)
 			drop[zone] = true
 			continue
 		}
@@ -244,7 +252,7 @@ func resolveIPNamesConflicts(configs []GrantConfig) []GrantConfig {
 	for i := 0; i < len(zones); i++ {
 		for j := i + 1; j < len(zones); j++ {
 			if ipNamesNested(zones[i], zones[j]) {
-				log.Printf("warning: dropping nested ipnames zones %s and %s", zones[i], zones[j])
+				slog.Warn("dropping nested ipnames zones", "a", zones[i], "b", zones[j])
 				drop[zones[i]] = true
 				drop[zones[j]] = true
 			}

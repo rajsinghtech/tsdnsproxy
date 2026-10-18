@@ -15,6 +15,21 @@ import (
 	"tailscale.com/tailcfg"
 )
 
+func FuzzParseRules(f *testing.F) {
+	f.Add([]byte(`{"example.internal":{"dns":["10.0.0.53:53"],"translateid":1}}`))
+	f.Add([]byte(`{"ip":{"ipnames":{"siteid":1}}}`))
+	f.Add([]byte("{"))
+	f.Add([]byte(""))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				t.Fatalf("panic: %v", rec)
+			}
+		}()
+		_, _ = ParseRules(data)
+	})
+}
+
 func TestParseRulesJSONAndHuJSON(t *testing.T) {
 	jsonBody := `{
 		"Example.Internal.": {
@@ -301,6 +316,27 @@ func writeRules(t *testing.T, path, body string) {
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCurrentReturnsACopy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.json")
+	body := `{"example.internal":{"dns":["10.0.0.53:53"],"translateid":1,"allowips":["10.0.0.0/8"]}}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rf, err := OpenRulesFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := rf.Current()
+	if !ok {
+		t.Fatal("missing rules")
+	}
+	got["example.internal"] = DNSGrant{DNS: []string{"10.9.9.9:53"}}
+	again, _ := rf.Current()
+	if again["example.internal"].DNS[0] != "10.0.0.53:53" {
+		t.Fatalf("stored rules changed: %+v", again["example.internal"])
 	}
 }
 

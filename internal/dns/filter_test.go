@@ -122,7 +122,7 @@ func TestTranslationAddressFilters(t *testing.T) {
 			if !ok {
 				t.Fatal("missing domain grant")
 			}
-			raw, err := server.handleAuthoritative4via6(query, &grant, domain, tc.grants)
+			raw, err := server.handleAuthoritative4via6(context.Background(), query, &grant, domain, tc.grants)
 			if err != nil {
 				t.Fatalf("handle: %v", err)
 			}

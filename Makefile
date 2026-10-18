@@ -38,9 +38,14 @@ lint:
 	@echo "Running linter..."
 	@if ! which golangci-lint > /dev/null; then \
 		echo "Installing golangci-lint..."; \
-		go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest; \
+		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0; \
 	fi
 	@golangci-lint run
+
+# Scan for known vulnerabilities
+vuln:
+	@go install golang.org/x/vuln/cmd/govulncheck@latest
+	@govulncheck ./...
 
 # Format code
 fmt:
