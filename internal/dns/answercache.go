@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rajsinghtech/tsdnsproxy/internal/constants"
@@ -61,6 +62,9 @@ type answerCache struct {
 	items   map[answerKey]*answerEntry
 	order   *list.List
 	flights map[answerKey]*answerFlight
+	hits    atomic.Uint64
+	misses  atomic.Uint64
+	evicts  atomic.Uint64
 
 	// joined, when set, runs after a caller attaches to an in-flight load.
 	joined func()
@@ -91,6 +95,55 @@ func newAnswerCache(size int, minTTL, maxTTL time.Duration, m *metrics.Metrics) 
 	}
 }
 
+// answerStats is a point-in-time view of the response cache.
+type answerStats struct {
+	Entries   int
+	Limit     int
+	Hits      uint64
+	Misses    uint64
+	Evictions uint64
+}
+
+func (c *answerCache) stats() answerStats {
+	if c == nil {
+		return answerStats{}
+	}
+	c.mu.Lock()
+	n := len(c.items)
+	c.mu.Unlock()
+	return answerStats{
+		Entries:   n,
+		Limit:     c.size,
+		Hits:      c.hits.Load(),
+		Misses:    c.misses.Load(),
+		Evictions: c.evicts.Load(),
+	}
+}
+
+func (c *answerCache) noteHit() {
+	if c == nil {
+		return
+	}
+	c.hits.Add(1)
+	c.metrics.CacheHit()
+}
+
+func (c *answerCache) noteMiss() {
+	if c == nil {
+		return
+	}
+	c.misses.Add(1)
+	c.metrics.CacheMiss()
+}
+
+func (c *answerCache) noteEvict(n int) {
+	if c == nil || n <= 0 {
+		return
+	}
+	c.evicts.Add(uint64(n))
+	c.metrics.CacheEviction(n)
+}
+
 func (c *answerCache) clock() time.Time {
 	if c != nil && c.now != nil {
 		return c.now()
@@ -108,7 +161,7 @@ func (c *answerCache) lookup(q *dnsmessage.Message, key answerKey, load func() (
 	c.mu.Lock()
 	if raw, stored, ok := c.freshLocked(key); ok {
 		c.mu.Unlock()
-		c.metrics.CacheHit()
+		c.noteHit()
 		out, err := present(raw, q, c.clock().Sub(stored))
 		return out, true, err
 	}
@@ -118,7 +171,7 @@ func (c *answerCache) lookup(q *dnsmessage.Message, key answerKey, load func() (
 			c.joined()
 		}
 		<-f.done
-		c.metrics.CacheMiss()
+		c.noteMiss()
 		if f.err != nil {
 			return nil, false, f.err
 		}
@@ -135,7 +188,7 @@ func (c *answerCache) lookup(q *dnsmessage.Message, key answerKey, load func() (
 	f := &answerFlight{done: make(chan struct{})}
 	c.flights[key] = f
 	c.mu.Unlock()
-	c.metrics.CacheMiss()
+	c.noteMiss()
 
 	panicked := true
 	defer func() {
@@ -231,7 +284,7 @@ func (c *answerCache) insert(key answerKey, raw []byte, ttl time.Duration) time.
 		evicted++
 	}
 	c.mu.Unlock()
-	c.metrics.CacheEviction(evicted)
+	c.noteEvict(evicted)
 	return now
 }
 

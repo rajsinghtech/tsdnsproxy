@@ -85,6 +85,10 @@ Flags and environment variables. Durations use Go syntax (`10s`, `5m`).
 | `-cache-size` | `TSDNSPROXY_CACHE_SIZE` | `4096` |
 | `-cache-min-ttl` | `TSDNSPROXY_CACHE_MIN_TTL` | `5s` |
 | `-cache-max-ttl` | `TSDNSPROXY_CACHE_MAX_TTL` | `1h` |
+| `-ui-addr` | `TSDNSPROXY_UI_ADDR` | `:80` |
+| `-ui-history` | `TSDNSPROXY_UI_HISTORY` | `1000` |
+| `-ui-cap` | `TSDNSPROXY_UI_CAP` | empty |
+| `-ui-audit-cap` | `TSDNSPROXY_UI_AUDIT_CAP` | empty |
 | `-http-addr` | `TSDNSPROXY_HTTP_ADDR` | `:8080` |
 | `-log-level` | `TSDNSPROXY_LOG_LEVEL` | `info` |
 | `-query-timeout` | `TSDNSPROXY_QUERY_TIMEOUT` | `10s` |
@@ -113,6 +117,20 @@ DNS answers are cached by default, after rewrite and 4via6 translation. The life
 The cache key is the question name, type, class, the DO and CD bits, and a hash of the effective rules. Peers with the same rules share an entry. A rule that reads the client address, such as `allowsrc` or `a` set to `direct`, also includes that address.
 
 `-cache-size` is the number of stored responses. `0` turns the cache off. `-dns-cache=false` or `TSDNSPROXY_DNS_CACHE=false` also turns it off. Identical questions that miss together share one upstream lookup.
+
+## Status UI
+
+`-ui-addr` serves a read-only site with `tsnet.Listen` on the tailnet. The default is `:80`. It is not the pod HTTP port (`-http-addr`). `-ui-addr=` or `TSDNSPROXY_UI_ADDR=-` turns the site off.
+
+The pages are Overview, Rules, Peers, Queries, Access, Backends, and Lookup. Assets are embedded. There is no CDN. The JSON endpoints are `/api/config`, `/api/peers`, `/api/queries`, `/api/access`, and `/api/lookup`.
+
+Any identified tailnet peer can open the site. Set `-ui-cap` to a capability name, for example `example.com/cap/dns/ui`, to require that capability on the viewer's node. Peers, Queries, and Access show user identities, so they can be restricted further with `-ui-audit-cap`, for example `example.com/cap/dns/audit`. When `-ui-audit-cap` is empty, those pages use the same rule as the rest of the site.
+
+`-ui-history` is how many recent queries are kept in memory. `0` disables the log. The log records the peer, the question, the matched rule, the action, the rcode, and whether the answer cache hit. It does not record auth keys. Text matching `tskey-` is replaced with `tskey-redacted`.
+
+Lookup shows the matching rule for a name, type, and peer address. It does not query an upstream server unless **Resolve upstream** is checked (`forward=1` on `/api/lookup`).
+
+`TSDNSPROXY_IMAGE` is optional text shown as the image name. It is not a credential.
 
 ## Grants and rules
 

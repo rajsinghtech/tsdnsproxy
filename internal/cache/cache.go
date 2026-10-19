@@ -44,6 +44,41 @@ func New[K comparable, V any](ttl time.Duration) *Cache[K, V] {
 	return c
 }
 
+// Len reports how many unexpired entries are stored.
+func (c *Cache[K, V]) Len() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	n := 0
+	now := time.Now()
+	for _, e := range c.entries {
+		if e != nil && now.Before(e.expiry) {
+			n++
+		}
+	}
+	return n
+}
+
+// Timing reports how long a live entry has been stored and when it expires.
+func (c *Cache[K, V]) Timing(key K) (age time.Duration, expire time.Time, ok bool) {
+	if c == nil {
+		return 0, time.Time{}, false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e, exists := c.entries[key]
+	if !exists || e == nil || !time.Now().Before(e.expiry) {
+		return 0, time.Time{}, false
+	}
+	age = c.ttl - time.Until(e.expiry)
+	if age < 0 {
+		age = 0
+	}
+	return age, e.expiry, true
+}
+
 // TTL returns the lifetime of a cached value.
 func (c *Cache[K, V]) TTL() time.Duration {
 	if c == nil {

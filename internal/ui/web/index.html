@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tsdnsproxy</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="nav">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <strong>tsdnsproxy</strong>
+          <small id="brand-meta">status</small>
+        </div>
+      </div>
+      <nav>
+        <button type="button" data-tab="overview" class="active">Overview</button>
+        <button type="button" data-tab="rules">Rules</button>
+        <button type="button" data-tab="peers">Peers</button>
+        <button type="button" data-tab="queries">Queries</button>
+        <button type="button" data-tab="access">Access</button>
+        <button type="button" data-tab="backends">Backends</button>
+        <button type="button" data-tab="lookup">Lookup</button>
+      </nav>
+      <button type="button" id="theme" class="theme">Theme</button>
+    </aside>
+    <main>
+      <header class="top">
+        <div>
+          <h1 id="title">Overview</h1>
+          <p id="subtitle">Live configuration and recent questions.</p>
+        </div>
+        <div class="top-meta" id="top-meta"></div>
+      </header>
+      <section id="overview" class="panel active"></section>
+      <section id="rules" class="panel"></section>
+      <section id="peers" class="panel"></section>
+      <section id="queries" class="panel"></section>
+      <section id="access" class="panel"></section>
+      <section id="backends" class="panel"></section>
+      <section id="lookup" class="panel"></section>
+    </main>
+  </div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

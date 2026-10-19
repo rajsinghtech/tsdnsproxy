@@ -44,6 +44,10 @@ type Config struct {
 	AnswerCacheSize int
 	AnswerMinTTL    time.Duration
 	AnswerMaxTTL    time.Duration
+	UIAddr          string
+	UIHistory       int
+	UICap           string
+	UIAuditCap      string
 }
 
 // Parse reads args as flags. Environment variables supply the defaults.
@@ -83,9 +87,16 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	fs.IntVar(&cfg.AnswerCacheSize, "cache-size", intEnv(getenv, "TSDNSPROXY_CACHE_SIZE", constants.DefaultAnswerCacheSize), "maximum cached DNS answers, 0 disables")
 	fs.DurationVar(&cfg.AnswerMinTTL, "cache-min-ttl", durationEnv(getenv, "TSDNSPROXY_CACHE_MIN_TTL", constants.DefaultAnswerMinTTL), "shortest time to keep a cached DNS answer")
 	fs.DurationVar(&cfg.AnswerMaxTTL, "cache-max-ttl", durationEnv(getenv, "TSDNSPROXY_CACHE_MAX_TTL", constants.DefaultAnswerMaxTTL), "longest time to keep a cached DNS answer")
+	fs.StringVar(&cfg.UIAddr, "ui-addr", envOr(getenv, "TSDNSPROXY_UI_ADDR", ":80"), "tailnet address for the status UI; empty or - disables it")
+	fs.IntVar(&cfg.UIHistory, "ui-history", intEnv(getenv, "TSDNSPROXY_UI_HISTORY", 1000), "recent DNS queries to keep; 0 disables the log")
+	fs.StringVar(&cfg.UICap, "ui-cap", getenv("TSDNSPROXY_UI_CAP"), "capability required to open the UI; empty allows any identified tailnet peer")
+	fs.StringVar(&cfg.UIAuditCap, "ui-audit-cap", getenv("TSDNSPROXY_UI_AUDIT_CAP"), "capability required to see peers, queries, and access; empty uses the UI rule")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
+	}
+	if cfg.UIAddr == "-" {
+		cfg.UIAddr = ""
 	}
 	fs.Visit(func(f *flag.Flag) {
 		if f.Name == "dial" {
@@ -132,6 +143,14 @@ func (c Config) Validate() error {
 	}
 	if c.AnswerMinTTL > c.AnswerMaxTTL {
 		return fmt.Errorf("cache-min-ttl must not exceed cache-max-ttl")
+	}
+	if c.UIHistory < 0 {
+		return fmt.Errorf("ui-history must be zero or positive")
+	}
+	if c.UIAddr != "" {
+		if _, err := net.ResolveTCPAddr("tcp", c.UIAddr); err != nil {
+			return fmt.Errorf("ui-addr: %w", err)
+		}
 	}
 	if _, err := ParseLogLevel(c.LogLevel); err != nil {
 		return err

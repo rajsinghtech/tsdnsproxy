@@ -24,6 +24,7 @@ import (
 	"github.com/rajsinghtech/tsdnsproxy/internal/health"
 	"github.com/rajsinghtech/tsdnsproxy/internal/logging"
 	"github.com/rajsinghtech/tsdnsproxy/internal/metrics"
+	"github.com/rajsinghtech/tsdnsproxy/internal/ui"
 	"tailscale.com/client/local"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -176,6 +177,8 @@ func main() {
 		"cache_size", cfg.AnswerCacheSize,
 		"cache_min_ttl", cfg.AnswerMinTTL.String(),
 		"cache_max_ttl", cfg.AnswerMaxTTL.String(),
+		"ui_addr", cfg.UIAddr,
+		"ui_history", cfg.UIHistory,
 	)
 
 	if cfg.AuthKey == "" {
@@ -360,6 +363,15 @@ func main() {
 		AnswerCacheSize: cfg.AnswerCacheSize,
 		AnswerMinTTL:    cfg.AnswerMinTTL,
 		AnswerMaxTTL:    cfg.AnswerMaxTTL,
+		Version:         version,
+		Image:           os.Getenv("TSDNSPROXY_IMAGE"),
+		Started:         time.Now(),
+		HistoryLimit:    cfg.UIHistory,
+	}
+	var queryLog *ui.Ring
+	if cfg.UIHistory > 0 {
+		queryLog = ui.NewRing(cfg.UIHistory)
+		dnsServer.OnQuery = queryLog.Add
 	}
 	if lc != nil {
 		dnsServer.SetLocalClient(lc)
@@ -396,6 +408,36 @@ func main() {
 	}
 	dnsServer.SetLocalClient(lc)
 	routes.SetClient(lc)
+	if cfg.UIAddr != "" {
+		statusUI := &ui.Server{
+			Snapshot: dnsServer.UISnapshot,
+			Peers:    dnsServer.UIPeers,
+			Lookup:   dnsServer.Explain,
+			History:  queryLog,
+			ViewCap:  cfg.UICap,
+			AuditCap: cfg.UIAuditCap,
+			WhoIs: func(ctx context.Context, ip string) ([]string, error) {
+				resp, err := lc.WhoIs(ctx, ip)
+				if err != nil || resp == nil {
+					return nil, err
+				}
+				caps := make([]string, 0, len(resp.CapMap))
+				for name := range resp.CapMap {
+					caps = append(caps, string(name))
+				}
+				return caps, nil
+			},
+		}
+		go func() {
+			slog.Info("status ui", "addr", cfg.UIAddr)
+			err := statusUI.Serve(ctx, func() (net.Listener, error) {
+				return s.Listen("tcp", cfg.UIAddr)
+			})
+			if err != nil && ctx.Err() == nil {
+				slog.Error("status ui stopped", "err", err.Error())
+			}
+		}()
+	}
 
 	if needRoutes {
 		log.Print("accepting subnet routes...")

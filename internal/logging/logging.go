@@ -36,8 +36,13 @@ func redactAttr(a slog.Attr) slog.Attr {
 	return a
 }
 
-func redact(s string) string {
+// Redact replaces Tailscale auth key material with a fixed placeholder.
+func Redact(s string) string {
 	return secretPattern.ReplaceAllString(s, "tskey-redacted")
+}
+
+func redact(s string) string {
+	return Redact(s)
 }
 
 // Writer sends standard-library log lines to slog at level.
