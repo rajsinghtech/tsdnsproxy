@@ -170,10 +170,62 @@ func (m *Manager) newBackend(raw string) (Backend, error) {
 		dialer = m.direct
 	}
 	backend := NewUDPBackend(ep.Addr, dialer, m.logf)
+	backend.mode = string(ep.Mode)
 	if ep.Explicit && ep.Mode == DialTailnet {
 		backend.label = "tailnet://" + ep.Addr
 	}
+	if ep.Explicit && ep.Mode == DialDirect {
+		backend.label = "direct://" + ep.Addr
+	}
 	return backend, nil
+}
+
+// BackendStatus is one configured default upstream and its health.
+type BackendStatus struct {
+	Address  string
+	Mode     string
+	Healthy  bool
+	Failures int
+	RetryAt  time.Time
+}
+
+// Status lists the default backends and any upstream currently marked unhealthy.
+func (m *Manager) Status() []BackendStatus {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	now := time.Now()
+	seen := map[string]bool{}
+	var out []BackendStatus
+	for _, b := range m.defaultBackends {
+		u, ok := b.(*UDPBackend)
+		if !ok || u == nil {
+			continue
+		}
+		st := BackendStatus{Address: u.Address(), Mode: u.DialMode(), Healthy: true}
+		if h, exists := m.unhealthy[b.String()]; exists && now.Before(h.unhealthyUntil) {
+			st.Healthy = false
+			st.Failures = h.failureCount
+			st.RetryAt = h.unhealthyUntil
+		}
+		seen[b.String()] = true
+		out = append(out, st)
+	}
+	for name, h := range m.unhealthy {
+		if seen[name] || h == nil || !now.Before(h.unhealthyUntil) {
+			continue
+		}
+		out = append(out, BackendStatus{
+			Address:  name,
+			Mode:     string(m.defaultMode),
+			Healthy:  false,
+			Failures: h.failureCount,
+			RetryAt:  h.unhealthyUntil,
+		})
+	}
+	return out
 }
 
 func (m *Manager) isUnhealthy(backend string) bool {
@@ -264,6 +316,7 @@ const upstreamUDPSize = 1232
 type UDPBackend struct {
 	server    string
 	label     string
+	mode      string
 	timeout   time.Duration
 	dnsDialer DNSDialer
 	logf      func(format string, args ...any)
@@ -337,6 +390,22 @@ func (b *UDPBackend) Query(ctx context.Context, query []byte) ([]byte, error) {
 		return nil, tcpErr
 	}
 	return tcpResp, nil
+}
+
+// Address is the host:port this backend dials.
+func (b *UDPBackend) Address() string {
+	if b == nil {
+		return ""
+	}
+	return b.server
+}
+
+// DialMode is direct or tailnet.
+func (b *UDPBackend) DialMode() string {
+	if b == nil || b.mode == "" {
+		return string(DialDirect)
+	}
+	return b.mode
 }
 
 func (b *UDPBackend) dialer() DNSDialer {

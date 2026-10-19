@@ -23,6 +23,7 @@ import (
 	"github.com/rajsinghtech/tsdnsproxy/internal/grants"
 	"github.com/rajsinghtech/tsdnsproxy/internal/health"
 	"github.com/rajsinghtech/tsdnsproxy/internal/metrics"
+	"github.com/rajsinghtech/tsdnsproxy/internal/ui"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
@@ -89,8 +90,22 @@ type Server struct {
 	AnswerMinTTL    time.Duration
 	AnswerMaxTTL    time.Duration
 
+	// OnQuery receives a redacted record of each answered question. It may be nil.
+	OnQuery func(ui.Query)
+	// Version and Image are shown on the status site.
+	Version string
+	Image   string
+	// Started is when the process began serving.
+	Started time.Time
+	// HistoryLimit is the configured query log size. Zero means the log is off.
+	HistoryLimit int
+
 	limiter *sourceLimiter
 	answers *answerCache
+	learn   *peerBook
+
+	boundMu sync.Mutex
+	bound   []boundListener
 
 	// Service hosts DNS as a Tailscale Service when set, for example "svc:dns".
 	// The listener is TCP. Port 53 is used unless the value ends in @port.
@@ -354,8 +369,8 @@ func (s *Server) runUDP(ctx context.Context, listenAddr string) error {
 	}()
 
 	s.Logf("listening on %s (UDP)", listenAddr)
-	s.trackListener()
-	defer s.untrackListener()
+	s.addBound("udp", listenAddr, "")
+	defer s.removeBound("udp", listenAddr, "")
 	return s.serveUDP(ctx, pc)
 }
 
@@ -455,8 +470,8 @@ func (s *Server) runTCP(ctx context.Context, listenAddr string) error {
 	}()
 
 	s.Logf("listening on %s (TCP)", listenAddr)
-	s.trackListener()
-	defer s.untrackListener()
+	s.addBound("tcp", listenAddr, "")
+	defer s.removeBound("tcp", listenAddr, "")
 	return s.serveTCP(ctx, listener)
 }
 
@@ -526,8 +541,8 @@ func (s *Server) runService(ctx context.Context, svc serviceConfig) error {
 
 	s.Logf("listening on service %s (TCP port %d, FQDN: %s)", svc.name, svc.port, ln.FQDN)
 	s.Logf("note: UDP DNS is not available via Tailscale Service %s (TCP-only by design)", svc.name)
-	s.trackListener()
-	defer s.untrackListener()
+	s.addBound("service", ln.FQDN, svc.name)
+	defer s.removeBound("service", ln.FQDN, svc.name)
 
 	// Wrap the listener to parse PROXY protocol headers and recover the
 	// real peer tailnet IP for whois-based identity routing.
@@ -631,14 +646,21 @@ func (s *Server) queryTimeout() time.Duration {
 
 func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Addr, packet []byte, via string) {
 	start := time.Now()
-	var qname, qtype, rcode string
+	var qname, qtype, rcode, cacheState string
 	var qerr error
+	var err error
+	var grantCfgs []grants.GrantConfig
 	defer func() {
 		remote := ""
 		if addr != nil {
 			remote = addr.String()
 		}
 		s.recordQuery(via, remote, qname, qtype, rcode, time.Since(start), qerr)
+		host := ""
+		if addr != nil {
+			host, _, _ = net.SplitHostPort(addr.String())
+		}
+		s.emitQuery(start, via, qname, qtype, rcode, host, grantCfgs, cacheState)
 	}()
 
 	// Create request-scoped context with timeout
@@ -704,7 +726,7 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 		s.Logf("[v] %s: %s %s", addr, q.Name, q.Type)
 	}
 
-	grants, err := s.getGrantsForSource(queryCtx, addr.String())
+	grantCfgs, err = s.getGrantsForSource(queryCtx, addr.String())
 	if err != nil {
 		rcode = "SERVFAIL"
 		qerr = err
@@ -712,7 +734,15 @@ func (s *Server) handleQuery(ctx context.Context, pc net.PacketConn, addr net.Ad
 		s.sendError(pc, addr, &msg, dnsmessage.RCodeServerFailure)
 		return
 	}
-	response, err := s.resolveCached(queryCtx, &msg, grants, sourceAddr(addr))
+	var hit bool
+	response, hit, err := s.resolveCached(queryCtx, &msg, grantCfgs, sourceAddr(addr))
+	if s.answers == nil {
+		cacheState = "off"
+	} else if hit {
+		cacheState = "hit"
+	} else {
+		cacheState = "miss"
+	}
 	if err != nil {
 		rcode = "SERVFAIL"
 		qerr = err
@@ -818,11 +848,14 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 	if err != nil {
 		if hasRules {
 			s.Logf("[v] whois failed for %s (%v), using rules file", host, err)
+			s.notePeer(host, nil, nil, "rules", s.RulesOnly)
 			return grants.ApplyRules(fileRules, nil, s.RulesOnly), nil
 		}
 		// For non-Tailscale clients, fall back to server's own grants
 		s.Logf("[v] whois failed for %s (%v), using server grants", host, err)
-		return s.serverGrantSnapshot(ctx), nil
+		fallback := s.serverGrantSnapshot(ctx)
+		s.notePeer(host, nil, fallback, "default", false)
+		return fallback, nil
 	}
 
 	identity := s.getIdentity(whois)
@@ -837,6 +870,7 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 
 	if hasRules && s.RulesOnly {
 		s.Logf("[v] rules-only: using rules file for %s", identity)
+		s.notePeer(host, whois, nil, "rules", true)
 		return grants.ApplyRules(fileRules, nil, true), nil
 	}
 
@@ -859,9 +893,11 @@ func (s *Server) getGrantsForSource(ctx context.Context, addr string) ([]grants.
 	}
 
 	if !hasRules {
+		s.notePeer(host, whois, parsed, "grant", false)
 		return parsed, nil
 	}
 	s.Logf("[v] merging rules file with %d grant configs for %s", len(parsed), identity)
+	s.notePeer(host, whois, parsed, "grant", false)
 	return grants.ApplyRules(fileRules, parsed, false), nil
 }
 
@@ -996,9 +1032,10 @@ func sourceAddr(addr net.Addr) netip.Addr {
 
 // resolveCached returns a final answer, using the response cache when it is enabled.
 // The cached bytes are the message after rewrite and 4via6 synthesis, before UDP truncation.
-func (s *Server) resolveCached(ctx context.Context, query *dnsmessage.Message, grantConfigs []grants.GrantConfig, src netip.Addr) ([]byte, error) {
+func (s *Server) resolveCached(ctx context.Context, query *dnsmessage.Message, grantConfigs []grants.GrantConfig, src netip.Addr) ([]byte, bool, error) {
 	if s == nil || s.answers == nil {
-		return s.processQuery(ctx, query, grantConfigs, src)
+		raw, err := s.processQuery(ctx, query, grantConfigs, src)
+		return raw, false, err
 	}
 	key := newAnswerKey(query, grantConfigs, src)
 	raw, hit, err := s.answers.lookup(query, key, func() ([]byte, error) {
@@ -1007,7 +1044,7 @@ func (s *Server) resolveCached(ctx context.Context, query *dnsmessage.Message, g
 	if hit && s.Logf != nil && len(query.Questions) > 0 {
 		s.Logf("[v] answer cache hit %s %s", query.Questions[0].Name, query.Questions[0].Type)
 	}
-	return raw, err
+	return raw, hit, err
 }
 
 func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, grantConfigs []grants.GrantConfig, src netip.Addr) ([]byte, error) {

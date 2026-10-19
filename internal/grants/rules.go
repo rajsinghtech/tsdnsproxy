@@ -21,11 +21,12 @@ const RulesPollInterval = 2 * time.Second
 // RulesFile is a grant map loaded from disk and applied to every client.
 // Reload keeps the previous rules when a new read fails.
 type RulesFile struct {
-	mu     sync.RWMutex
-	path   string
-	rules  GrantConfig
-	loaded bool
-	sum    [32]byte
+	mu      sync.RWMutex
+	path    string
+	rules   GrantConfig
+	loaded  bool
+	sum     [32]byte
+	updated time.Time
 }
 
 // ParseRules parses a JSON or HuJSON rules document.
@@ -135,7 +136,18 @@ func (r *RulesFile) Reload() (bool, error) {
 	r.rules = cfg
 	r.sum = sum
 	r.loaded = true
+	r.updated = time.Now()
 	return true, nil
+}
+
+// Updated is when the current rules were last loaded successfully.
+func (r *RulesFile) Updated() time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.updated
 }
 
 // Watch reloads the file until ctx is cancelled.

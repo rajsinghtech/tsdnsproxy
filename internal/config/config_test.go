@@ -23,6 +23,9 @@ func TestParseDefaults(t *testing.T) {
 	if !cfg.DNSCache || cfg.AnswerCacheSize != 4096 || cfg.AnswerMinTTL != 5*time.Second || cfg.AnswerMaxTTL != time.Hour {
 		t.Fatalf("answer cache defaults %+v", cfg)
 	}
+	if cfg.UIAddr != ":80" || cfg.UIHistory != 1000 || cfg.UICap != "" || cfg.UIAuditCap != "" {
+		t.Fatalf("ui defaults %+v", cfg)
+	}
 }
 
 func TestParseEnvAndFlags(t *testing.T) {
@@ -63,6 +66,8 @@ func TestParseRejectsBadValues(t *testing.T) {
 		{"-cache-min-ttl", "-1s"},
 		{"-cache-max-ttl", "0"},
 		{"-cache-min-ttl", "2h", "-cache-max-ttl", "1h"},
+		{"-ui-history", "-1"},
+		{"-ui-addr", "not an address"},
 	}
 	for _, args := range cases {
 		if _, err := Parse(args, nil); err == nil {
@@ -93,6 +98,13 @@ func TestParseDNSCacheDisabled(t *testing.T) {
 	}
 	if off.DNSCache || off.AnswerCacheSize != 10 {
 		t.Fatalf("%+v", off)
+	}
+	uiOff, err := Parse([]string{"-ui-addr", "-"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uiOff.UIAddr != "" {
+		t.Fatalf("ui addr %q", uiOff.UIAddr)
 	}
 }
 
