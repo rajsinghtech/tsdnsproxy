@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- The status UI can also listen on the host network. `-ui-local-addr` (`TSDNSPROXY_UI_LOCAL_ADDR`, default empty) is an address such as `0.0.0.0:8081`, served with `net.Listen`. `-ui-trusted-proxy-cidrs` (`TSDNSPROXY_UI_TRUSTED_PROXY_CIDRS`) lists prefixes such as `10.0.0.0/8`. A connection from one of those prefixes uses the forwarded identity headers and does not call WhoIs. A missing user header is rejected. Any other address on the local listener is rejected and is not treated as a tailnet peer. The local address requires the CIDR list. `GET /healthz` returns 200 with an empty body and does not require a viewer.
+
 ## 1.2.0 - 2026-10-20
 
 ### Breaking

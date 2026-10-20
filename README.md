@@ -89,6 +89,8 @@ Flags and environment variables. Durations use Go syntax (`10s`, `5m`).
 | `-ui-history` | `TSDNSPROXY_UI_HISTORY` | `1000` |
 | `-ui-cap` | `TSDNSPROXY_UI_CAP` | empty |
 | `-ui-audit-cap` | `TSDNSPROXY_UI_AUDIT_CAP` | empty |
+| `-ui-local-addr` | `TSDNSPROXY_UI_LOCAL_ADDR` | empty |
+| `-ui-trusted-proxy-cidrs` | `TSDNSPROXY_UI_TRUSTED_PROXY_CIDRS` | empty |
 | `-ui-trusted-proxy-tags` | `TSDNSPROXY_UI_TRUSTED_PROXY_TAGS` | empty |
 | `-ui-user-header` | `TSDNSPROXY_UI_USER_HEADER` | `Tailscale-User-Login` |
 | `-ui-name-header` | `TSDNSPROXY_UI_NAME_HEADER` | `Tailscale-User-Name` |
@@ -139,6 +141,16 @@ Any identified tailnet peer can open the site. Set `-ui-cap` to a capability nam
 WhoIs does not include groups, so a direct viewer has none. A direct viewer passes a group check only when that page's capability is configured and the viewer holds it. If a group list is set and the capability for that page is empty, direct viewers are denied. A proxied user who is outside the group is denied even when the proxy node holds the capability. When a capability is also set, the connecting peer must hold it, and a proxied user must still match the group.
 
 When `-ui-trusted-proxy-tags`, `-ui-groups`, and `-ui-audit-groups` are empty, `-ui-cap` and `-ui-audit-cap` behave as before.
+
+`-ui-local-addr` serves the same site with `net.Listen` on the host, for example `0.0.0.0:8081`. It is off when empty. It is separate from `-ui-addr` and from `-http-addr`. A reverse proxy on the pod network can reach this listener. The process refuses to start when `-ui-local-addr` is set and `-ui-trusted-proxy-cidrs` is empty, because every UI request on that listener would be denied.
+
+`-ui-trusted-proxy-cidrs` is a comma-separated list of prefixes, for example `10.0.0.0/8` or `192.0.2.0/24`. `authorize` checks this list before WhoIs. A connection from one of those prefixes is a proxy: the viewer comes from the configured headers, and WhoIs is not called. A missing user header is rejected. Headers from any other address are ignored.
+
+A request on the local listener from outside those prefixes is denied. It is not passed to WhoIs, so a pod address is never treated as a tailnet peer. On the tailnet listener, an address outside the list still uses WhoIs and the tag rules.
+
+A trusted-CIDR viewer is not a tailnet node, so `-ui-cap` and `-ui-audit-cap` do not apply to that connection. Group lists do. An empty group list allows the forwarded user. Tailnet viewers keep the capability checks.
+
+`GET /healthz` and `HEAD /healthz` return 200 with an empty body on both UI listeners. They do not require a viewer. Use that path for a proxy health check.
 
 Peers, Queries, and Access show the viewer. A proxied viewer is marked `via proxy`, and the process logs that login.
 
