@@ -360,6 +360,9 @@ func (s *Server) finishAuth(viewer Viewer, caller *Caller, audit, proxied bool) 
 			return Viewer{}, errors.New("direct viewer has no groups")
 		}
 	}
+	if !proxied && caller != nil && capName != "" && hasCap(caller.Caps, capName) {
+		viewer.GrantedCap = capName
+	}
 	if proxied {
 		s.logProxy(viewer, true)
 	}
