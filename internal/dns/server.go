@@ -1060,6 +1060,9 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 	if !found {
 		return s.forwardQuery(ctx, query, nil, nil, dnsmessage.Name{}, nil)
 	}
+	if grant.Static != nil {
+		return s.handleStatic(query, domain, &grant, src)
+	}
 	if grant.IPNames != nil {
 		return s.handleIPNames(query, domain, &grant, src)
 	}

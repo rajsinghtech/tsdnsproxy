@@ -212,7 +212,9 @@ func describeMatch(parser *grants.Parser, cfgs []grants.GrantConfig, qname strin
 			action = "4via6"
 		}
 	}
-	if grant.IPNames != nil {
+	if grant.Static != nil {
+		action = "static"
+	} else if grant.IPNames != nil {
 		action = "ipnames"
 	} else if rewrite != "" && action == "" {
 		action = "rewrite"
@@ -221,7 +223,7 @@ func describeMatch(parser *grants.Parser, cfgs []grants.GrantConfig, qname strin
 	}
 	if len(grant.DNS) > 0 {
 		backend = strings.Join(grant.DNS, ", ")
-	} else if action != "ipnames" {
+	} else if action != "ipnames" && action != "static" {
 		backend = "default"
 	}
 	source = "grant"

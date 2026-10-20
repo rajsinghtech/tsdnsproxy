@@ -296,6 +296,15 @@ func ruleFrom(domain string, grant grants.DNSGrant, source string) ui.Rule {
 		rule.IPNames = view
 		rule.AllowSrc = view.AllowSrc
 	}
+	if grant.Static != nil {
+		rule.Static = &ui.Static{
+			A:    append([]string(nil), grant.Static.A...),
+			AAAA: append([]string(nil), grant.Static.AAAA...),
+			TTL:  int(grant.Static.AnswerTTL()),
+			Apex: grant.Static.ApexEnabled(),
+		}
+		rule.AllowSrc = append([]string(nil), grant.Static.AllowSrc...)
+	}
 	return rule
 }
 

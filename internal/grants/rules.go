@@ -105,6 +105,9 @@ func cloneGrantConfig(in GrantConfig) GrantConfig {
 			cp.AllowIPs = append([]string(nil), grant.IPNames.AllowIPs...)
 			grant.IPNames = &cp
 		}
+		if grant.Static != nil {
+			grant.Static = grant.Static.clone()
+		}
 		out[key] = grant
 	}
 	return out

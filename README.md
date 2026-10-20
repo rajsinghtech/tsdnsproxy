@@ -171,10 +171,45 @@ The file is checked at startup. A bad file exits the process. `SIGHUP`, or repla
   - above `65535`: the grant is rejected
 - `allowips` and `denyips`: limit which IPv4 answers are translated. `denyips` wins. A non-empty `allowips` list translates only addresses inside it.
 - `ipnames`: synthesize dashed IPv4 names. It cannot be combined with `rewrite` or `translateid`.
+- `static`: answer the name from configured A and AAAA records. See below.
 
-Domains match themselves and any name under them. The longest match wins. A key that is a CIDR matches the resolved address. The longest matching prefix overrides the domain rule for that address. A prefix rule with `translateid` omitted or `0` leaves the address unchanged.
+Domain rules match themselves and any name under them. The longest match wins. A `static` key matches only the name it writes, or one label under a wildcard. An exact static name beats a wildcard, and a longer name beats a shorter one. A key that is a CIDR matches the resolved address. The longest matching prefix overrides the domain rule for that address. A prefix rule with `translateid` omitted or `0` leaves the address unchanged.
 
-Addresses in `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`, `224.0.0.0/4`, `255.255.255.255/32`, and `100.64.0.0/10` are not translated unless `allowips` covers them. An excluded A answer is returned unchanged, and the AAAA answer is empty.
+Addresses in `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`, `224.0.0.0/4`, `255.255.255.255/32`, and `100.64.0.0/10` are not translated unless `allowips` covers them. An excluded A answer is returned unchanged, and the AAAA answer is empty. The same filter drops A records from a `static` rule.
+
+### Static records
+
+A `static` rule answers from the config. The query is not forwarded.
+
+```json
+{
+  "app.example.internal": {
+    "static": {
+      "a": ["192.0.2.10"],
+      "aaaa": ["2001:db8::10"],
+      "ttl": 60
+    }
+  },
+  "*.apps.example.internal": {
+    "static": { "a": ["192.0.2.20"], "ttl": 30 }
+  }
+}
+```
+
+- A literal key matches that name only. `app.example.internal` does not answer `foo.app.example.internal`.
+- `*.apps.example.internal` matches one extra label, such as `foo.apps.example.internal`. It does not match `a.b.apps.example.internal`.
+- The wildcard does not match the apex `apps.example.internal` unless `"apex": true` is set, or the apex has its own rule. An exact rule for the apex wins over `apex`.
+- Names match without regard to case or a trailing dot.
+- `a` and `aaaa` list addresses. At least one address is required. `ttl` defaults to 300 and must be from 1 through 86400.
+- A and AAAA queries return the addresses of that family. MX, TXT, and any other type are NOERROR with no answers (NODATA) and a synthetic SOA. An A or AAAA query is also NODATA when that family is not configured. An A query is NODATA when `allowips` or `denyips` remove every A record.
+- `allowsrc` on the static object, when set, refuses clients outside those prefixes before an answer is built. An empty list allows every client.
+- `allowips` and `denyips` stay on the grant and filter A answers. `denyips` wins. AAAA answers ignore `allowips`. An AAAA address covered by `denyips` is omitted.
+- `static` cannot be combined with `dns`, `rewrite`, `translateid`, or `ipnames`, and the key cannot be a CIDR. A wildcard key is valid only with `static`.
+- A name that matches no rule is forwarded as usual.
+
+`allowsrc`, `allowips`, and `denyips` on the winning rule still apply. A single-label wildcard beats a zone rule of the same parent for that one label. Extra labels under the wildcard still use the zone rule.
+
+The synthetic SOA is owned by the exact name, or by the wildcard parent. Its minimum is the static TTL, so NODATA can be cached. Positive static answers use the answer cache. `allowsrc` puts the client address in the cache key. The Rules tab and Lookup show the static addresses. Lookup does not query upstream unless resolve is requested.
 
 ### Encoded names
 
