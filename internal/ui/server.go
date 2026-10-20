@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -44,19 +45,20 @@ type LookupFunc func(ctx context.Context, req LookupRequest) (Lookup, error)
 
 // Server is the tailnet status site.
 type Server struct {
-	Snapshot         func() Snapshot
-	Peers            func() []Peer
-	Lookup           LookupFunc
-	History          *Ring
-	WhoIs            WhoIs
-	ViewCap          string
-	AuditCap         string
-	ViewGroups       []string
-	AuditGroups      []string
-	TrustedProxyTags []string
-	UserHeader       string
-	NameHeader       string
-	GroupsHeader     string
+	Snapshot          func() Snapshot
+	Peers             func() []Peer
+	Lookup            LookupFunc
+	History           *Ring
+	WhoIs             WhoIs
+	ViewCap           string
+	AuditCap          string
+	ViewGroups        []string
+	AuditGroups       []string
+	TrustedProxyTags  []string
+	TrustedProxyCIDRs []netip.Prefix
+	UserHeader        string
+	NameHeader        string
+	GroupsHeader      string
 	// Logf records a proxied viewer. It may be nil.
 	Logf func(format string, args ...any)
 }
@@ -64,6 +66,7 @@ type Server struct {
 // Handler is the read-only site. It rejects every method except GET and HEAD.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /{$}", s.page)
 	mux.HandleFunc("GET /assets/app.css", s.asset)
 	mux.HandleFunc("GET /assets/app.js", s.asset)
@@ -85,12 +88,30 @@ func (s *Server) Handler() http.Handler {
 // Serve listens with listen and serves until ctx is canceled.
 // listen is tsnet.Listen for the real process and net.Listen in tests.
 func (s *Server) Serve(ctx context.Context, listen func() (net.Listener, error)) error {
+	return s.serve(ctx, listen, false)
+}
+
+// ServeLocal serves the same site on a host listener.
+// Connections that are not in TrustedProxyCIDRs are denied and are not
+// identified with WhoIs.
+func (s *Server) ServeLocal(ctx context.Context, listen func() (net.Listener, error)) error {
+	return s.serve(ctx, listen, true)
+}
+
+func (s *Server) serve(ctx context.Context, listen func() (net.Listener, error), local bool) error {
 	ln, err := listen()
 	if err != nil {
 		return err
 	}
+	handler := s.Handler()
+	if local {
+		base := handler
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			base.ServeHTTP(w, r.WithContext(markLocal(r.Context())))
+		})
+	}
 	httpSrv := &http.Server{
-		Handler:           s.Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
@@ -107,6 +128,12 @@ func (s *Server) Serve(ctx context.Context, listen func() (net.Listener, error))
 		return nil
 	}
 	return err
+}
+
+func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Length", "0")
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) page(w http.ResponseWriter, r *http.Request) {
@@ -261,12 +288,29 @@ func (s *Server) allow(w http.ResponseWriter, r *http.Request, audit bool) (View
 }
 
 func (s *Server) authorize(r *http.Request, audit bool) (Viewer, error) {
-	if s == nil || s.WhoIs == nil {
+	if s == nil {
 		return Viewer{}, errors.New("no identity")
 	}
 	ip := remoteIP(r)
 	if ip == "" {
 		return Viewer{}, errors.New("no peer address")
+	}
+	if addr, ok := parseIP(ip); ok && prefixContains(s.TrustedProxyCIDRs, addr) {
+		parsed, perr := s.forwardedViewer(r)
+		parsed.ViaProxy = true
+		if perr != nil {
+			s.logProxy(parsed, false)
+			return Viewer{}, perr
+		}
+		// A CIDR proxy is not a tailnet node, so capability checks do not apply.
+		// Group lists still do. An empty group list allows the forwarded user.
+		return s.finishAuth(parsed, nil, audit, true)
+	}
+	if isLocal(r.Context()) {
+		return Viewer{}, errors.New("local listener outside trusted cidrs")
+	}
+	if s.WhoIs == nil {
+		return Viewer{}, errors.New("no identity")
 	}
 	caller, err := s.WhoIs(r.Context(), ip)
 	if err != nil || caller == nil {
@@ -286,12 +330,16 @@ func (s *Server) authorize(r *http.Request, audit bool) (Viewer, error) {
 	} else {
 		viewer = Viewer{Login: caller.Login, Name: caller.Name, Node: caller.Node}
 	}
+	return s.finishAuth(viewer, caller, audit, trusted)
+}
+
+func (s *Server) finishAuth(viewer Viewer, caller *Caller, audit, proxied bool) (Viewer, error) {
 	capName := s.ViewCap
 	if audit && s.AuditCap != "" {
 		capName = s.AuditCap
 	}
-	if capName != "" && !hasCap(caller.Caps, capName) {
-		if trusted {
+	if caller != nil && capName != "" && !hasCap(caller.Caps, capName) {
+		if proxied {
 			s.logProxy(viewer, false)
 		}
 		return Viewer{}, errors.New("missing capability")
@@ -301,7 +349,7 @@ func (s *Server) authorize(r *http.Request, audit bool) (Viewer, error) {
 		groups = s.AuditGroups
 	}
 	if len(groups) > 0 {
-		if viewer.ViaProxy {
+		if proxied {
 			if !hasAny(viewer.Groups, groups) {
 				s.logProxy(viewer, false)
 				return Viewer{}, errors.New("missing group")
@@ -312,7 +360,7 @@ func (s *Server) authorize(r *http.Request, audit bool) (Viewer, error) {
 			return Viewer{}, errors.New("direct viewer has no groups")
 		}
 	}
-	if trusted {
+	if proxied {
 		s.logProxy(viewer, true)
 	}
 	return viewer, nil
@@ -424,6 +472,40 @@ func hasAny(have, want []string) bool {
 	}
 	for _, item := range want {
 		if _, ok := set[strings.TrimSpace(item)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+type localKey struct{}
+
+func markLocal(ctx context.Context) context.Context {
+	return context.WithValue(ctx, localKey{}, true)
+}
+
+func isLocal(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(localKey{}).(bool)
+	return v
+}
+
+func parseIP(host string) (netip.Addr, bool) {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return addr.Unmap(), true
+}
+
+func prefixContains(prefixes []netip.Prefix, ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	for _, p := range prefixes {
+		if p.Contains(ip) {
 			return true
 		}
 	}

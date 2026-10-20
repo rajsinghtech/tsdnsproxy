@@ -178,6 +178,7 @@ func main() {
 		"cache_min_ttl", cfg.AnswerMinTTL.String(),
 		"cache_max_ttl", cfg.AnswerMaxTTL.String(),
 		"ui_addr", cfg.UIAddr,
+		"ui_local_addr", cfg.UILocalAddr,
 		"ui_history", cfg.UIHistory,
 	)
 
@@ -408,20 +409,21 @@ func main() {
 	}
 	dnsServer.SetLocalClient(lc)
 	routes.SetClient(lc)
-	if cfg.UIAddr != "" {
+	if cfg.UIAddr != "" || cfg.UILocalAddr != "" {
 		statusUI := &ui.Server{
-			Snapshot:         dnsServer.UISnapshot,
-			Peers:            dnsServer.UIPeers,
-			Lookup:           dnsServer.Explain,
-			History:          queryLog,
-			ViewCap:          cfg.UICap,
-			AuditCap:         cfg.UIAuditCap,
-			ViewGroups:       cfg.UIGroups,
-			AuditGroups:      cfg.UIAuditGroups,
-			TrustedProxyTags: cfg.UITrustedProxyTags,
-			UserHeader:       cfg.UIUserHeader,
-			NameHeader:       cfg.UINameHeader,
-			GroupsHeader:     cfg.UIGroupsHeader,
+			Snapshot:          dnsServer.UISnapshot,
+			Peers:             dnsServer.UIPeers,
+			Lookup:            dnsServer.Explain,
+			History:           queryLog,
+			ViewCap:           cfg.UICap,
+			AuditCap:          cfg.UIAuditCap,
+			ViewGroups:        cfg.UIGroups,
+			AuditGroups:       cfg.UIAuditGroups,
+			TrustedProxyTags:  cfg.UITrustedProxyTags,
+			TrustedProxyCIDRs: cfg.UITrustedProxyCIDRs,
+			UserHeader:        cfg.UIUserHeader,
+			NameHeader:        cfg.UINameHeader,
+			GroupsHeader:      cfg.UIGroupsHeader,
 			Logf: func(format string, args ...any) {
 				slog.Info(fmt.Sprintf(format, args...))
 			},
@@ -445,15 +447,28 @@ func main() {
 				return caller, nil
 			},
 		}
-		go func() {
-			slog.Info("status ui", "addr", cfg.UIAddr)
-			err := statusUI.Serve(ctx, func() (net.Listener, error) {
-				return s.Listen("tcp", cfg.UIAddr)
-			})
-			if err != nil && ctx.Err() == nil {
-				slog.Error("status ui stopped", "err", err.Error())
-			}
-		}()
+		if cfg.UIAddr != "" {
+			go func() {
+				slog.Info("status ui", "addr", cfg.UIAddr)
+				err := statusUI.Serve(ctx, func() (net.Listener, error) {
+					return s.Listen("tcp", cfg.UIAddr)
+				})
+				if err != nil && ctx.Err() == nil {
+					slog.Error("status ui stopped", "err", err.Error())
+				}
+			}()
+		}
+		if cfg.UILocalAddr != "" {
+			go func() {
+				slog.Info("status ui", "local_addr", cfg.UILocalAddr)
+				err := statusUI.ServeLocal(ctx, func() (net.Listener, error) {
+					return net.Listen("tcp", cfg.UILocalAddr)
+				})
+				if err != nil && ctx.Err() == nil {
+					slog.Error("status ui stopped", "addr", cfg.UILocalAddr, "err", err.Error())
+				}
+			}()
+		}
 	}
 
 	if needRoutes {

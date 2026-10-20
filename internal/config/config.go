@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -16,44 +17,46 @@ import (
 
 // Config is the process configuration.
 type Config struct {
-	AuthKey            string
-	Hostname           string
-	StateDir           string
-	State              string
-	ControlURL         string
-	AdvertiseTags      string
-	OverrideDNS        string
-	CacheTTL           time.Duration
-	HTTPAddr           string
-	ListenAddrs        string
-	Service            string
-	AcceptRoutes       bool
-	Dial               string
-	DialSet            bool
-	LogLevel           string
-	CapName            string
-	RulesFile          string
-	RulesOnly          bool
-	MaxInflight        int
-	MaxMessageBytes    int
-	MaxUDPBytes        int
-	RateLimit          float64
-	RateBurst          int
-	QueryTimeout       time.Duration
-	DNSCache           bool
-	AnswerCacheSize    int
-	AnswerMinTTL       time.Duration
-	AnswerMaxTTL       time.Duration
-	UIAddr             string
-	UIHistory          int
-	UICap              string
-	UIAuditCap         string
-	UITrustedProxyTags []string
-	UIUserHeader       string
-	UINameHeader       string
-	UIGroupsHeader     string
-	UIGroups           []string
-	UIAuditGroups      []string
+	AuthKey             string
+	Hostname            string
+	StateDir            string
+	State               string
+	ControlURL          string
+	AdvertiseTags       string
+	OverrideDNS         string
+	CacheTTL            time.Duration
+	HTTPAddr            string
+	ListenAddrs         string
+	Service             string
+	AcceptRoutes        bool
+	Dial                string
+	DialSet             bool
+	LogLevel            string
+	CapName             string
+	RulesFile           string
+	RulesOnly           bool
+	MaxInflight         int
+	MaxMessageBytes     int
+	MaxUDPBytes         int
+	RateLimit           float64
+	RateBurst           int
+	QueryTimeout        time.Duration
+	DNSCache            bool
+	AnswerCacheSize     int
+	AnswerMinTTL        time.Duration
+	AnswerMaxTTL        time.Duration
+	UIAddr              string
+	UIHistory           int
+	UICap               string
+	UIAuditCap          string
+	UITrustedProxyTags  []string
+	UIUserHeader        string
+	UINameHeader        string
+	UIGroupsHeader      string
+	UIGroups            []string
+	UIAuditGroups       []string
+	UILocalAddr         string
+	UITrustedProxyCIDRs []netip.Prefix
 }
 
 // Parse reads args as flags. Environment variables supply the defaults.
@@ -97,7 +100,9 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	fs.IntVar(&cfg.UIHistory, "ui-history", intEnv(getenv, "TSDNSPROXY_UI_HISTORY", 1000), "recent DNS queries to keep; 0 disables the log")
 	fs.StringVar(&cfg.UICap, "ui-cap", getenv("TSDNSPROXY_UI_CAP"), "capability required to open the UI; empty allows any identified tailnet peer")
 	fs.StringVar(&cfg.UIAuditCap, "ui-audit-cap", getenv("TSDNSPROXY_UI_AUDIT_CAP"), "capability required to see peers, queries, and access; empty uses the UI rule")
-	var proxyTags, userHeader, nameHeader, groupsHeader, viewGroups, auditGroups string
+	var proxyTags, userHeader, nameHeader, groupsHeader, viewGroups, auditGroups, proxyCIDRs string
+	fs.StringVar(&cfg.UILocalAddr, "ui-local-addr", getenv("TSDNSPROXY_UI_LOCAL_ADDR"), "optional pod address for the status UI, for example 0.0.0.0:8081")
+	fs.StringVar(&proxyCIDRs, "ui-trusted-proxy-cidrs", getenv("TSDNSPROXY_UI_TRUSTED_PROXY_CIDRS"), "comma-separated CIDRs whose connections may forward UI identity headers")
 	fs.StringVar(&proxyTags, "ui-trusted-proxy-tags", getenv("TSDNSPROXY_UI_TRUSTED_PROXY_TAGS"), "comma-separated tags whose nodes may forward UI identity headers")
 	fs.StringVar(&userHeader, "ui-user-header", envOr(getenv, "TSDNSPROXY_UI_USER_HEADER", "Tailscale-User-Login"), "header with the proxied user login")
 	fs.StringVar(&nameHeader, "ui-name-header", envOr(getenv, "TSDNSPROXY_UI_NAME_HEADER", "Tailscale-User-Name"), "header with the proxied display name")
@@ -114,6 +119,12 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	cfg.UIUserHeader = strings.TrimSpace(userHeader)
 	cfg.UINameHeader = strings.TrimSpace(nameHeader)
 	cfg.UIGroupsHeader = strings.TrimSpace(groupsHeader)
+	cfg.UILocalAddr = strings.TrimSpace(cfg.UILocalAddr)
+	cidrs, err := parsePrefixes(proxyCIDRs)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.UITrustedProxyCIDRs = cidrs
 	if cfg.UIAddr == "-" {
 		cfg.UIAddr = ""
 	}
@@ -171,6 +182,14 @@ func (c Config) Validate() error {
 			return fmt.Errorf("ui-addr: %w", err)
 		}
 	}
+	if c.UILocalAddr != "" {
+		if _, err := net.ResolveTCPAddr("tcp", c.UILocalAddr); err != nil {
+			return fmt.Errorf("ui-local-addr: %w", err)
+		}
+		if len(c.UITrustedProxyCIDRs) == 0 {
+			return fmt.Errorf("ui-local-addr requires ui-trusted-proxy-cidrs")
+		}
+	}
 	if err := validHeaderName("ui-user-header", c.UIUserHeader); err != nil {
 		return err
 	}
@@ -217,6 +236,28 @@ func ParseLogLevel(raw string) (slog.Level, error) {
 	default:
 		return 0, fmt.Errorf("log level %q is not debug, info, warn, or error", raw)
 	}
+}
+
+func parsePrefixes(raw string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	seen := map[netip.Prefix]struct{}{}
+	for _, part := range strings.Split(raw, ",") {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		p, err := netip.ParsePrefix(item)
+		if err != nil {
+			return nil, fmt.Errorf("ui-trusted-proxy-cidrs %q: %w", item, err)
+		}
+		p = p.Masked()
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 func splitList(raw string) []string {

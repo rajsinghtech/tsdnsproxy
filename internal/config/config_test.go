@@ -32,6 +32,9 @@ func TestParseDefaults(t *testing.T) {
 	if cfg.UITrustedProxyTags != nil || cfg.UIGroups != nil || cfg.UIAuditGroups != nil {
 		t.Fatalf("proxy defaults %+v", cfg)
 	}
+	if cfg.UILocalAddr != "" || cfg.UITrustedProxyCIDRs != nil {
+		t.Fatalf("local ui defaults %+v", cfg)
+	}
 }
 
 func TestParseEnvAndFlags(t *testing.T) {
@@ -78,6 +81,10 @@ func TestParseRejectsBadValues(t *testing.T) {
 		{"-ui-user-header", "Bad Header"},
 		{"-ui-groups", "dns admins"},
 		{"-ui-trusted-proxy-tags", "tag proxy"},
+		{"-ui-local-addr", "not an address"},
+		{"-ui-local-addr", "127.0.0.1:8081"},
+		{"-ui-trusted-proxy-cidrs", "not-a-cidr"},
+		{"-ui-trusted-proxy-cidrs", "10.0.0.0/99"},
 	}
 	for _, args := range cases {
 		if _, err := Parse(args, nil); err == nil {
@@ -144,6 +151,13 @@ func TestParseUIProxyFlags(t *testing.T) {
 	}
 	if cfg.UIUserHeader != "X-User" || cfg.UINameHeader != "Tailscale-User-Name" {
 		t.Fatalf("headers %+v", cfg)
+	}
+	local, err := Parse([]string{"-ui-local-addr", "0.0.0.0:8081", "-ui-trusted-proxy-cidrs", "192.0.2.0/24, 10.0.0.0/8, 10.0.0.0/8"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.UILocalAddr != "0.0.0.0:8081" || len(local.UITrustedProxyCIDRs) != 2 {
+		t.Fatalf("local %+v", local)
 	}
 	flagged, err := Parse([]string{"-ui-groups", "dns-admins", "-ui-trusted-proxy-tags", "tag:edge"}, func(k string) string {
 		if k == "TSDNSPROXY_UI_GROUPS" {
