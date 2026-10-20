@@ -84,6 +84,11 @@ function ruleCells(r) {
   if (r.translate_id != null && r.translate_id > 0) policy.push("4via6 " + r.translate_id);
   if (r.site_prefix) policy.push(r.site_prefix);
   if (r.ipnames) policy.push("ipnames site " + r.ipnames.site_id + (r.ipnames.a ? " a=" + r.ipnames.a : ""));
+  if (r.static) {
+    const addrs = [].concat(r.static.a || [], r.static.aaaa || []);
+    policy.push("static " + addrs.join(" ") + (r.static.ttl ? " ttl " + r.static.ttl : ""));
+    if (r.static.apex) policy.push("apex");
+  }
   if (r.allow_ips && r.allow_ips.length) policy.push("allowips " + r.allow_ips.join(" "));
   if (r.allow_src && r.allow_src.length) policy.push("allowsrc " + r.allow_src.join(" "));
   if (r.ipnames && r.ipnames.allow_src && r.ipnames.allow_src.length) policy.push("allowsrc " + r.ipnames.allow_src.join(" "));
@@ -91,7 +96,7 @@ function ruleCells(r) {
     el("span", r.domain, "mono"),
     pill(r.source || ""),
     policy.join(" · "),
-    el("span", join(r.backends) || (r.ipnames ? "" : "default"), "mono")
+    el("span", join(r.backends) || (r.ipnames || r.static ? "" : "default"), "mono")
   ];
 }
 

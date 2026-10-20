@@ -69,6 +69,15 @@ type Rule struct {
 	DenyIPs     []string `json:"deny_ips,omitempty"`
 	AllowSrc    []string `json:"allow_src,omitempty"`
 	IPNames     *IPNames `json:"ipnames,omitempty"`
+	Static      *Static  `json:"static,omitempty"`
+}
+
+// Static is a configured address answer for one name or single-label wildcard.
+type Static struct {
+	A    []string `json:"a,omitempty"`
+	AAAA []string `json:"aaaa,omitempty"`
+	TTL  int      `json:"ttl,omitempty"`
+	Apex bool     `json:"apex,omitempty"`
 }
 
 // IPNames is the encoded-name zone on a rule.

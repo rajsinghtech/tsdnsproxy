@@ -321,10 +321,10 @@ func queryDO(q *dnsmessage.Message) bool {
 func policyBindsSource(cfgs []grants.GrantConfig) bool {
 	for _, cfg := range cfgs {
 		for _, grant := range cfg {
-			if grant.IPNames == nil {
-				continue
+			if grant.IPNames != nil && (len(grant.IPNames.AllowSrc) > 0 || strings.EqualFold(grant.IPNames.A, "direct")) {
+				return true
 			}
-			if len(grant.IPNames.AllowSrc) > 0 || strings.EqualFold(grant.IPNames.A, "direct") {
+			if grant.Static != nil && len(grant.Static.AllowSrc) > 0 {
 				return true
 			}
 		}
@@ -378,6 +378,13 @@ func canonGrant(g grants.DNSGrant) grants.DNSGrant {
 		cp.DirectSrc = sortedCopy(cp.DirectSrc)
 		cp.AllowIPs = sortedCopy(cp.AllowIPs)
 		g.IPNames = &cp
+	}
+	if g.Static != nil {
+		cp := *g.Static
+		cp.A = append([]string(nil), g.Static.A...)
+		cp.AAAA = append([]string(nil), g.Static.AAAA...)
+		cp.AllowSrc = sortedCopy(g.Static.AllowSrc)
+		g.Static = &cp
 	}
 	return g
 }

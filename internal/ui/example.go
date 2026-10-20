@@ -30,6 +30,7 @@ func ExampleSnapshot() Snapshot {
 			{Domain: "example.internal", Source: "rules", Rewrite: "svc.example", Backends: []string{"10.0.0.53:53"}},
 			{Domain: "site.example", Source: "rules", TranslateID: &id, SitePrefix: "fd7a:115c:a1e0:b1a:0:7::/96", AllowIPs: []string{"10.0.0.0/8"}, Backends: []string{"10.0.0.53:53"}},
 			{Domain: "ip", Source: "rules", SitePrefix: "fd7a:115c:a1e0:b1a:0:1::/96", IPNames: &IPNames{SiteID: 1, A: "never", AllowIPs: []string{"10.0.0.0/8"}, SitePrefix: "fd7a:115c:a1e0:b1a:0:1::/96"}},
+			{Domain: "*.apps.example.internal", Source: "rules", Static: &Static{A: []string{"192.0.2.20"}, TTL: 30}},
 		},
 		Backends: []Backend{
 			{Address: "10.0.0.53:53", Mode: "tailnet", Healthy: true},
