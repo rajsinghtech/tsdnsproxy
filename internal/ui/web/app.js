@@ -132,6 +132,7 @@ async function renderOverview() {
   meta.appendChild(el("div", c.version || "dev"));
   meta.appendChild(el("div", c.image || "image not set"));
   meta.appendChild(el("div", "up " + dur(c.uptime_sec)));
+  if (viewerText(c.viewer)) meta.appendChild(el("div", viewerText(c.viewer)));
   const panel = $("#overview");
   clear(panel);
   const cards = el("div", null, "cards");
@@ -167,10 +168,36 @@ async function renderRules() {
   panel.appendChild(table(["Domain", "Source", "Policy", "Backends"], (c.rules || []).map(ruleCells)));
 }
 
+function viewerText(v) {
+  if (!v) return "";
+  const who = v.login || v.name || v.node || "";
+  if (!who && !v.via_proxy) return "";
+  let text = "Viewing as " + (who || "unknown");
+  if (v.name && v.login && v.name !== v.login) text += " (" + v.name + ")";
+  if (v.via_proxy) text += " via proxy";
+  if (v.groups && v.groups.length) text += " · " + v.groups.join(", ");
+  return text;
+}
+function showViewer(panel, v) {
+  const text = viewerText(v);
+  let line = panel.querySelector(":scope > .viewer");
+  if (!text) {
+    if (line) line.remove();
+    return;
+  }
+  if (!line) {
+    line = el("p", text, "muted viewer");
+    panel.insertBefore(line, panel.firstChild);
+  } else {
+    line.textContent = text;
+  }
+}
+
 async function renderPeers() {
   const data = await getJSON("/api/peers");
   const panel = $("#peers");
   clear(panel);
+  showViewer(panel, data.viewer);
   const rows = (data.peers || []).map((p) => {
     const btn = el("button", p.node || p.id, "link mono");
     btn.type = "button";
@@ -235,6 +262,7 @@ async function renderQueries() {
   if (domain) params.set("domain", domain);
   if (rcode) params.set("rcode", rcode);
   const data = await getJSON("/api/queries?" + params.toString());
+  showViewer(panel, data.viewer);
   const box = $(".query-table", panel);
   clear(box);
   if (!data.enabled) box.appendChild(el("p", "The query log is off. Set -ui-history above 0 to keep one.", "muted"));
@@ -267,6 +295,7 @@ async function renderAccess() {
   const data = await getJSON("/api/access");
   const panel = $("#access");
   clear(panel);
+  showViewer(panel, data.viewer);
   const cards = el("div", null, "cards");
   [["Questions", String(data.total || 0)], ["Refused", String(data.refused || 0)]].forEach((it) => {
     const card = el("div", null, "card");

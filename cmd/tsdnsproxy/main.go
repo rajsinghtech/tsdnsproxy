@@ -410,22 +410,39 @@ func main() {
 	routes.SetClient(lc)
 	if cfg.UIAddr != "" {
 		statusUI := &ui.Server{
-			Snapshot: dnsServer.UISnapshot,
-			Peers:    dnsServer.UIPeers,
-			Lookup:   dnsServer.Explain,
-			History:  queryLog,
-			ViewCap:  cfg.UICap,
-			AuditCap: cfg.UIAuditCap,
-			WhoIs: func(ctx context.Context, ip string) ([]string, error) {
+			Snapshot:         dnsServer.UISnapshot,
+			Peers:            dnsServer.UIPeers,
+			Lookup:           dnsServer.Explain,
+			History:          queryLog,
+			ViewCap:          cfg.UICap,
+			AuditCap:         cfg.UIAuditCap,
+			ViewGroups:       cfg.UIGroups,
+			AuditGroups:      cfg.UIAuditGroups,
+			TrustedProxyTags: cfg.UITrustedProxyTags,
+			UserHeader:       cfg.UIUserHeader,
+			NameHeader:       cfg.UINameHeader,
+			GroupsHeader:     cfg.UIGroupsHeader,
+			Logf: func(format string, args ...any) {
+				slog.Info(fmt.Sprintf(format, args...))
+			},
+			WhoIs: func(ctx context.Context, ip string) (*ui.Caller, error) {
 				resp, err := lc.WhoIs(ctx, ip)
 				if err != nil || resp == nil {
 					return nil, err
 				}
-				caps := make([]string, 0, len(resp.CapMap))
+				caller := &ui.Caller{}
 				for name := range resp.CapMap {
-					caps = append(caps, string(name))
+					caller.Caps = append(caller.Caps, string(name))
 				}
-				return caps, nil
+				if resp.Node != nil {
+					caller.Tags = append([]string(nil), resp.Node.Tags...)
+					caller.Node = strings.TrimSuffix(resp.Node.Name, ".")
+				}
+				if resp.UserProfile != nil {
+					caller.Login = resp.UserProfile.LoginName
+					caller.Name = resp.UserProfile.DisplayName
+				}
+				return caller, nil
 			},
 		}
 		go func() {

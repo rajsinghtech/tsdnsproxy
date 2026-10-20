@@ -89,6 +89,12 @@ Flags and environment variables. Durations use Go syntax (`10s`, `5m`).
 | `-ui-history` | `TSDNSPROXY_UI_HISTORY` | `1000` |
 | `-ui-cap` | `TSDNSPROXY_UI_CAP` | empty |
 | `-ui-audit-cap` | `TSDNSPROXY_UI_AUDIT_CAP` | empty |
+| `-ui-trusted-proxy-tags` | `TSDNSPROXY_UI_TRUSTED_PROXY_TAGS` | empty |
+| `-ui-user-header` | `TSDNSPROXY_UI_USER_HEADER` | `Tailscale-User-Login` |
+| `-ui-name-header` | `TSDNSPROXY_UI_NAME_HEADER` | `Tailscale-User-Name` |
+| `-ui-groups-header` | `TSDNSPROXY_UI_GROUPS_HEADER` | `X-Tailscale-Groups` |
+| `-ui-groups` | `TSDNSPROXY_UI_GROUPS` | empty |
+| `-ui-audit-groups` | `TSDNSPROXY_UI_AUDIT_GROUPS` | empty |
 | `-http-addr` | `TSDNSPROXY_HTTP_ADDR` | `:8080` |
 | `-log-level` | `TSDNSPROXY_LOG_LEVEL` | `info` |
 | `-query-timeout` | `TSDNSPROXY_QUERY_TIMEOUT` | `10s` |
@@ -125,6 +131,16 @@ The cache key is the question name, type, class, the DO and CD bits, and a hash 
 The pages are Overview, Rules, Peers, Queries, Access, Backends, and Lookup. Assets are embedded. There is no CDN. The JSON endpoints are `/api/config`, `/api/peers`, `/api/queries`, `/api/access`, and `/api/lookup`.
 
 Any identified tailnet peer can open the site. Set `-ui-cap` to a capability name, for example `example.com/cap/dns/ui`, to require that capability on the viewer's node. Peers, Queries, and Access show user identities, so they can be restricted further with `-ui-audit-cap`, for example `example.com/cap/dns/audit`. When `-ui-audit-cap` is empty, those pages use the same rule as the rest of the site.
+
+`-ui-trusted-proxy-tags` is a comma-separated list of node tags, for example `tag:proxy`. When the TCP peer has one of those tags, the site reads the viewer from forwarded headers instead of treating the proxy node as the user. The default headers are `Tailscale-User-Login`, `Tailscale-User-Name`, and `X-Tailscale-Groups`. The groups header is a comma-separated list. `-ui-user-header`, `-ui-name-header`, and `-ui-groups-header` rename them. A peer that does not have a trusted tag is a direct viewer: the headers are ignored, so a client cannot spoof a login or a group. A trusted proxy with no user header is rejected. The proxy node is not a viewer on its own.
+
+`-ui-groups`, for example `dns-admins,dns-readers`, requires a proxied user to be in one of those groups. `-ui-audit-groups` does the same for Peers, Queries, and Access. When `-ui-audit-groups` is empty, those pages use `-ui-groups`. Names match exactly.
+
+WhoIs does not include groups, so a direct viewer has none. A direct viewer passes a group check only when that page's capability is configured and the viewer holds it. If a group list is set and the capability for that page is empty, direct viewers are denied. A proxied user who is outside the group is denied even when the proxy node holds the capability. When a capability is also set, the connecting peer must hold it, and a proxied user must still match the group.
+
+When `-ui-trusted-proxy-tags`, `-ui-groups`, and `-ui-audit-groups` are empty, `-ui-cap` and `-ui-audit-cap` behave as before.
+
+Peers, Queries, and Access show the viewer. A proxied viewer is marked `via proxy`, and the process logs that login.
 
 `-ui-history` is how many recent queries are kept in memory. `0` disables the log. The log records the peer, the question, the matched rule, the action, the rcode, and whether the answer cache hit. It does not record auth keys. Text matching `tskey-` is replaced with `tskey-redacted`.
 

@@ -37,12 +37,12 @@ func TestAPIShapeRedactionAndGating(t *testing.T) {
 		History:  ring,
 		ViewCap:  "example.com/cap/dns",
 		AuditCap: "example.com/cap/dns/audit",
-		WhoIs: func(_ context.Context, ip string) ([]string, error) {
+		WhoIs: func(_ context.Context, ip string) (*Caller, error) {
 			switch ip {
 			case "192.0.2.1":
-				return []string{"example.com/cap/dns", "example.com/cap/dns/audit"}, nil
+				return &Caller{Caps: []string{"example.com/cap/dns", "example.com/cap/dns/audit"}, Login: "alice@example.com"}, nil
 			case "192.0.2.2":
-				return []string{"example.com/cap/dns"}, nil
+				return &Caller{Caps: []string{"example.com/cap/dns"}, Login: "bob@example.com"}, nil
 			default:
 				return nil, errDenied
 			}

@@ -16,38 +16,44 @@ import (
 
 // Config is the process configuration.
 type Config struct {
-	AuthKey         string
-	Hostname        string
-	StateDir        string
-	State           string
-	ControlURL      string
-	AdvertiseTags   string
-	OverrideDNS     string
-	CacheTTL        time.Duration
-	HTTPAddr        string
-	ListenAddrs     string
-	Service         string
-	AcceptRoutes    bool
-	Dial            string
-	DialSet         bool
-	LogLevel        string
-	CapName         string
-	RulesFile       string
-	RulesOnly       bool
-	MaxInflight     int
-	MaxMessageBytes int
-	MaxUDPBytes     int
-	RateLimit       float64
-	RateBurst       int
-	QueryTimeout    time.Duration
-	DNSCache        bool
-	AnswerCacheSize int
-	AnswerMinTTL    time.Duration
-	AnswerMaxTTL    time.Duration
-	UIAddr          string
-	UIHistory       int
-	UICap           string
-	UIAuditCap      string
+	AuthKey            string
+	Hostname           string
+	StateDir           string
+	State              string
+	ControlURL         string
+	AdvertiseTags      string
+	OverrideDNS        string
+	CacheTTL           time.Duration
+	HTTPAddr           string
+	ListenAddrs        string
+	Service            string
+	AcceptRoutes       bool
+	Dial               string
+	DialSet            bool
+	LogLevel           string
+	CapName            string
+	RulesFile          string
+	RulesOnly          bool
+	MaxInflight        int
+	MaxMessageBytes    int
+	MaxUDPBytes        int
+	RateLimit          float64
+	RateBurst          int
+	QueryTimeout       time.Duration
+	DNSCache           bool
+	AnswerCacheSize    int
+	AnswerMinTTL       time.Duration
+	AnswerMaxTTL       time.Duration
+	UIAddr             string
+	UIHistory          int
+	UICap              string
+	UIAuditCap         string
+	UITrustedProxyTags []string
+	UIUserHeader       string
+	UINameHeader       string
+	UIGroupsHeader     string
+	UIGroups           []string
+	UIAuditGroups      []string
 }
 
 // Parse reads args as flags. Environment variables supply the defaults.
@@ -91,10 +97,23 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	fs.IntVar(&cfg.UIHistory, "ui-history", intEnv(getenv, "TSDNSPROXY_UI_HISTORY", 1000), "recent DNS queries to keep; 0 disables the log")
 	fs.StringVar(&cfg.UICap, "ui-cap", getenv("TSDNSPROXY_UI_CAP"), "capability required to open the UI; empty allows any identified tailnet peer")
 	fs.StringVar(&cfg.UIAuditCap, "ui-audit-cap", getenv("TSDNSPROXY_UI_AUDIT_CAP"), "capability required to see peers, queries, and access; empty uses the UI rule")
+	var proxyTags, userHeader, nameHeader, groupsHeader, viewGroups, auditGroups string
+	fs.StringVar(&proxyTags, "ui-trusted-proxy-tags", getenv("TSDNSPROXY_UI_TRUSTED_PROXY_TAGS"), "comma-separated tags whose nodes may forward UI identity headers")
+	fs.StringVar(&userHeader, "ui-user-header", envOr(getenv, "TSDNSPROXY_UI_USER_HEADER", "Tailscale-User-Login"), "header with the proxied user login")
+	fs.StringVar(&nameHeader, "ui-name-header", envOr(getenv, "TSDNSPROXY_UI_NAME_HEADER", "Tailscale-User-Name"), "header with the proxied display name")
+	fs.StringVar(&groupsHeader, "ui-groups-header", envOr(getenv, "TSDNSPROXY_UI_GROUPS_HEADER", "X-Tailscale-Groups"), "header with comma-separated proxied groups")
+	fs.StringVar(&viewGroups, "ui-groups", getenv("TSDNSPROXY_UI_GROUPS"), "comma-separated groups allowed to open the UI")
+	fs.StringVar(&auditGroups, "ui-audit-groups", getenv("TSDNSPROXY_UI_AUDIT_GROUPS"), "comma-separated groups allowed to see peers, queries, and access; empty uses ui-groups")
 
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
+	cfg.UITrustedProxyTags = splitList(proxyTags)
+	cfg.UIGroups = splitList(viewGroups)
+	cfg.UIAuditGroups = splitList(auditGroups)
+	cfg.UIUserHeader = strings.TrimSpace(userHeader)
+	cfg.UINameHeader = strings.TrimSpace(nameHeader)
+	cfg.UIGroupsHeader = strings.TrimSpace(groupsHeader)
 	if cfg.UIAddr == "-" {
 		cfg.UIAddr = ""
 	}
@@ -152,6 +171,24 @@ func (c Config) Validate() error {
 			return fmt.Errorf("ui-addr: %w", err)
 		}
 	}
+	if err := validHeaderName("ui-user-header", c.UIUserHeader); err != nil {
+		return err
+	}
+	if err := validHeaderName("ui-name-header", c.UINameHeader); err != nil {
+		return err
+	}
+	if err := validHeaderName("ui-groups-header", c.UIGroupsHeader); err != nil {
+		return err
+	}
+	if err := validList("ui-trusted-proxy-tags", c.UITrustedProxyTags); err != nil {
+		return err
+	}
+	if err := validList("ui-groups", c.UIGroups); err != nil {
+		return err
+	}
+	if err := validList("ui-audit-groups", c.UIAuditGroups); err != nil {
+		return err
+	}
 	if _, err := ParseLogLevel(c.LogLevel); err != nil {
 		return err
 	}
@@ -180,6 +217,51 @@ func ParseLogLevel(raw string) (slog.Level, error) {
 	default:
 		return 0, fmt.Errorf("log level %q is not debug, info, warn, or error", raw)
 	}
+}
+
+func splitList(raw string) []string {
+	var out []string
+	seen := map[string]struct{}{}
+	for _, part := range strings.Split(raw, ",") {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func validHeaderName(flagName, name string) error {
+	if name == "" {
+		return fmt.Errorf("%s is empty", flagName)
+	}
+	if len(name) > 128 || !tokenString(name) {
+		return fmt.Errorf("%s %q is not a header name", flagName, name)
+	}
+	return nil
+}
+
+func validList(flagName string, items []string) error {
+	for _, item := range items {
+		if len(item) > 128 || strings.ContainsAny(item, " \t\r\n") {
+			return fmt.Errorf("%s entry %q is invalid", flagName, item)
+		}
+	}
+	return nil
+}
+
+func tokenString(name string) bool {
+	for _, r := range name {
+		if r <= ' ' || r >= 127 || r == ':' {
+			return false
+		}
+	}
+	return true
 }
 
 func envOr(getenv func(string) string, key, fallback string) string {
