@@ -26,6 +26,12 @@ func TestParseDefaults(t *testing.T) {
 	if cfg.UIAddr != ":80" || cfg.UIHistory != 1000 || cfg.UICap != "" || cfg.UIAuditCap != "" {
 		t.Fatalf("ui defaults %+v", cfg)
 	}
+	if cfg.UIUserHeader != "Tailscale-User-Login" || cfg.UINameHeader != "Tailscale-User-Name" || cfg.UIGroupsHeader != "X-Tailscale-Groups" {
+		t.Fatalf("header defaults %+v", cfg)
+	}
+	if cfg.UITrustedProxyTags != nil || cfg.UIGroups != nil || cfg.UIAuditGroups != nil {
+		t.Fatalf("proxy defaults %+v", cfg)
+	}
 }
 
 func TestParseEnvAndFlags(t *testing.T) {
@@ -68,6 +74,10 @@ func TestParseRejectsBadValues(t *testing.T) {
 		{"-cache-min-ttl", "2h", "-cache-max-ttl", "1h"},
 		{"-ui-history", "-1"},
 		{"-ui-addr", "not an address"},
+		{"-ui-user-header", ""},
+		{"-ui-user-header", "Bad Header"},
+		{"-ui-groups", "dns admins"},
+		{"-ui-trusted-proxy-tags", "tag proxy"},
 	}
 	for _, args := range cases {
 		if _, err := Parse(args, nil); err == nil {
@@ -105,6 +115,47 @@ func TestParseDNSCacheDisabled(t *testing.T) {
 	}
 	if uiOff.UIAddr != "" {
 		t.Fatalf("ui addr %q", uiOff.UIAddr)
+	}
+}
+
+func TestParseUIProxyFlags(t *testing.T) {
+	cfg, err := Parse(nil, func(k string) string {
+		switch k {
+		case "TSDNSPROXY_UI_TRUSTED_PROXY_TAGS":
+			return "tag:proxy, tag:proxy"
+		case "TSDNSPROXY_UI_GROUPS":
+			return "dns-admins, dns-readers"
+		case "TSDNSPROXY_UI_AUDIT_GROUPS":
+			return "dns-auditors"
+		case "TSDNSPROXY_UI_USER_HEADER":
+			return "X-User"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(cfg.UITrustedProxyTags, ",") != "tag:proxy" {
+		t.Fatalf("tags %v", cfg.UITrustedProxyTags)
+	}
+	if strings.Join(cfg.UIGroups, ",") != "dns-admins,dns-readers" || strings.Join(cfg.UIAuditGroups, ",") != "dns-auditors" {
+		t.Fatalf("groups %+v", cfg)
+	}
+	if cfg.UIUserHeader != "X-User" || cfg.UINameHeader != "Tailscale-User-Name" {
+		t.Fatalf("headers %+v", cfg)
+	}
+	flagged, err := Parse([]string{"-ui-groups", "dns-admins", "-ui-trusted-proxy-tags", "tag:edge"}, func(k string) string {
+		if k == "TSDNSPROXY_UI_GROUPS" {
+			return "dns-readers"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(flagged.UIGroups, ",") != "dns-admins" || strings.Join(flagged.UITrustedProxyTags, ",") != "tag:edge" {
+		t.Fatalf("flags did not override env: %+v", flagged)
 	}
 }
 

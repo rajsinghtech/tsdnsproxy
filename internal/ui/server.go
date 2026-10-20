@@ -16,9 +16,27 @@ import (
 //go:embed web/*
 var web embed.FS
 
-// WhoIs reports the capability names granted to a tailnet address.
-// A nil slice and a nil error means the address is not an identified peer.
-type WhoIs func(ctx context.Context, ip string) (caps []string, err error)
+const (
+	defaultUserHeader   = "Tailscale-User-Login"
+	defaultNameHeader   = "Tailscale-User-Name"
+	defaultGroupsHeader = "X-Tailscale-Groups"
+	maxIdentityLen      = 256
+	maxGroupsHeader     = 2048
+	maxGroups           = 32
+)
+
+// Caller is the tailnet node at the TCP remote address.
+// A nil Caller and a nil error means the address is not an identified peer.
+type Caller struct {
+	Caps  []string
+	Tags  []string
+	Node  string
+	Login string
+	Name  string
+}
+
+// WhoIs reports the tailnet node at an address.
+type WhoIs func(ctx context.Context, ip string) (*Caller, error)
 
 // LookupFunc answers a dry-run question. It must not contact an upstream
 // unless req.Forward is true.
@@ -26,13 +44,21 @@ type LookupFunc func(ctx context.Context, req LookupRequest) (Lookup, error)
 
 // Server is the tailnet status site.
 type Server struct {
-	Snapshot func() Snapshot
-	Peers    func() []Peer
-	Lookup   LookupFunc
-	History  *Ring
-	WhoIs    WhoIs
-	ViewCap  string
-	AuditCap string
+	Snapshot         func() Snapshot
+	Peers            func() []Peer
+	Lookup           LookupFunc
+	History          *Ring
+	WhoIs            WhoIs
+	ViewCap          string
+	AuditCap         string
+	ViewGroups       []string
+	AuditGroups      []string
+	TrustedProxyTags []string
+	UserHeader       string
+	NameHeader       string
+	GroupsHeader     string
+	// Logf records a proxied viewer. It may be nil.
+	Logf func(format string, args ...any)
 }
 
 // Handler is the read-only site. It rejects every method except GET and HEAD.
@@ -84,14 +110,14 @@ func (s *Server) Serve(ctx context.Context, listen func() (net.Listener, error))
 }
 
 func (s *Server) page(w http.ResponseWriter, r *http.Request) {
-	if !s.allow(w, r, false) {
+	if _, ok := s.allow(w, r, false); !ok {
 		return
 	}
 	serveFile(w, r, "web/index.html")
 }
 
 func (s *Server) asset(w http.ResponseWriter, r *http.Request) {
-	if !s.allow(w, r, false) {
+	if _, ok := s.allow(w, r, false); !ok {
 		return
 	}
 	name := strings.TrimPrefix(r.URL.Path, "/assets/")
@@ -103,7 +129,8 @@ func (s *Server) asset(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) config(w http.ResponseWriter, r *http.Request) {
-	if !s.allow(w, r, false) {
+	viewer, ok := s.allow(w, r, false)
+	if !ok {
 		return
 	}
 	snap := Snapshot{}
@@ -112,6 +139,7 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 	}
 	snap.ViewCap = s.ViewCap
 	snap.AuditCap = s.AuditCap
+	snap.Viewer = viewer
 	if s.History != nil {
 		snap.HistoryLimit = s.History.Size()
 		snap.HistoryEnabled = s.History.Size() > 0
@@ -120,7 +148,8 @@ func (s *Server) config(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) peers(w http.ResponseWriter, r *http.Request) {
-	if !s.allow(w, r, true) {
+	viewer, ok := s.allow(w, r, true)
+	if !ok {
 		return
 	}
 	list := []Peer{}
@@ -129,7 +158,7 @@ func (s *Server) peers(w http.ResponseWriter, r *http.Request) {
 	}
 	id := strings.TrimSpace(r.URL.Query().Get("id"))
 	if id == "" {
-		writeJSON(w, map[string]any{"peers": list})
+		writeJSON(w, map[string]any{"peers": list, "viewer": viewer})
 		return
 	}
 	var found *Peer
@@ -147,11 +176,12 @@ func (s *Server) peers(w http.ResponseWriter, r *http.Request) {
 		}
 		queries = s.History.List(key, "", "", "")
 	}
-	writeJSON(w, map[string]any{"peer": found, "queries": queries})
+	writeJSON(w, map[string]any{"peer": found, "queries": queries, "viewer": viewer})
 }
 
 func (s *Server) queries(w http.ResponseWriter, r *http.Request) {
-	if !s.allow(w, r, true) {
+	viewer, ok := s.allow(w, r, true)
+	if !ok {
 		return
 	}
 	q := r.URL.Query()
@@ -165,22 +195,25 @@ func (s *Server) queries(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"enabled": s.History != nil && s.History.Size() > 0,
 		"queries": list,
+		"viewer":  viewer,
 	})
 }
 
 func (s *Server) access(w http.ResponseWriter, r *http.Request) {
-	if !s.allow(w, r, true) {
+	viewer, ok := s.allow(w, r, true)
+	if !ok {
 		return
 	}
 	report := Access{}
 	if s.History != nil {
 		report = s.History.Access()
 	}
+	report.Viewer = viewer
 	writeJSON(w, report)
 }
 
 func (s *Server) lookup(w http.ResponseWriter, r *http.Request) {
-	if !s.allow(w, r, false) {
+	if _, ok := s.allow(w, r, false); !ok {
 		return
 	}
 	if s.Lookup == nil {
@@ -218,38 +251,179 @@ func (s *Server) lookup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, result)
 }
 
-func (s *Server) allow(w http.ResponseWriter, r *http.Request, audit bool) bool {
-	if err := s.authorize(r, audit); err != nil {
+func (s *Server) allow(w http.ResponseWriter, r *http.Request, audit bool) (Viewer, bool) {
+	viewer, err := s.authorize(r, audit)
+	if err != nil {
 		http.Error(w, "forbidden", http.StatusForbidden)
-		return false
+		return Viewer{}, false
 	}
-	return true
+	return viewer, true
 }
 
-func (s *Server) authorize(r *http.Request, audit bool) error {
+func (s *Server) authorize(r *http.Request, audit bool) (Viewer, error) {
 	if s == nil || s.WhoIs == nil {
-		return errors.New("no identity")
+		return Viewer{}, errors.New("no identity")
 	}
 	ip := remoteIP(r)
 	if ip == "" {
-		return errors.New("no peer address")
+		return Viewer{}, errors.New("no peer address")
 	}
-	caps, err := s.WhoIs(r.Context(), ip)
-	if err != nil || caps == nil {
-		return errors.New("not a tailnet peer")
+	caller, err := s.WhoIs(r.Context(), ip)
+	if err != nil || caller == nil {
+		return Viewer{}, errors.New("not a tailnet peer")
 	}
-	if s.ViewCap != "" && !hasCap(caps, s.ViewCap) {
-		return errors.New("missing view capability")
+	trusted := hasAny(caller.Tags, s.TrustedProxyTags)
+	var viewer Viewer
+	if trusted {
+		parsed, perr := s.forwardedViewer(r)
+		parsed.Node = caller.Node
+		parsed.ViaProxy = true
+		if perr != nil {
+			s.logProxy(parsed, false)
+			return Viewer{}, perr
+		}
+		viewer = parsed
+	} else {
+		viewer = Viewer{Login: caller.Login, Name: caller.Name, Node: caller.Node}
 	}
-	if audit && s.AuditCap != "" && !hasCap(caps, s.AuditCap) {
-		return errors.New("missing audit capability")
+	capName := s.ViewCap
+	if audit && s.AuditCap != "" {
+		capName = s.AuditCap
 	}
-	return nil
+	if capName != "" && !hasCap(caller.Caps, capName) {
+		if trusted {
+			s.logProxy(viewer, false)
+		}
+		return Viewer{}, errors.New("missing capability")
+	}
+	groups := s.ViewGroups
+	if audit && len(s.AuditGroups) > 0 {
+		groups = s.AuditGroups
+	}
+	if len(groups) > 0 {
+		if viewer.ViaProxy {
+			if !hasAny(viewer.Groups, groups) {
+				s.logProxy(viewer, false)
+				return Viewer{}, errors.New("missing group")
+			}
+		} else if capName == "" {
+			// WhoIs has no groups. A direct viewer can pass only when a
+			// capability is configured for this page and they hold it.
+			return Viewer{}, errors.New("direct viewer has no groups")
+		}
+	}
+	if trusted {
+		s.logProxy(viewer, true)
+	}
+	return viewer, nil
+}
+
+func (s *Server) forwardedViewer(r *http.Request) (Viewer, error) {
+	login, ok := headerValue(r, s.headerOr(s.UserHeader, defaultUserHeader), maxIdentityLen)
+	if !ok {
+		return Viewer{}, errors.New("bad user header")
+	}
+	if login == "" {
+		return Viewer{}, errors.New("missing user header")
+	}
+	name, ok := headerValue(r, s.headerOr(s.NameHeader, defaultNameHeader), maxIdentityLen)
+	if !ok {
+		return Viewer{}, errors.New("bad name header")
+	}
+	groups, ok := groupsHeader(r, s.headerOr(s.GroupsHeader, defaultGroupsHeader))
+	if !ok {
+		return Viewer{}, errors.New("bad groups header")
+	}
+	return Viewer{Login: login, Name: name, Groups: groups, ViaProxy: true}, nil
+}
+
+func (s *Server) headerOr(name, fallback string) string {
+	if strings.TrimSpace(name) != "" {
+		return name
+	}
+	return fallback
+}
+
+func (s *Server) logProxy(v Viewer, allow bool) {
+	if s == nil || s.Logf == nil {
+		return
+	}
+	state := "denied"
+	if allow {
+		state = "allowed"
+	}
+	s.Logf("status ui viewer login=%s name=%s groups=%s via proxy %s", v.Login, v.Name, strings.Join(v.Groups, ","), state)
+}
+
+// headerValue reads one header. Missing is an empty string and true.
+// A value with a line break or over max is false.
+func headerValue(r *http.Request, name string, maxLen int) (string, bool) {
+	if r == nil {
+		return "", false
+	}
+	raw := r.Header.Get(name)
+	if raw == "" {
+		return "", true
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", true
+	}
+	if strings.ContainsAny(value, "\r\n") || len(value) > maxLen {
+		return "", false
+	}
+	return value, true
+}
+
+func groupsHeader(r *http.Request, name string) ([]string, bool) {
+	raw, ok := headerValue(r, name, maxGroupsHeader)
+	if !ok {
+		return nil, false
+	}
+	if raw == "" {
+		return nil, true
+	}
+	var out []string
+	seen := map[string]struct{}{}
+	for _, part := range strings.Split(raw, ",") {
+		item := strings.TrimSpace(part)
+		if item == "" {
+			continue
+		}
+		if strings.ContainsAny(item, "\r\n") || len(item) > maxIdentityLen {
+			return nil, false
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		if len(out) >= maxGroups {
+			return nil, false
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out, true
 }
 
 func hasCap(caps []string, want string) bool {
 	for _, c := range caps {
 		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAny(have, want []string) bool {
+	if len(want) == 0 {
+		return false
+	}
+	set := make(map[string]struct{}, len(have))
+	for _, item := range have {
+		set[strings.TrimSpace(item)] = struct{}{}
+	}
+	for _, item := range want {
+		if _, ok := set[strings.TrimSpace(item)]; ok {
 			return true
 		}
 	}

@@ -17,6 +17,7 @@ type Snapshot struct {
 	HistoryLimit   int        `json:"history_limit"`
 	ViewCap        string     `json:"view_cap"`
 	AuditCap       string     `json:"audit_cap"`
+	Viewer         Viewer     `json:"viewer,omitempty"`
 	Listeners      []Listener `json:"listeners"`
 	Service        Service    `json:"service"`
 	Caches         Caches     `json:"caches"`
@@ -141,6 +142,18 @@ type Access struct {
 	Peers   []Tally `json:"peers"`
 	Domains []Tally `json:"domains"`
 	History bool    `json:"history"`
+	Viewer  Viewer  `json:"viewer,omitempty"`
+}
+
+// Viewer is the person looking at the status site.
+// ViaProxy is set when the TCP peer is a trusted proxy and the identity
+// came from forwarded headers.
+type Viewer struct {
+	Login    string   `json:"login,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	Node     string   `json:"node,omitempty"`
+	Groups   []string `json:"groups,omitempty"`
+	ViaProxy bool     `json:"via_proxy"`
 }
 
 // Tally is a count of queries, including how many were refused.
