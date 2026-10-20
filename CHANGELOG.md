@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.2.0 - 2026-10-20
+
 ### Breaking
 
 - `-authkey` is now `-auth-key`. `TS_AUTHKEY` is unchanged.
