@@ -154,6 +154,9 @@ type Viewer struct {
 	Node     string   `json:"node,omitempty"`
 	Groups   []string `json:"groups,omitempty"`
 	ViaProxy bool     `json:"via_proxy"`
+	// GrantedCap is the capability that granted this viewer access.
+	// It is empty for a trusted-proxy viewer and when no capability matched.
+	GrantedCap string `json:"granted_cap,omitempty"`
 }
 
 // Tally is a count of queries, including how many were refused.

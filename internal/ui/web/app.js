@@ -137,7 +137,6 @@ async function renderOverview() {
   clear(panel);
   const cards = el("div", null, "cards");
   const items = [
-    ["Capability", c.cap_name || ""],
     ["Listeners", String((c.listeners || []).length)],
     ["Answer cache", c.caches && c.caches.answer ? String(c.caches.answer.entries) + " / " + (c.caches.answer.limit || "off") : ""],
     ["Cache hits", c.caches && c.caches.answer ? String(c.caches.answer.hits || 0) : "0"],
@@ -146,6 +145,7 @@ async function renderOverview() {
     ["Service", c.service && c.service.name ? c.service.name + " :" + c.service.port : "none"],
     ["Rules reload", fmtTime(c.rules_updated) || "not loaded"]
   ];
+  if (c.viewer && c.viewer.granted_cap) items.unshift(["Capability", c.viewer.granted_cap]);
   items.forEach((it) => {
     const card = el("div", null, "card");
     card.appendChild(el("span", it[0]));
