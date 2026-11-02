@@ -8,7 +8,7 @@ require (
 	github.com/tailscale/hujson v0.0.0-20260727124030-b80ff77dac4f
 	golang.org/x/net v0.61.0
 	golang.org/x/time v0.16.0
-	tailscale.com v1.104.2
+	tailscale.com v1.104.4
 )
 
 require (
