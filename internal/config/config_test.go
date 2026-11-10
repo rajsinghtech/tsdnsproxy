@@ -181,3 +181,37 @@ func TestParseLogLevel(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestParseWorkloadIdentity(t *testing.T) {
+	env := map[string]string{
+		"TS_CLIENT_ID":            "Tabc-kdef?preauthorized=true",
+		"TSDNSPROXY_SPIFFE_AGENT": "identity-server-agent.kube-identity.svc:8443",
+	}
+	cfg, err := Parse(nil, func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ClientIDBase() != "Tabc-kdef" {
+		t.Fatalf("ClientIDBase = %q", cfg.ClientIDBase())
+	}
+	if cfg.Audience() != "api.tailscale.com/Tabc-kdef" {
+		t.Fatalf("Audience = %q", cfg.Audience())
+	}
+	if cfg.SPIFFEAgentCA != "/etc/agent-ca/ca.crt" || cfg.SPIFFEAgentToken != "/var/run/secrets/tokens/agent-token" {
+		t.Fatalf("agent defaults = %q %q", cfg.SPIFFEAgentCA, cfg.SPIFFEAgentToken)
+	}
+}
+
+func TestParseWorkloadIdentityRejects(t *testing.T) {
+	for _, args := range [][]string{
+		{"-client-id", "T1-k1"},
+		{"-id-token-file", "/tmp/t"},
+		{"-client-id", "T1-k1", "-id-token", "x", "-id-token-file", "/tmp/t"},
+		{"-client-id", "T1-k1", "-id-token", "x", "-auth-key", "tskey-x"},
+		{"-client-id", "T1-k1", "-id-token", "x", "-id-token-audience", "aud"},
+	} {
+		if _, err := Parse(args, nil); err == nil {
+			t.Errorf("Parse(%q) accepted", args)
+		}
+	}
+}
