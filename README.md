@@ -66,7 +66,14 @@ Flags and environment variables. Durations use Go syntax (`10s`, `5m`).
 
 | Flag | Environment | Default |
 | --- | --- | --- |
-| `-auth-key` | `TS_AUTHKEY` | required |
+| `-auth-key` | `TS_AUTHKEY` | required unless `-client-id` is set |
+| `-client-id` | `TS_CLIENT_ID` | empty |
+| `-id-token` | `TS_ID_TOKEN` | empty |
+| `-id-token-file` | `TSDNSPROXY_ID_TOKEN_FILE` | empty |
+| `-spiffe-agent` | `TSDNSPROXY_SPIFFE_AGENT` | empty |
+| `-spiffe-agent-ca` | `TSDNSPROXY_SPIFFE_AGENT_CA` | `/etc/agent-ca/ca.crt` |
+| `-spiffe-agent-token` | `TSDNSPROXY_SPIFFE_AGENT_TOKEN` | `/var/run/secrets/tokens/agent-token` |
+| `-id-token-audience` | `TSDNSPROXY_ID_TOKEN_AUDIENCE` | `api.tailscale.com/<client id>` |
 | `-hostname` | `TSDNSPROXY_HOSTNAME` | `tsdnsproxy` |
 | `-state-dir` | `TSDNSPROXY_STATE_DIR` | `/var/lib/tsdnsproxy` |
 | `-state` | `TSDNSPROXY_STATE` | empty |
@@ -117,6 +124,18 @@ Listen addresses other than wildcard and loopback are bound with tsnet.
 See `CHANGELOG.md` for renamed flags.
 
 `-cache-ttl` is the whois and grant cache. The answer cache uses the flags below.
+
+## Workload identity federation
+
+Instead of an auth key, the node can be created with a Tailscale federated identity. Set `-client-id` to the identity's client ID and give one ID token source:
+
+- `-id-token`: the token itself.
+- `-id-token-file`: a file holding the token, read at startup.
+- `-spiffe-agent`: a SPIFFE Workload API address served over TLS, such as an identity-server agent. tsdnsproxy fetches a JWT-SVID with audience `api.tailscale.com/<client id>` (override with `-id-token-audience`), authenticating with the bearer token in `-spiffe-agent-token` and trusting `-spiffe-agent-ca`.
+
+Key attributes may follow the client ID as a query string, for example `-client-id 'T123-k456?preauthorized=true'`. The federated identity must carry the tags in `-advertise-tags` and the `auth_keys` scope.
+
+The token is only used for the first login. When the state store already holds a node, tsdnsproxy skips the token source, so restarts do not depend on it. `-client-id` and `-auth-key` are mutually exclusive.
 
 ## Answer cache
 

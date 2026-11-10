@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ import (
 	"github.com/rajsinghtech/tsdnsproxy/internal/logging"
 	"github.com/rajsinghtech/tsdnsproxy/internal/metrics"
 	"github.com/rajsinghtech/tsdnsproxy/internal/ui"
+	"github.com/rajsinghtech/tsdnsproxy/internal/wif"
 	"tailscale.com/client/local"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
@@ -32,6 +35,9 @@ import (
 	"tailscale.com/ipn/store"
 	_ "tailscale.com/ipn/store/kubestore" // registers the kube: state store; no build tag, so -tags netgo keeps it
 	"tailscale.com/tsnet"
+
+	// Links tsnet's workload identity federation (ClientID + IDToken).
+	_ "tailscale.com/feature/identityfederation"
 )
 
 // version is set with -ldflags "-X main.version=..." at release build time.
@@ -182,8 +188,8 @@ func main() {
 		"ui_history", cfg.UIHistory,
 	)
 
-	if cfg.AuthKey == "" {
-		log.Fatal("auth key is required (set TS_AUTHKEY or use -auth-key)")
+	if cfg.AuthKey == "" && cfg.ClientID == "" {
+		log.Fatal("auth key or client id is required (set TS_AUTHKEY, or TS_CLIENT_ID with an ID token source)")
 	}
 	if cfg.RulesOnly && cfg.RulesFile == "" {
 		log.Fatal("-rules-only requires -rules-file")
@@ -277,6 +283,12 @@ func main() {
 		}
 		s.Store = stateStore
 		log.Printf("using state store: %s", cfg.State)
+	}
+
+	if cfg.ClientID != "" {
+		if err := setWorkloadIdentity(ctx, s, cfg); err != nil {
+			log.Fatalf("workload identity: %v", err)
+		}
 	}
 
 	defer func() {
@@ -661,4 +673,54 @@ func logf(debug bool) func(format string, args ...any) {
 		}
 		slog.Info(msg)
 	}
+}
+
+// setWorkloadIdentity configures s to create its node with workload identity
+// federation. The ID token is fetched only when the state store holds no node
+// yet: once the node key is stored, tsnet logs in with it and restarts no
+// longer depend on the token source.
+func setWorkloadIdentity(ctx context.Context, s *tsnet.Server, cfg config.Config) error {
+	enrolled, err := hasNodeState(s.Store, cfg.StateDir)
+	if err != nil {
+		return err
+	}
+	if enrolled {
+		log.Printf("node state found; skipping workload identity login")
+		return nil
+	}
+	tok, err := wif.Token(ctx, wif.Source{
+		Token:      cfg.IDToken,
+		File:       cfg.IDTokenFile,
+		Agent:      cfg.SPIFFEAgent,
+		AgentCA:    cfg.SPIFFEAgentCA,
+		AgentToken: cfg.SPIFFEAgentToken,
+		Audience:   cfg.Audience(),
+	})
+	if err != nil {
+		return err
+	}
+	s.ClientID = cfg.ClientID
+	s.IDToken = tok
+	log.Printf("no node state: first login via workload identity (client %s)", cfg.ClientIDBase())
+	return nil
+}
+
+// hasNodeState reports whether a node profile is already stored, in st when
+// set or else in tsnet's file store under dir.
+func hasNodeState(st ipn.StateStore, dir string) (bool, error) {
+	if st == nil {
+		_, err := os.Stat(filepath.Join(dir, "tailscaled.state"))
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return err == nil, err
+	}
+	_, err := st.ReadState(ipn.CurrentProfileStateKey)
+	if errors.Is(err, ipn.ErrStateNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read state: %w", err)
+	}
+	return true, nil
 }

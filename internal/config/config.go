@@ -18,6 +18,13 @@ import (
 // Config is the process configuration.
 type Config struct {
 	AuthKey             string
+	ClientID            string
+	IDToken             string
+	IDTokenFile         string
+	IDTokenAudience     string
+	SPIFFEAgent         string
+	SPIFFEAgentCA       string
+	SPIFFEAgentToken    string
 	Hostname            string
 	StateDir            string
 	State               string
@@ -70,6 +77,13 @@ func Parse(args []string, getenv func(string) string) (Config, error) {
 	fs.SetOutput(io.Discard)
 
 	fs.StringVar(&cfg.AuthKey, "auth-key", getenv("TS_AUTHKEY"), "tailscale auth key (TS_AUTHKEY)")
+	fs.StringVar(&cfg.ClientID, "client-id", getenv("TS_CLIENT_ID"), "workload identity federation client ID; key attributes may follow as a query string, for example ?preauthorized=true")
+	fs.StringVar(&cfg.IDToken, "id-token", getenv("TS_ID_TOKEN"), "ID token to exchange for an auth key with -client-id")
+	fs.StringVar(&cfg.IDTokenFile, "id-token-file", getenv("TSDNSPROXY_ID_TOKEN_FILE"), "file holding the ID token for -client-id, read at first login")
+	fs.StringVar(&cfg.IDTokenAudience, "id-token-audience", getenv("TSDNSPROXY_ID_TOKEN_AUDIENCE"), "audience for a SPIFFE JWT-SVID; default api.tailscale.com/<client id>")
+	fs.StringVar(&cfg.SPIFFEAgent, "spiffe-agent", getenv("TSDNSPROXY_SPIFFE_AGENT"), "SPIFFE Workload API address (TLS) to fetch a JWT-SVID for -client-id, for example identity-server-agent.kube-identity.svc:8443")
+	fs.StringVar(&cfg.SPIFFEAgentCA, "spiffe-agent-ca", envOr(getenv, "TSDNSPROXY_SPIFFE_AGENT_CA", "/etc/agent-ca/ca.crt"), "CA bundle for -spiffe-agent")
+	fs.StringVar(&cfg.SPIFFEAgentToken, "spiffe-agent-token", envOr(getenv, "TSDNSPROXY_SPIFFE_AGENT_TOKEN", "/var/run/secrets/tokens/agent-token"), "bearer token file (projected ServiceAccount token) for -spiffe-agent")
 	fs.StringVar(&cfg.Hostname, "hostname", envOr(getenv, "TSDNSPROXY_HOSTNAME", "tsdnsproxy"), "hostname on the tailnet")
 	fs.StringVar(&cfg.StateDir, "state-dir", envOr(getenv, "TSDNSPROXY_STATE_DIR", "/var/lib/tsdnsproxy"), "state directory")
 	fs.StringVar(&cfg.State, "state", getenv("TSDNSPROXY_STATE"), "state store, for example kube:tsdnsproxy-state")
@@ -219,7 +233,54 @@ func (c Config) Validate() error {
 	if c.RulesOnly && c.RulesFile == "" {
 		return fmt.Errorf("rules-only requires rules-file")
 	}
+	if err := c.validateIdentity(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateIdentity checks the workload identity federation settings: one
+// token source at most, and a client ID whenever a token source is set.
+func (c Config) validateIdentity() error {
+	sources := 0
+	for _, v := range []string{c.IDToken, c.IDTokenFile, c.SPIFFEAgent} {
+		if v != "" {
+			sources++
+		}
+	}
+	if sources > 1 {
+		return fmt.Errorf("set only one of id-token, id-token-file, and spiffe-agent")
+	}
+	if sources == 1 && c.ClientID == "" {
+		return fmt.Errorf("id-token, id-token-file, and spiffe-agent require client-id")
+	}
+	if c.ClientID != "" && sources == 0 {
+		return fmt.Errorf("client-id requires id-token, id-token-file, or spiffe-agent")
+	}
+	if c.ClientID != "" && c.AuthKey != "" {
+		return fmt.Errorf("set auth-key or client-id, not both")
+	}
+	if c.IDTokenAudience != "" && c.SPIFFEAgent == "" {
+		return fmt.Errorf("id-token-audience requires spiffe-agent")
+	}
+	return nil
+}
+
+// ClientIDBase is the client ID without the optional key attribute query
+// string.
+func (c Config) ClientIDBase() string {
+	id, _, _ := strings.Cut(c.ClientID, "?")
+	return id
+}
+
+// Audience is the JWT-SVID audience requested from the SPIFFE agent. Tailscale
+// expects api.tailscale.com/<client id> unless the federated identity says
+// otherwise.
+func (c Config) Audience() string {
+	if c.IDTokenAudience != "" {
+		return c.IDTokenAudience
+	}
+	return "api.tailscale.com/" + c.ClientIDBase()
 }
 
 // ParseLogLevel accepts debug, info, warn, and error.
