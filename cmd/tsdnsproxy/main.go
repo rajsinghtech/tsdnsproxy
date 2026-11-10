@@ -701,7 +701,7 @@ func setWorkloadIdentity(ctx context.Context, s *tsnet.Server, cfg config.Config
 	}
 	s.ClientID = cfg.ClientID
 	s.IDToken = tok
-	log.Printf("no node state: first login via workload identity (client %s)", cfg.ClientIDBase())
+	log.Print("no node state: first login via workload identity")
 	return nil
 }
 
