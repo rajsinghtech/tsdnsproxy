@@ -108,6 +108,7 @@ func cloneGrantConfig(in GrantConfig) GrantConfig {
 		if grant.Static != nil {
 			grant.Static = grant.Static.clone()
 		}
+		grant.Zone = grant.Zone.clone()
 		out[key] = grant
 	}
 	return out

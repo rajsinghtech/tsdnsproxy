@@ -1066,6 +1066,9 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 	if grant.IPNames != nil {
 		return s.handleIPNames(query, domain, &grant, src)
 	}
+	if grant.Zone != nil {
+		return s.handleZone(ctx, query, domain, &grant, grantConfigs)
+	}
 
 	// Omitted and negative translateid values forward the query.
 	// An explicit id above the encodable range is rejected.

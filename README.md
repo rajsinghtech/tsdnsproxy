@@ -219,6 +219,7 @@ The file is checked at startup. A bad file exits the process. `SIGHUP`, or repla
 - `allowips` and `denyips`: limit which IPv4 answers are translated. `denyips` wins. A non-empty `allowips` list translates only addresses inside it.
 - `ipnames`: synthesize dashed IPv4 names. It cannot be combined with `rewrite` or `translateid`.
 - `static`: answer the name from configured A and AAAA records. See below.
+- `zone`: forward a whole zone and handle each answer. See below.
 
 Domain rules match themselves and any name under them. The longest match wins. A `static` key matches only the name it writes, or one label under a wildcard. An exact static name beats a wildcard, and a longer name beats a shorter one. A key that is a CIDR matches the resolved address. The longest matching prefix overrides the domain rule for that address. A prefix rule with `translateid` omitted or `0` leaves the address unchanged.
 
@@ -257,6 +258,36 @@ A `static` rule answers from the config. The query is not forwarded.
 `allowsrc`, `allowips`, and `denyips` on the winning rule still apply. A single-label wildcard beats a zone rule of the same parent for that one label. Extra labels under the wildcard still use the zone rule.
 
 The synthetic SOA is owned by the exact name, or by the wildcard parent. Its minimum is the static TTL, so NODATA can be cached. Positive static answers use the answer cache. `allowsrc` puts the client address in the cache key. The Rules tab and Lookup show the static addresses. Lookup does not query upstream unless resolve is requested.
+
+### Zone forwarding
+
+A `zone` rule owns a zone whose parent is public, without listing each private name. Every query under the key goes to `dns`. Private answers are translated and public names keep working.
+
+```json
+{
+  "example.com": {
+    "dns": ["tailnet://10.0.0.53"],
+    "translateid": 7,
+    "allowips": ["10.0.0.0/8"],
+    "zone": {
+      "fallback": ["direct://192.0.2.53"],
+      "timeout": "1s"
+    }
+  }
+}
+```
+
+- `nas.example.com` resolves upstream to `10.0.0.20`. The AAAA answer is the 4via6 address for site 7. The A answer is empty, the same as an authoritative `translateid`.
+- `www.example.com` resolves upstream to a public address. A, AAAA, and every other type pass through unchanged.
+- When the upstream answer is NXDOMAIN, NOERROR with no answers, SERVFAIL, REFUSED, or takes longer than `timeout`, the query is sent to `fallback` and that answer is returned unchanged.
+- `dns` is required. `tailnet://`, `direct://`, and bare addresses work as elsewhere.
+- `translateid` is required, from 1 through 65535.
+- `allowips` lists the private prefixes. It defaults to `10.0.0.0/8`, `172.16.0.0/12`, and `192.168.0.0/16`. `denyips` and CIDR rules apply as usual. An A answer outside these is public.
+- `fallback` uses the same address forms as `dns`. When empty, the default upstreams are used (`-override-dns`, or the host resolvers).
+- `timeout` bounds each upstream and fallback attempt. It defaults to `1s` and must be from `50ms` through `5s`. A query that misses upstream finishes in about twice this value.
+- `zone` cannot be combined with `rewrite`, `static`, or `ipnames`, and the key cannot be a CIDR.
+
+Put the rule in an ACL grant to limit who sees the private answers. A caller without that grant matches no rule and is forwarded to the default upstreams, so it gets the public answer and the private upstream is never asked. A rules file applies to every client.
 
 ### Encoded names
 

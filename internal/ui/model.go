@@ -71,6 +71,13 @@ type Rule struct {
 	AllowSrc    []string `json:"allow_src,omitempty"`
 	IPNames     *IPNames `json:"ipnames,omitempty"`
 	Static      *Static  `json:"static,omitempty"`
+	Zone        *Zone    `json:"zone,omitempty"`
+}
+
+// Zone is zone forwarding on a rule. An empty Fallback uses the default upstreams.
+type Zone struct {
+	Fallback []string `json:"fallback,omitempty"`
+	Timeout  string   `json:"timeout,omitempty"`
 }
 
 // Static is a configured address answer for one name or single-label wildcard.
