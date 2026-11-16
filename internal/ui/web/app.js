@@ -89,6 +89,7 @@ function ruleCells(r) {
     policy.push("static " + addrs.join(" ") + (r.static.ttl ? " ttl " + r.static.ttl : ""));
     if (r.static.apex) policy.push("apex");
   }
+  if (r.zone) policy.push("zone fallback " + (join(r.zone.fallback) || "default") + (r.zone.timeout ? " timeout " + r.zone.timeout : ""));
   if (r.allow_ips && r.allow_ips.length) policy.push("allowips " + r.allow_ips.join(" "));
   if (r.allow_src && r.allow_src.length) policy.push("allowsrc " + r.allow_src.join(" "));
   if (r.ipnames && r.ipnames.allow_src && r.ipnames.allow_src.length) policy.push("allowsrc " + r.ipnames.allow_src.join(" "));

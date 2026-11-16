@@ -305,6 +305,15 @@ func ruleFrom(domain string, grant grants.DNSGrant, source string) ui.Rule {
 		}
 		rule.AllowSrc = append([]string(nil), grant.Static.AllowSrc...)
 	}
+	if grant.Zone != nil {
+		rule.Zone = &ui.Zone{
+			Fallback: append([]string(nil), grant.Zone.Fallback...),
+			Timeout:  grant.Zone.TimeoutValue().String(),
+		}
+		if len(rule.AllowIPs) == 0 {
+			rule.AllowIPs = append([]string(nil), grants.DefaultZonePrivate...)
+		}
+	}
 	return rule
 }
 

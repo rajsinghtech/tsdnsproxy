@@ -216,6 +216,8 @@ func describeMatch(parser *grants.Parser, cfgs []grants.GrantConfig, qname strin
 		action = "static"
 	} else if grant.IPNames != nil {
 		action = "ipnames"
+	} else if grant.Zone != nil {
+		action = "zone"
 	} else if rewrite != "" && action == "" {
 		action = "rewrite"
 	} else if action == "" {

@@ -40,6 +40,9 @@ type DNSGrant struct {
 	// Static answers the matched name from configured addresses.
 	// It cannot be combined with DNS, Rewrite, TranslateID, or IPNames.
 	Static *StaticConfig `json:"static,omitempty"`
+	// Zone forwards every name under the key and translates private answers.
+	// It requires DNS and a positive TranslateID.
+	Zone *ZoneConfig `json:"zone,omitempty"`
 }
 
 // IPPolicy builds the translation filter for this grant.
@@ -247,6 +250,14 @@ func (p *Parser) validateGrant(grant GrantConfig) error {
 		}
 		if hasStatic && isPrefix {
 			return fmt.Errorf("static cannot use CIDR key %s", domain)
+		}
+		if dnsGrant.Zone != nil {
+			if isPrefix {
+				return fmt.Errorf("zone cannot use CIDR key %s", domain)
+			}
+			if err := validateZone(NormalizeDomain(domain), dnsGrant); err != nil {
+				return err
+			}
 		}
 		if hasStatic {
 			if !wildcard && dnsGrant.Static.ApexEnabled() {
