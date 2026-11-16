@@ -3,14 +3,12 @@ package main
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -259,7 +257,6 @@ func main() {
 	s := &tsnet.Server{
 		Dir:      cfg.StateDir,
 		Hostname: cfg.Hostname,
-		AuthKey:  cfg.AuthKey,
 		Logf:     logf(verbose),
 	}
 
@@ -285,10 +282,13 @@ func main() {
 		log.Printf("using state store: %s", cfg.State)
 	}
 
-	if cfg.ClientID != "" {
-		if err := setWorkloadIdentity(ctx, s, cfg); err != nil {
-			log.Fatalf("workload identity: %v", err)
-		}
+	auth, err := resolveTSNetAuth(ctx, cfg, s.Store, wif.Token)
+	if err != nil {
+		log.Fatalf("workload identity: %v", err)
+	}
+	auth.apply(s)
+	if err := clearTSNetAuthEnv(); err != nil {
+		log.Fatal(err)
 	}
 
 	defer func() {
@@ -673,54 +673,4 @@ func logf(debug bool) func(format string, args ...any) {
 		}
 		slog.Info(msg)
 	}
-}
-
-// setWorkloadIdentity configures s to create its node with workload identity
-// federation. The ID token is fetched only when the state store holds no node
-// yet: once the node key is stored, tsnet logs in with it and restarts no
-// longer depend on the token source.
-func setWorkloadIdentity(ctx context.Context, s *tsnet.Server, cfg config.Config) error {
-	enrolled, err := hasNodeState(s.Store, cfg.StateDir)
-	if err != nil {
-		return err
-	}
-	if enrolled {
-		log.Printf("node state found; skipping workload identity login")
-		return nil
-	}
-	tok, err := wif.Token(ctx, wif.Source{
-		Token:      cfg.IDToken,
-		File:       cfg.IDTokenFile,
-		Agent:      cfg.SPIFFEAgent,
-		AgentCA:    cfg.SPIFFEAgentCA,
-		AgentToken: cfg.SPIFFEAgentToken,
-		Audience:   cfg.Audience(),
-	})
-	if err != nil {
-		return err
-	}
-	s.ClientID = cfg.ClientID
-	s.IDToken = tok
-	log.Print("no node state: first login via workload identity")
-	return nil
-}
-
-// hasNodeState reports whether a node profile is already stored, in st when
-// set or else in tsnet's file store under dir.
-func hasNodeState(st ipn.StateStore, dir string) (bool, error) {
-	if st == nil {
-		_, err := os.Stat(filepath.Join(dir, "tailscaled.state"))
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
-		}
-		return err == nil, err
-	}
-	_, err := st.ReadState(ipn.CurrentProfileStateKey)
-	if errors.Is(err, ipn.ErrStateNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("read state: %w", err)
-	}
-	return true, nil
 }
