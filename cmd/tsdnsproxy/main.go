@@ -25,6 +25,7 @@ import (
 	"github.com/rajsinghtech/tsdnsproxy/internal/logging"
 	"github.com/rajsinghtech/tsdnsproxy/internal/metrics"
 	"github.com/rajsinghtech/tsdnsproxy/internal/ui"
+	"github.com/rajsinghtech/tsdnsproxy/internal/vip"
 	"github.com/rajsinghtech/tsdnsproxy/internal/wif"
 	"tailscale.com/client/local"
 	"tailscale.com/hostinfo"
@@ -352,7 +353,9 @@ func main() {
 	if lc != nil {
 		localClient = lc
 	}
+	serviceVIPs := &vip.Table{}
 	dnsServer := &dns.Server{
+		ServiceVIPs:     serviceVIPs,
 		TSServer:        s,
 		LocalClient:     localClient,
 		WhoisCache:      whoisCache,
@@ -421,6 +424,7 @@ func main() {
 	}
 	dnsServer.SetLocalClient(lc)
 	routes.SetClient(lc)
+	go vip.Watch(ctx, vip.LocalBus(lc), serviceVIPs, logf(verbose))
 	if cfg.UIAddr != "" || cfg.UILocalAddr != "" {
 		statusUI := &ui.Server{
 			Snapshot:          dnsServer.UISnapshot,

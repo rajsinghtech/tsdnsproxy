@@ -245,6 +245,12 @@ func matchScore(query, key string, grant DNSGrant) (int, bool) {
 	if wildcard {
 		return 0, false
 	}
+	if grant.Service != "" {
+		if query == key {
+			return labelCount(key)*10 + rankExact, true
+		}
+		return 0, false
+	}
 	if query == key || strings.HasSuffix(query, "."+key) {
 		return labelCount(key)*10 + rankSuffix, true
 	}

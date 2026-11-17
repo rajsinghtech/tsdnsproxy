@@ -4,7 +4,7 @@ const titles = {
   peers: ["Peers", "Identities learned from whois. A capability can hide this view."],
   queries: ["Queries", "Recent questions. Filter by peer, user, domain, or rcode."],
   access: ["Access", "Who is asking, and which names are refused."],
-  backends: ["Backends", "Default upstreams, dial mode, and health."],
+  backends: ["Backends", "Default upstreams, dial mode, health, and service targets."],
   lookup: ["Lookup", "Show the rule for a name and peer. Upstream is contacted only when you ask."]
 };
 
@@ -90,6 +90,7 @@ function ruleCells(r) {
     if (r.static.apex) policy.push("apex");
   }
   if (r.zone) policy.push("zone fallback " + (join(r.zone.fallback) || "default") + (r.zone.timeout ? " timeout " + r.zone.timeout : ""));
+  if (r.service) policy.push("service " + r.service.name + " " + serviceAnswer(r.service) + (r.service.ttl ? " ttl " + r.service.ttl : ""));
   if (r.allow_ips && r.allow_ips.length) policy.push("allowips " + r.allow_ips.join(" "));
   if (r.allow_src && r.allow_src.length) policy.push("allowsrc " + r.allow_src.join(" "));
   if (r.ipnames && r.ipnames.allow_src && r.ipnames.allow_src.length) policy.push("allowsrc " + r.ipnames.allow_src.join(" "));
@@ -97,8 +98,13 @@ function ruleCells(r) {
     el("span", r.domain, "mono"),
     pill(r.source || ""),
     policy.join(" · "),
-    el("span", join(r.backends) || (r.ipnames || r.static ? "" : "default"), "mono")
+    el("span", join(r.backends) || (r.ipnames || r.static || (r.service && r.service.from !== "upstream") ? "" : "default"), "mono")
   ];
+}
+function serviceAnswer(s) {
+  if (!s.from) return "";
+  if (s.from === "upstream") return "not in netmap, forwarded";
+  return (s.from === "netmap" ? "netmap " : "fallback ") + (s.resolved || []).join(" ");
 }
 
 function show(tab) {
@@ -329,6 +335,15 @@ async function renderBackends() {
     pill(b.healthy ? "healthy" : "unhealthy", b.healthy ? "good" : "bad"),
     String(b.failures || 0),
     fmtTime(b.retry_at)
+  ])));
+  panel.appendChild(el("h2", "Service targets"));
+  panel.appendChild(table(["Domain", "Source", "Service", "Answer", "Addresses", "TTL"], (c.service_vips || []).map((s) => [
+    el("span", s.domain, "mono"),
+    pill(s.source || ""),
+    el("span", s.name, "mono"),
+    pill(s.from === "netmap" ? "netmap" : s.from === "addrs" ? "fallback addrs" : "upstream", s.from === "netmap" ? "good" : "warn"),
+    el("span", join(s.resolved) || "default upstreams", "mono"),
+    String(s.ttl || "")
   ])));
 }
 

@@ -280,15 +280,23 @@ func FuzzProcessQuery(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(packed)
+	svcSeed := seed
+	svcSeed.Questions = []dnsmessage.Question{{Name: dnsmessage.MustNewName("app.example.com."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}}
+	svcPacked, err := svcSeed.Pack()
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(svcPacked)
 	f.Add([]byte{0, 1, 2, 3})
 	server := &Server{
 		GrantParser: grants.NewParser(),
 		BackendMgr: &mockBackendManager{backend: &mockBackend{queryFunc: func(ctx context.Context, query []byte) ([]byte, error) {
 			return seed.Pack()
 		}}},
-		Logf: func(string, ...any) {},
+		Logf:        func(string, ...any) {},
+		ServiceVIPs: vipTable(map[string][]string{"svc:app": {"100.64.0.10", "2001:db8::a"}}),
 	}
-	cfgs := mustIPNames(f, `{"site-a.example":{"ipnames":{"siteid":1}},"site-b.example":{"dns":["10.1.0.10:53"],"translateid":-1}}`)
+	cfgs := mustIPNames(f, `{"site-a.example":{"ipnames":{"siteid":1}},"site-b.example":{"dns":["10.1.0.10:53"],"translateid":-1},"app.example.com":{"service":"svc:app"},"db.example.com":{"service":"svc:db","addrs":["192.0.2.20"]}}`)
 	f.Fuzz(func(t *testing.T, packet []byte) {
 		defer func() {
 			if rec := recover(); rec != nil {

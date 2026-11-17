@@ -109,6 +109,11 @@ func cloneGrantConfig(in GrantConfig) GrantConfig {
 			grant.Static = grant.Static.clone()
 		}
 		grant.Zone = grant.Zone.clone()
+		grant.Addrs = append([]string(nil), grant.Addrs...)
+		if grant.TTL != nil {
+			ttl := *grant.TTL
+			grant.TTL = &ttl
+		}
 		out[key] = grant
 	}
 	return out
