@@ -43,6 +43,12 @@ type DNSGrant struct {
 	// Zone forwards every name under the key and translates private answers.
 	// It requires DNS and a positive TranslateID.
 	Zone *ZoneConfig `json:"zone,omitempty"`
+	// Service answers A and AAAA for the exact key with the VIPs of this
+	// Tailscale Service, for example "svc:app". Addrs are used when the
+	// service is not in the netmap. TTL is the answer TTL in seconds.
+	Service string   `json:"service,omitempty"`
+	Addrs   []string `json:"addrs,omitempty"`
+	TTL     *int     `json:"ttl,omitempty"`
 }
 
 // IPPolicy builds the translation filter for this grant.
@@ -153,9 +159,10 @@ func (p *Parser) ParseGrants(capMap tailcfg.PeerCapMap) ([]GrantConfig, error) {
 // FindBestMatch finds the most specific domain match for a query.
 // A static name matches only itself. A static wildcard matches one label
 // under its parent, and the parent only when apex is set.
+// A service rule matches only its own name.
 // Other domain rules match themselves and any name under them.
-// An exact static name beats a wildcard, a wildcard beats a zone of the
-// same parent, and a longer name beats a shorter one.
+// An exact static or service name beats a wildcard, a wildcard beats a zone
+// of the same parent, and a longer name beats a shorter one.
 func (p *Parser) FindBestMatch(queryDomain string, grants []GrantConfig) (string, DNSGrant, bool) {
 	queryDomain = NormalizeDomain(queryDomain)
 
@@ -245,6 +252,10 @@ func (p *Parser) validateGrant(grant GrantConfig) error {
 		hasTranslate := dnsGrant.TranslateID != nil
 		hasIPNames := dnsGrant.IPNames != nil
 		hasStatic := dnsGrant.Static != nil
+		hasService := dnsGrant.Service != ""
+		if err := validateService(NormalizeDomain(domain), dnsGrant, isPrefix, wildcard); err != nil {
+			return err
+		}
 		if hasIPNames && isPrefix {
 			return fmt.Errorf("ipnames cannot use CIDR key %s", domain)
 		}
@@ -287,7 +298,7 @@ func (p *Parser) validateGrant(grant GrantConfig) error {
 			if !hasFilter && !hasTranslate && !hasIPNames && !hasStatic && len(dnsGrant.DNS) == 0 && dnsGrant.Rewrite == "" {
 				return fmt.Errorf("empty grant for %s", domain)
 			}
-		} else if !hasIPNames && !hasStatic && len(dnsGrant.DNS) == 0 && dnsGrant.Rewrite == "" {
+		} else if !hasIPNames && !hasStatic && !hasService && len(dnsGrant.DNS) == 0 && dnsGrant.Rewrite == "" {
 			return fmt.Errorf("empty grant for %s", domain)
 		}
 		if hasIPNames {

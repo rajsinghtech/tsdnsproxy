@@ -23,6 +23,9 @@ type Snapshot struct {
 	Caches         Caches     `json:"caches"`
 	Rules          []Rule     `json:"rules"`
 	Backends       []Backend  `json:"backends"`
+	// ServiceVIPs are the service rules from the rules file and the
+	// server's own grants, with their current answers.
+	ServiceVIPs []ServiceVIP `json:"service_vips"`
 }
 
 // Listener is one bound DNS socket.
@@ -60,18 +63,32 @@ type CacheStat struct {
 
 // Rule is one domain or zone and the policy that applies to it.
 type Rule struct {
-	Domain      string   `json:"domain"`
-	Source      string   `json:"source"`
-	Rewrite     string   `json:"rewrite,omitempty"`
-	Backends    []string `json:"backends,omitempty"`
-	TranslateID *int     `json:"translate_id,omitempty"`
-	SitePrefix  string   `json:"site_prefix,omitempty"`
-	AllowIPs    []string `json:"allow_ips,omitempty"`
-	DenyIPs     []string `json:"deny_ips,omitempty"`
-	AllowSrc    []string `json:"allow_src,omitempty"`
-	IPNames     *IPNames `json:"ipnames,omitempty"`
-	Static      *Static  `json:"static,omitempty"`
-	Zone        *Zone    `json:"zone,omitempty"`
+	Domain      string      `json:"domain"`
+	Source      string      `json:"source"`
+	Rewrite     string      `json:"rewrite,omitempty"`
+	Backends    []string    `json:"backends,omitempty"`
+	TranslateID *int        `json:"translate_id,omitempty"`
+	SitePrefix  string      `json:"site_prefix,omitempty"`
+	AllowIPs    []string    `json:"allow_ips,omitempty"`
+	DenyIPs     []string    `json:"deny_ips,omitempty"`
+	AllowSrc    []string    `json:"allow_src,omitempty"`
+	IPNames     *IPNames    `json:"ipnames,omitempty"`
+	Static      *Static     `json:"static,omitempty"`
+	Zone        *Zone       `json:"zone,omitempty"`
+	ServiceVIP  *ServiceVIP `json:"service,omitempty"`
+}
+
+// ServiceVIP is a service rule and the answer it gives now.
+// From is "netmap", "addrs", or "upstream". Resolved lists the addresses
+// served, and is empty when the query is forwarded upstream.
+type ServiceVIP struct {
+	Domain   string   `json:"domain,omitempty"`
+	Source   string   `json:"source,omitempty"`
+	Name     string   `json:"name"`
+	Addrs    []string `json:"addrs,omitempty"`
+	TTL      int      `json:"ttl"`
+	From     string   `json:"from,omitempty"`
+	Resolved []string `json:"resolved,omitempty"`
 }
 
 // Zone is zone forwarding on a rule. An empty Fallback uses the default upstreams.

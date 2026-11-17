@@ -36,6 +36,8 @@ func (s *Server) UISnapshot() ui.Snapshot {
 		}
 		snap.RulesUpdated = s.Rules.Updated()
 	}
+	s.describeServices(snap.Rules)
+	snap.ServiceVIPs = s.serviceVIPViews(snap.Rules)
 	hosted, err := ParseHostedService(s.Service)
 	if err == nil && hosted.Name != "" {
 		state := "configured"
@@ -72,6 +74,9 @@ func (s *Server) UIPeers() []ui.Peer {
 	peers := s.learnedPeers()
 	if peers == nil {
 		return []ui.Peer{}
+	}
+	for i := range peers {
+		s.describeServices(peers[i].Rules)
 	}
 	return peers
 }
@@ -218,6 +223,8 @@ func describeMatch(parser *grants.Parser, cfgs []grants.GrantConfig, qname strin
 		action = "ipnames"
 	} else if grant.Zone != nil {
 		action = "zone"
+	} else if grant.Service != "" {
+		action = "service"
 	} else if rewrite != "" && action == "" {
 		action = "rewrite"
 	} else if action == "" {
@@ -225,6 +232,8 @@ func describeMatch(parser *grants.Parser, cfgs []grants.GrantConfig, qname strin
 	}
 	if len(grant.DNS) > 0 {
 		backend = strings.Join(grant.DNS, ", ")
+	} else if action == "service" {
+		backend = grant.Service
 	} else if action != "ipnames" && action != "static" {
 		backend = "default"
 	}

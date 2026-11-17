@@ -62,6 +62,7 @@ func (s *Server) Explain(ctx context.Context, req ui.LookupRequest) (ui.Lookup, 
 			}
 		}
 		rule := ruleFrom(domain, grant, source)
+		s.describeService(rule.ServiceVIP)
 		out.Rule = &rule
 	}
 	if !req.Forward {

@@ -20,6 +20,7 @@ func FuzzParseRules(f *testing.F) {
 	f.Add([]byte(`{"ip":{"ipnames":{"siteid":1}}}`))
 	f.Add([]byte(`{"app.example.internal":{"static":{"a":["192.0.2.10"],"aaaa":["2001:db8::10"],"ttl":60}}}`))
 	f.Add([]byte(`{"*.apps.example.internal":{"static":{"a":["192.0.2.20"],"apex":true}}}`))
+	f.Add([]byte(`{"app.example.com":{"service":"svc:app","addrs":["192.0.2.10","2001:db8::10"],"ttl":30}}`))
 	f.Add([]byte("{"))
 	f.Add([]byte(""))
 	f.Fuzz(func(t *testing.T, data []byte) {
