@@ -23,6 +23,7 @@ import (
 // answerKey identifies one cached response.
 // policy is a hash of the effective rules. src is set only when those rules
 // read the client address, so peers with the same rules share an entry.
+// vips is the service VIP generation when the rules hold a service rule.
 type answerKey struct {
 	name   string
 	qtype  uint16
@@ -31,6 +32,7 @@ type answerKey struct {
 	cd     bool
 	policy [32]byte
 	src    string
+	vips   uint64
 }
 
 type answerEntry struct {
@@ -154,6 +156,12 @@ func (c *answerCache) clock() time.Time {
 // lookup returns the response for q. Concurrent callers for one key share one load.
 // A panicking load releases the waiters and panics again.
 func (c *answerCache) lookup(q *dnsmessage.Message, key answerKey, load func() ([]byte, error)) ([]byte, bool, error) {
+	return c.lookupLimited(q, key, 0, load)
+}
+
+// lookupLimited is lookup with a stored lifetime of at most limit.
+// A zero limit applies only the cache's own bounds.
+func (c *answerCache) lookupLimited(q *dnsmessage.Message, key answerKey, limit time.Duration, load func() ([]byte, error)) ([]byte, bool, error) {
 	if c == nil || c.size < 1 {
 		raw, err := load()
 		return raw, false, err
@@ -206,6 +214,9 @@ func (c *answerCache) lookup(q *dnsmessage.Message, key answerKey, load func() (
 		return nil, false, err
 	}
 	ttl, store := retention(raw, c.minTTL, c.maxTTL, c.failTTL)
+	if limit > 0 && ttl > limit {
+		ttl = limit
+	}
 	var stored time.Time
 	if store {
 		stored = c.insert(key, raw, ttl)
@@ -386,6 +397,7 @@ func canonGrant(g grants.DNSGrant) grants.DNSGrant {
 		cp.AllowSrc = sortedCopy(g.Static.AllowSrc)
 		g.Static = &cp
 	}
+	g.Addrs = append([]string(nil), g.Addrs...)
 	return g
 }
 

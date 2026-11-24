@@ -24,6 +24,7 @@ import (
 	"github.com/rajsinghtech/tsdnsproxy/internal/health"
 	"github.com/rajsinghtech/tsdnsproxy/internal/metrics"
 	"github.com/rajsinghtech/tsdnsproxy/internal/ui"
+	"github.com/rajsinghtech/tsdnsproxy/internal/vip"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/ipn/ipnstate"
@@ -110,6 +111,9 @@ type Server struct {
 	// Service hosts DNS as a Tailscale Service when set, for example "svc:dns".
 	// The listener is TCP. Port 53 is used unless the value ends in @port.
 	Service string
+
+	// ServiceVIPs answers service rules from the netmap. It may be nil.
+	ServiceVIPs vip.Source
 
 	// Worker pool for handling queries
 	workerPool chan struct{}
@@ -1038,7 +1042,14 @@ func (s *Server) resolveCached(ctx context.Context, query *dnsmessage.Message, g
 		return raw, false, err
 	}
 	key := newAnswerKey(query, grantConfigs, src)
-	raw, hit, err := s.answers.lookup(query, key, func() ([]byte, error) {
+	var limit time.Duration
+	if policyHasService(grantConfigs) {
+		if s.ServiceVIPs != nil {
+			key.vips = s.ServiceVIPs.Generation()
+		}
+		limit = s.serviceCacheLimit(query, grantConfigs)
+	}
+	raw, hit, err := s.answers.lookupLimited(query, key, limit, func() ([]byte, error) {
 		return s.processQuery(ctx, query, grantConfigs, src)
 	})
 	if hit && s.Logf != nil && len(query.Questions) > 0 {
@@ -1068,6 +1079,9 @@ func (s *Server) processQuery(ctx context.Context, query *dnsmessage.Message, gr
 	}
 	if grant.Zone != nil {
 		return s.handleZone(ctx, query, domain, &grant, grantConfigs)
+	}
+	if grant.Service != "" {
+		return s.handleService(ctx, query, domain, &grant)
 	}
 
 	// Omitted and negative translateid values forward the query.

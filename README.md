@@ -220,8 +220,9 @@ The file is checked at startup. A bad file exits the process. `SIGHUP`, or repla
 - `ipnames`: synthesize dashed IPv4 names. It cannot be combined with `rewrite` or `translateid`.
 - `static`: answer the name from configured A and AAAA records. See below.
 - `zone`: forward a whole zone and handle each answer. See below.
+- `service`: answer A and AAAA with a Tailscale Service's VIP addresses. See below.
 
-Domain rules match themselves and any name under them. The longest match wins. A `static` key matches only the name it writes, or one label under a wildcard. An exact static name beats a wildcard, and a longer name beats a shorter one. A key that is a CIDR matches the resolved address. The longest matching prefix overrides the domain rule for that address. A prefix rule with `translateid` omitted or `0` leaves the address unchanged.
+Domain rules match themselves and any name under them. The longest match wins. A `static` key matches only the name it writes, or one label under a wildcard. A `service` key matches only its own name. An exact static name beats a wildcard, and a longer name beats a shorter one. A key that is a CIDR matches the resolved address. The longest matching prefix overrides the domain rule for that address. A prefix rule with `translateid` omitted or `0` leaves the address unchanged.
 
 Addresses in `0.0.0.0/8`, `127.0.0.0/8`, `169.254.0.0/16`, `224.0.0.0/4`, `255.255.255.255/32`, and `100.64.0.0/10` are not translated unless `allowips` covers them. An excluded A answer is returned unchanged, and the AAAA answer is empty. The same filter drops A records from a `static` rule.
 
@@ -288,6 +289,36 @@ A `zone` rule owns a zone whose parent is public, without listing each private n
 - `zone` cannot be combined with `rewrite`, `static`, or `ipnames`, and the key cannot be a CIDR.
 
 Put the rule in an ACL grant to limit who sees the private answers. A caller without that grant matches no rule and is forwarded to the default upstreams, so it gets the public answer and the private upstream is never asked. A rules file applies to every client.
+
+### Service targets
+
+A `service` rule points a name at a Tailscale Service. The A and AAAA answers are the service's VIP addresses from this node's netmap, so the record follows the VIP when it changes.
+
+```json
+{
+  "app.example.com": {
+    "service": "svc:app",
+    "addrs": ["192.0.2.10", "2001:db8::10"],
+    "ttl": 30
+  }
+}
+```
+
+- `service` must look like `svc:<name>`. The VIPs come from the services this node can see, and from services it hosts.
+- `addrs` are literal IPv4 and IPv6 addresses used when the service is not in the netmap. They are optional.
+- When neither the netmap nor `addrs` has an address, the query is forwarded to the default upstreams.
+- `ttl` is the answer TTL in seconds. It defaults to `30` and must be from `1` through `86400`.
+- When the service has addresses of one family only, the other query type is NODATA. Other query types for the name are NODATA too.
+- The key matches only that name. It cannot be a wildcard or a CIDR.
+- `service` cannot be combined with `rewrite`, `static`, `ipnames`, `zone`, `dns`, `translateid`, `allowips`, or `denyips`.
+
+Answers are built from the netmap on every query. The answer cache keeps a service answer no longer than `ttl`, even when `-cache-min-ttl` is higher, and drops it as soon as a netmap update changes any service VIP.
+
+As with other rules, an ACL grant applies only to the callers it names. A caller without the grant gets the normal answer. A rules file applies to every client.
+
+The Rules tab, Lookup, and Backends page show the addresses being served and whether they came from the netmap, from `addrs`, or are forwarded upstream. The Backends page lists service rules from the rules file and from this node's own grants.
+
+Service VIPs differ per tailnet. The expected setup is one tsdnsproxy instance per tailnet, each resolving `svc:app` from its own netmap, so the same rule gives the right local VIP everywhere. A multi-tailnet mode is not built. It could be added later as one process with a tsnet node per tailnet, answering based on which tailnet the query arrived on, or with an explicit `tailnet` field to steer across tailnets. The tradeoff is a shared blast radius across tailnets and one process holding credentials for all of them.
 
 ### Encoded names
 

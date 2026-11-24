@@ -314,6 +314,13 @@ func ruleFrom(domain string, grant grants.DNSGrant, source string) ui.Rule {
 			rule.AllowIPs = append([]string(nil), grants.DefaultZonePrivate...)
 		}
 	}
+	if grant.Service != "" {
+		rule.ServiceVIP = &ui.ServiceVIP{
+			Name:  grant.Service,
+			Addrs: append([]string(nil), grant.Addrs...),
+			TTL:   int(grant.ServiceTTL()),
+		}
+	}
 	return rule
 }
 
